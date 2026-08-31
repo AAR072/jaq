@@ -15,4 +15,4 @@ fmt:
 	gofmt -w $$(find cmd internal -name '*.go' -type f)
 
 analyzer-image:
-	docker build --pull -t jaq-ghidra:12.1.3 analysis
+	docker build --pull --platform linux/amd64 -t jaq-ghidra:12.1.3 analysis

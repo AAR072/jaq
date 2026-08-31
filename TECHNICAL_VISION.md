@@ -28,7 +28,7 @@ Formats are versioned and validated at every trust boundary. Comparable runs use
 
 ## Security and isolation
 
-The Ghidra 12.1.3 image uses the official public release archive and SHA-256 checksum. At runtime Docker supplies no network, no Linux capabilities, no privilege escalation, a read-only root filesystem, a non-root UID/GID, bounded processes and memory, a read-only single-file sample mount, and disposable in-memory project/temp storage. Only the evidence output directory is writable. The image and controller expose no dynamic-analysis path.
+The Ghidra 12.1.3 image uses the official public release archive and SHA-256 checksum atop a digest-pinned JDK 21 base. At runtime Docker supplies no network, no Linux capabilities, no privilege escalation, a read-only root filesystem, a fixed non-root UID/GID, bounded processes and memory, a read-only single-file copy of the sample, and disposable in-memory project/temp storage. The container receives no writable host bind: it emits bounded raw evidence over stdout, which the controller validates and publishes afterward. The image and controller expose no dynamic-analysis path.
 
 The host controller never interprets extracted endpoints as destinations. The investigator receives evidence records through an allowlisted in-process API, not paths or commands. Output paths are controller-selected and model responses cannot change them. Raw provider traces, credentials, samples, generated runs, Ghidra projects, and artifacts stay outside version control.
 
