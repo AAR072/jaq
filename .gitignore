@@ -1,0 +1,29 @@
+# Local inputs and generated analysis state
+samples/
+runs/
+artifacts/
+ghidra-projects/
+model-traces/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Build and language state
+/bin/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+*.swp
+*~
