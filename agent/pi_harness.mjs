@@ -161,7 +161,7 @@ async function main() {
             tool?.name === "submit_investigation" || tool?.function?.name === "submit_investigation"
           );
         }
-        payload.tool_choice = { type: "function", function: { name: "submit_investigation" } };
+        delete payload.tool_choice;
       });
       pi.on("session_before_compact", () => ({
         customInstructions: [
