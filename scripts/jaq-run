@@ -47,7 +47,7 @@ if ! docker image inspect jaq-radare2:6.2.0-mcp1.8.6 >/dev/null 2>&1; then
     make sandbox-image
 fi
 
-if [ ! -x bin/jaq ]; then
+if [ ! -x bin/jaq ] || find cmd internal -type f -name '*.go' -newer bin/jaq -print -quit | grep -q .; then
     make build
 fi
 
