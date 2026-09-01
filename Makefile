@@ -1,15 +1,18 @@
-.PHONY: build test test-go test-python fmt sandbox-image
+.PHONY: build test test-go test-python test-agent fmt sandbox-image
 
 build:
 	go build -o bin/jaq ./cmd/jaq
 
-test: test-go test-python
+test: test-go test-python test-agent
 
 test-go:
 	go test ./...
 
 test-python:
 	PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+
+test-agent:
+	npm test
 
 fmt:
 	gofmt -w $$(find cmd internal -name '*.go' -type f)

@@ -112,11 +112,12 @@ class AgentIntegrationTest(unittest.TestCase):
             )
             path.write_text(json.dumps(native.to_dict()) + "\n", encoding="utf-8")
             store = EvidenceStore(path)
+            investigator = Investigator(
+                store, client=AdaptiveClient(), tool_runtime=UnpersistedRuntime(store),
+                config=InvestigatorConfig(model="mock/investigator"),
+            )
             with self.assertRaises(EvidenceToolError):
-                Investigator(
-                    store, client=AdaptiveClient(), tool_runtime=UnpersistedRuntime(store),
-                    config=InvestigatorConfig(model="mock/investigator"),
-                ).run()
+                investigator._execute_tool("run_static_command", {"command": "true"})
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ func mockedController(t *testing.T, sandboxError error) (*Controller, *fakeSessi
 		Config: Config{
 			SandboxImage: "jaq-radare2:6.2.0-mcp1.8.6", InvestigatorModel: "mock/investigator",
 			PromptHashes:  map[string]string{"investigator": promptHash, "judge": promptHash},
-			PythonVersion: "3.test", LiteLLMVersion: "mock",
+			PythonVersion: "3.test", LiteLLMVersion: "mock", NodeVersion: "vtest", PiVersion: "0.test",
 		},
 	}
 	return controller, session

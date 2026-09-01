@@ -19,12 +19,12 @@ func TestProcessRequiresModel(t *testing.T) {
 func TestRuntimeVersionsAreExplicit(t *testing.T) {
 	t.Setenv("JAQ_PYTHON", "")
 	p := NewProcess("")
-	python, litellm, err := p.RuntimeVersions(context.Background())
+	versions, err := p.RuntimeVersions(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if python == "" || litellm == "" {
-		t.Fatalf("incomplete runtime versions: python=%q litellm=%q", python, litellm)
+	if versions.Python == "" || versions.LiteLLM == "" || versions.Node == "" || versions.Pi == "" {
+		t.Fatalf("incomplete runtime versions: %#v", versions)
 	}
 }
 

@@ -49,6 +49,8 @@ type Config struct {
 	PromptHashes      map[string]string
 	PythonVersion     string
 	LiteLLMVersion    string
+	NodeVersion       string
+	PiVersion         string
 }
 
 type Controller struct {
@@ -61,12 +63,26 @@ type Controller struct {
 }
 
 func NewController(projectRoot string) (*Controller, error) {
-	promptHash, err := hashFile(filepath.Join(projectRoot, "python", "jaq_investigator", "prompts.py"))
+	basePromptHash, err := hashFile(filepath.Join(projectRoot, "python", "jaq_investigator", "prompts.py"))
 	if err != nil {
 		return nil, fmt.Errorf("hash investigator prompts: %w", err)
 	}
+	piHarnessHash, err := hashFile(filepath.Join(projectRoot, "agent", "pi_harness.mjs"))
+	if err != nil {
+		return nil, fmt.Errorf("hash Pi harness: %w", err)
+	}
+	piBrokerHash, err := hashFile(filepath.Join(projectRoot, "python", "jaq_investigator", "pi_harness.py"))
+	if err != nil {
+		return nil, fmt.Errorf("hash Pi broker: %w", err)
+	}
+	promptHash, err := contentHash(map[string]string{
+		"prompts": basePromptHash, "pi_harness": piHarnessHash, "pi_broker": piBrokerHash,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hash investigator harness configuration: %w", err)
+	}
 	process := invprocess.NewProcess(projectRoot)
-	pythonVersion, liteLLMVersion, err := process.RuntimeVersions(context.Background())
+	runtimeVersions, err := process.RuntimeVersions(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -87,8 +103,10 @@ func NewController(projectRoot string) (*Controller, error) {
 				"investigator": promptHash,
 				"judge":        promptHash,
 			},
-			PythonVersion:  pythonVersion,
-			LiteLLMVersion: liteLLMVersion,
+			PythonVersion:  runtimeVersions.Python,
+			LiteLLMVersion: runtimeVersions.LiteLLM,
+			NodeVersion:    runtimeVersions.Node,
+			PiVersion:      runtimeVersions.Pi,
 		},
 	}, nil
 }
@@ -167,6 +185,7 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"sandbox_base_digest": sandboxBaseDigest,
 		"sandbox_image":       c.Config.SandboxImage, "sandbox_image_id": sandboxImageID,
 		"python": c.Config.PythonVersion, "python_package": "jaq-investigator/" + Version,
+		"node": c.Config.NodeVersion, "pi_sdk": c.Config.PiVersion,
 		"litellm": c.Config.LiteLLMVersion,
 	}
 	manifest.ConfigurationHashes["native_pe"] = nativeConfigHash

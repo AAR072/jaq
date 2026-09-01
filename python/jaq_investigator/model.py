@@ -81,6 +81,7 @@ class ModelResponse:
     model: str | None = None
     provider: str | None = None
     finish_reason: str | None = None
+    reasoning_content: str | None = None
 
     @property
     def data(self) -> Any:
@@ -286,7 +287,8 @@ def normalize_model_response(
     message = _get(choice, "message")
     if message is None:
         raise ModelResponseError("provider returned a choice without a message")
-    content = _content_text(_get(message, "content"))
+    raw_content = _get(message, "content")
+    content = _content_text(raw_content)
     raw_calls = _get(message, "tool_calls", ()) or ()
     if isinstance(raw_calls, Mapping):
         raw_calls = [raw_calls]
@@ -296,6 +298,8 @@ def normalize_model_response(
     structured = _get(message, "parsed")
     if structured is None:
         structured = _get(message, "json")
+    if structured is None and isinstance(raw_content, Mapping):
+        structured = dict(raw_content)
     if structured is None:
         parsed_content = _json_object(content) if content else None
         if isinstance(parsed_content, (Mapping, list)):
@@ -307,6 +311,13 @@ def normalize_model_response(
     finish_reason = _get(choice, "finish_reason")
     if finish_reason is not None:
         finish_reason = str(finish_reason)
+    reasoning_content = _get(message, "reasoning_content")
+    if reasoning_content is None:
+        provider_fields = _get(message, "provider_specific_fields")
+        if isinstance(provider_fields, Mapping):
+            reasoning_content = provider_fields.get("reasoning_content")
+    if reasoning_content is not None:
+        reasoning_content = str(reasoning_content)
     return ModelResponse(
         content=content,
         structured=structured,
@@ -315,6 +326,7 @@ def normalize_model_response(
         model=str(model) if model is not None else None,
         provider=provider,
         finish_reason=finish_reason,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -403,10 +415,11 @@ class LiteLLMModelClient:
             "max_tokens": self.default_max_tokens if max_tokens is None else int(max_tokens),
         }
         if self.provider == "deepseek" and "deepseek-v4-" in self.model:
-            # V4 thinking models require reasoning state on later tool-call
-            # turns. LiteLLM's DeepSeek adapter supplies it when reasoning is
-            # explicitly enabled.
-            request["reasoning_effort"] = "high"
+            # DeepSeek V4 thinking turns require provider-specific reasoning
+            # state to be echoed through every tool round. JSON-mode responses
+            # do not reliably expose that state through LiteLLM, so use the
+            # provider's explicit non-thinking mode for this bounded tool loop.
+            request["reasoning_effort"] = "none"
         if request["timeout"] <= 0:
             raise ModelConfigurationError("timeout must be positive")
         if request["max_tokens"] <= 0:

@@ -111,7 +111,10 @@ class ModelLoopTests(unittest.TestCase):
     def test_complete_tool_loop_and_evidence_reference(self):
         client = QueueClient(
             [
-                ModelResponse(tool_calls=(ToolCall("get_observation", {"id": "obs-1"}, "tc-1"),)),
+                ModelResponse(
+                    tool_calls=(ToolCall("get_observation", {"id": "obs-1"}, "tc-1"),),
+                    reasoning_content="private model reasoning",
+                ),
                 ModelResponse(structured=final_claims(), usage={"total_tokens": 7}),
             ]
         )
@@ -123,18 +126,22 @@ class ModelLoopTests(unittest.TestCase):
         tool_messages = [m for m in client.requests[1]["messages"] if m["role"] == "tool"]
         self.assertEqual(len(tool_messages), 1)
         self.assertTrue(json_truth(tool_messages[0]["content"], "untrusted_evidence"))
+        assistant_messages = [m for m in client.requests[1]["messages"] if m["role"] == "assistant"]
+        self.assertEqual(assistant_messages[0]["reasoning_content"], "private model reasoning")
 
-    def test_invalid_tool_name_and_arguments_are_rejected(self):
-        with self.assertRaises(InvalidToolCallError):
-            Investigator(
-                FakeStore(),
-                client=QueueClient([ModelResponse(tool_calls=(ToolCall("shell", {}, "tc"),))]),
-            ).run()
-        with self.assertRaises(InvalidToolCallError):
-            Investigator(
-                FakeStore(),
-                client=QueueClient([ModelResponse(tool_calls=(ToolCall("get_observation", {"id": "obs-1", "path": "/tmp"}, "tc"),))]),
-            ).run()
+    def test_invalid_tool_name_and_arguments_are_returned_for_correction(self):
+        for call in (
+            ToolCall("shell", {}, "tc"),
+            ToolCall("get_observation", {"id": "obs-1", "path": "/tmp"}, "tc"),
+        ):
+            client = QueueClient([
+                ModelResponse(tool_calls=(call,)),
+                ModelResponse(structured=final_claims()),
+            ])
+            Investigator(FakeStore(), client=client).run()
+            tool_messages = [m for m in client.requests[1]["messages"] if m["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertIn('"status":"rejected"', tool_messages[0]["content"])
 
     def test_missing_model_and_timeout_are_normalized(self):
         with mock.patch.dict(os.environ, {"JAQ_INVESTIGATOR_MODEL": ""}, clear=False):
@@ -246,18 +253,77 @@ class ModelLoopTests(unittest.TestCase):
         def completion(**kwargs):
             captured.update(kwargs)
             return {
-                "choices": [{"message": {"content": '{"schema_version":"1.0","claims":[]}'}}],
+                "choices": [{"message": {
+                    "content": '{"schema_version":"1.0","claims":[]}',
+                    "provider_specific_fields": {"reasoning_content": "preserved reasoning"},
+                }}],
                 "model": kwargs["model"],
             }
 
         fake = types.SimpleNamespace(completion=completion)
         with mock.patch.dict(sys.modules, {"litellm": fake}):
-            LiteLLMModelClient("deepseek/deepseek-v4-flash").generate_structured(
+            response = LiteLLMModelClient("deepseek/deepseek-v4-flash").generate_structured(
                 messages=[{"role": "user", "content": "Return JSON"}],
                 schema={"type": "object"},
             )
         self.assertEqual(captured["response_format"], {"type": "json_object"})
-        self.assertEqual(captured["reasoning_effort"], "high")
+        self.assertEqual(captured["reasoning_effort"], "none")
+        self.assertEqual(response.reasoning_content, "preserved reasoning")
+
+    def test_tool_budget_reserves_a_tools_disabled_finalization_turn(self):
+        calls = tuple(
+            ToolCall("get_observation", {"id": "obs-1"}, f"tc-{index}")
+            for index in range(3)
+        )
+        client = QueueClient([
+            ModelResponse(tool_calls=calls),
+            ModelResponse(structured=final_claims()),
+        ])
+        Investigator(
+            FakeStore(), client=client,
+            config=InvestigatorConfig(max_tool_calls=4, max_rounds=8),
+        ).run()
+        self.assertIsNone(client.requests[1]["tools"])
+        self.assertIn(
+            "static evidence collection is complete",
+            client.requests[1]["messages"][-1]["content"],
+        )
+
+    def test_forced_finalization_retries_a_wrong_json_shape(self):
+        calls = tuple(
+            ToolCall("get_observation", {"id": "obs-1"}, f"tc-{index}")
+            for index in range(3)
+        )
+        client = QueueClient([
+            ModelResponse(tool_calls=calls),
+            ModelResponse(structured={"claims": []}),
+            ModelResponse(structured=final_claims()),
+        ])
+        result = Investigator(
+            FakeStore(), client=client,
+            config=InvestigatorConfig(max_tool_calls=4, max_rounds=8),
+        ).run()
+        self.assertEqual(result["schema_version"], "1.0")
+        self.assertEqual(len(client.requests), 3)
+        self.assertIsNone(client.requests[1]["tools"])
+        self.assertIsNone(client.requests[2]["tools"])
+        self.assertIn("final response was rejected", client.requests[2]["messages"][-2]["content"])
+
+    def test_forced_finalization_normalizes_a_bare_claims_array(self):
+        calls = tuple(
+            ToolCall("get_observation", {"id": "obs-1"}, f"tc-{index}")
+            for index in range(3)
+        )
+        client = QueueClient([
+            ModelResponse(tool_calls=calls),
+            ModelResponse(structured=final_claims()["claims"]),
+        ])
+        result = Investigator(
+            FakeStore(), client=client,
+            config=InvestigatorConfig(max_tool_calls=4, max_rounds=8),
+        ).run()
+        self.assertEqual(result["schema_version"], "1.0")
+        self.assertEqual(result["claims"][0]["id"], "claim-1")
 
     def test_litellm_other_providers_keep_strict_json_schema(self):
         captured = {}

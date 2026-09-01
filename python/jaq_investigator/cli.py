@@ -14,6 +14,7 @@ from .evidence import EvidenceStore as CanonicalEvidenceStore
 from .investigator import Investigator, InvestigatorConfig
 from .judge import Judge, JudgeConfig
 from .model import ModelError
+from .pi_harness import PiHarnessError, PiInvestigator
 from .report import render_report
 from .runtime import StaticToolRuntime
 from .verifier import verify_and_score
@@ -84,13 +85,18 @@ def run_pipeline(
         runtime = StaticToolRuntime.from_environment(store)
     if runtime is None and client is None:
         raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
-    investigator: Investigator | None = None
+    investigator: Investigator | PiInvestigator | None = None
     try:
-        investigator = Investigator(
-            store, model_client=client,
-            config=investigator_config or InvestigatorConfig.from_env(),
-            tool_runtime=runtime,
-        )
+        if client is None:
+            if runtime is None:
+                raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
+            investigator = PiInvestigator(store, runtime, output_dir)
+        else:
+            investigator = Investigator(
+                store, model_client=client,
+                config=investigator_config or InvestigatorConfig.from_env(),
+                tool_runtime=runtime,
+            )
         claims = investigator.run(task)
     finally:
         if runtime is not None:
@@ -153,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         # itself still sees only typed in-memory operations.
         run_pipeline(args.evidence, args.output, task=args.task)
         return 0
-    except (ModelError, ValueError, OSError, RuntimeError) as error:
+    except (ModelError, PiHarnessError, ValueError, OSError, RuntimeError) as error:
         # Keep provider/sample data and credentials out of CLI logs. ModelError
         # messages are already normalized; local validation messages are bounded.
         print(f"jaq-investigator: {error}", file=sys.stderr)

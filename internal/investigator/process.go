@@ -3,6 +3,7 @@ package investigator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,6 +24,7 @@ var credentialPatterns = []*regexp.Regexp{
 
 type Process struct {
 	Python           string
+	Node             string
 	ProjectRoot      string
 	Timeout          time.Duration
 	SandboxContainer string
@@ -45,12 +47,23 @@ func NewProcess(projectRoot string) *Process {
 	if python == "" {
 		python = "python3"
 	}
-	return &Process{Python: python, ProjectRoot: projectRoot, Timeout: DefaultTimeout}
+	node := os.Getenv("JAQ_NODE")
+	if node == "" {
+		node = "node"
+	}
+	return &Process{Python: python, Node: node, ProjectRoot: projectRoot, Timeout: DefaultTimeout}
 }
 
-// RuntimeVersions records the exact Python and installed LiteLLM versions
-// without importing LiteLLM or reading provider credentials.
-func (p *Process) RuntimeVersions(ctx context.Context) (string, string, error) {
+type RuntimeVersionInfo struct {
+	Python  string
+	LiteLLM string
+	Node    string
+	Pi      string
+}
+
+// RuntimeVersions records the exact host harness versions without importing
+// providers, reading credentials, or making a model request.
+func (p *Process) RuntimeVersions(ctx context.Context) (RuntimeVersionInfo, error) {
 	python := p.Python
 	if python == "" {
 		python = "python3"
@@ -64,13 +77,46 @@ func (p *Process) RuntimeVersions(ctx context.Context) (string, string, error) {
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Run(); err != nil {
-		return "", "", fmt.Errorf("query Python runtime versions: %w: %s", err, strings.TrimSpace(RedactSensitive(output.String())))
+		return RuntimeVersionInfo{}, fmt.Errorf("query Python runtime versions: %w: %s", err, strings.TrimSpace(RedactSensitive(output.String())))
 	}
 	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
 	if len(lines) != 2 || lines[0] == "" || lines[1] == "" {
-		return "", "", errors.New("query Python runtime versions: unexpected response")
+		return RuntimeVersionInfo{}, errors.New("query Python runtime versions: unexpected response")
 	}
-	return lines[0], lines[1], nil
+	node := p.Node
+	if node == "" {
+		node = "node"
+	}
+	nodeCmd := exec.CommandContext(versionCtx, node, "--version")
+	nodeCmd.Stdin = nil
+	var nodeOutput bytes.Buffer
+	nodeCmd.Stdout = &nodeOutput
+	nodeCmd.Stderr = &nodeOutput
+	if err := nodeCmd.Run(); err != nil {
+		return RuntimeVersionInfo{}, fmt.Errorf("query Node runtime version: %w: %s", err, strings.TrimSpace(RedactSensitive(nodeOutput.String())))
+	}
+	projectRoot := p.ProjectRoot
+	if projectRoot == "" {
+		var rootErr error
+		projectRoot, rootErr = FindProjectRoot(".")
+		if rootErr != nil {
+			return RuntimeVersionInfo{}, fmt.Errorf("locate Pi SDK package: %w", rootErr)
+		}
+	}
+	piPackage := filepath.Join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent", "package.json")
+	packageContents, err := os.ReadFile(piPackage)
+	if err != nil {
+		return RuntimeVersionInfo{}, fmt.Errorf("read Pi SDK package metadata: %w", err)
+	}
+	var metadata struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(packageContents, &metadata); err != nil || metadata.Version == "" {
+		return RuntimeVersionInfo{}, errors.New("read Pi SDK package metadata: invalid version")
+	}
+	return RuntimeVersionInfo{
+		Python: lines[0], LiteLLM: lines[1], Node: strings.TrimSpace(nodeOutput.String()), Pi: metadata.Version,
+	}, nil
 }
 
 func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
@@ -110,6 +156,7 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 	}
 	cmd.Env = env
 	cmd.Env = append(cmd.Env,
+		"JAQ_PROJECT_ROOT="+p.ProjectRoot,
 		"JAQ_SANDBOX_CONTAINER="+p.SandboxContainer,
 		"JAQ_SAMPLE_SHA256="+p.SampleSHA256,
 		"JAQ_RADARE2_VERSION="+p.RadareVersion,

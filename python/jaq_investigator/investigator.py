@@ -109,7 +109,7 @@ class InvestigatorConfig:
 
     model: str | None = None
     timeout: float = 60.0
-    max_rounds: int = 20
+    max_rounds: int = 64
     max_tool_output_chars: int = 16_000
     max_tool_calls: int = 128
     max_claims: int = 100
@@ -477,6 +477,12 @@ def validate_claims(
     Evidence IDs are checked against the injected store when available.
     """
 
+    # DeepSeek JSON mode may return the requested claims array without its
+    # wrapper even when instructed otherwise. The wrapper contains no model
+    # evidence; normalize this one provider-compatible shape, then apply the
+    # exact same strict per-claim and evidence validation below.
+    if isinstance(payload, list):
+        payload = {"schema_version": schema_version, "claims": payload}
     if not isinstance(payload, Mapping):
         raise ClaimsValidationError("final model output must be a JSON object")
     if set(payload) != {"schema_version", "claims"}:
@@ -611,7 +617,12 @@ class Investigator:
             )
         return self.model_client
 
-    def _invoke_model(self, messages: Sequence[Mapping[str, Any]]) -> Any:
+    def _invoke_model(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        allow_tools: bool = True,
+    ) -> Any:
         client = self._get_client()
         method = getattr(client, "generate_structured", None)
         if not callable(method):
@@ -623,7 +634,7 @@ class Investigator:
         kwargs = {
             "messages": messages,
             "schema": CLAIMS_SCHEMA,
-            "tools": self._model_tools,
+            "tools": self._model_tools if allow_tools else None,
             "timeout": self.config.timeout,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -703,6 +714,11 @@ class Investigator:
                 ):
                     raise EvidenceToolError("static tool result is not correlated to its request")
                 return _cap_tool_result(result, self.config.max_tool_output_chars)
+            except ValueError as error:
+                message = " ".join(str(error).split())[:300]
+                raise InvalidToolCallError(
+                    f"invalid arguments for static tool {name!r}: {message}"
+                ) from error
             except InvestigatorError:
                 raise
             except Exception as error:
@@ -748,14 +764,37 @@ class Investigator:
         tool_calls_count = 0
         model_name: str | None = None
         provider_name: str | None = None
+        finalizing = False
+        finalization_attempts = 0
         for round_number in range(1, self.config.max_rounds + 1):
-            raw_response = self._invoke_model(messages)
+            finalization_threshold = max(1, (self.config.max_tool_calls * 3) // 4)
+            if (
+                tool_calls_count >= finalization_threshold
+                or round_number >= self.config.max_rounds - 2
+            ):
+                finalizing = True
+            if finalizing:
+                finalization_attempts += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Controller budget notice: static evidence collection is complete. "
+                        "Do not request more tools. Return exactly one JSON object with top-level "
+                        "keys schema_version and claims: "
+                        "{\"schema_version\":\"1.0\",\"claims\":[...]}. "
+                        "Do not return a bare array, quoted JSON string, or markdown. Use only "
+                        "evidence IDs already present in the conversation."
+                    ),
+                })
+            raw_response = self._invoke_model(messages, allow_tools=not finalizing)
             calls = response_tool_calls(raw_response)
             _increment_usage(usage, response_usage(raw_response))
             model_name = response_model(raw_response, getattr(self._get_client(), "model", self.config.model))
             provider_name = response_provider(raw_response, getattr(self._get_client(), "provider", None))
 
             if calls:
+                if finalizing:
+                    raise InvestigatorLimitError("model requested tools during forced finalization")
                 if tool_calls_count + len(calls) > self.config.max_tool_calls:
                     raise InvestigatorLimitError("model exceeded the configured tool-call limit")
                 assistant_message: dict[str, Any] = {"role": "assistant"}
@@ -764,6 +803,11 @@ class Investigator:
                     content = raw_response.get("content", content)
                 if content is not None:
                     assistant_message["content"] = str(content)
+                reasoning_content = getattr(raw_response, "reasoning_content", None)
+                if isinstance(raw_response, Mapping):
+                    reasoning_content = raw_response.get("reasoning_content", reasoning_content)
+                if reasoning_content is not None:
+                    assistant_message["reasoning_content"] = str(reasoning_content)
                 assistant_message["tool_calls"] = [
                     {
                         "id": call.id or f"tool-call-{tool_calls_count + index + 1}",
@@ -774,7 +818,14 @@ class Investigator:
                 ]
                 messages.append(assistant_message)
                 for index, call in enumerate(calls):
-                    result = self._execute_tool(call.name, call.arguments)
+                    try:
+                        result = self._execute_tool(call.name, call.arguments)
+                    except InvestigatorError as error:
+                        result = {
+                            "status": "rejected",
+                            "error_type": error.__class__.__name__,
+                            "message": " ".join(str(error).split())[:500],
+                        }
                     call_id = call.id or f"tool-call-{tool_calls_count + index + 1}"
                     messages.append(
                         {
@@ -793,22 +844,47 @@ class Investigator:
 
             payload = structured_payload(raw_response)
             if payload is None:
-                raise ClaimsValidationError("model returned neither tool calls nor structured claims")
-            claims = validate_claims(
-                payload,
-                evidence_store=self.evidence_store,
-                max_claims=self.config.max_claims,
-                schema_version=self.config.schema_version,
-            )
-            self.last_run = InvestigatorRun(
-                claims=claims,
-                rounds=round_number,
-                tool_calls=tool_calls_count,
-                usage=usage,
-                model=model_name,
-                provider=provider_name,
-            )
-            return claims
+                validation_error: ClaimsValidationError = ClaimsValidationError(
+                    "model returned neither tool calls nor structured claims"
+                )
+            else:
+                try:
+                    claims = validate_claims(
+                        payload,
+                        evidence_store=self.evidence_store,
+                        max_claims=self.config.max_claims,
+                        schema_version=self.config.schema_version,
+                    )
+                except ClaimsValidationError as error:
+                    validation_error = error
+                else:
+                    self.last_run = InvestigatorRun(
+                        claims=claims,
+                        rounds=round_number,
+                        tool_calls=tool_calls_count,
+                        usage=usage,
+                        model=model_name,
+                        provider=provider_name,
+                    )
+                    return claims
+            if finalizing and finalization_attempts < 3 and round_number < self.config.max_rounds:
+                invalid_content = getattr(raw_response, "content", None)
+                if isinstance(raw_response, Mapping):
+                    invalid_content = raw_response.get("content", invalid_content)
+                messages.append({
+                    "role": "assistant",
+                    "content": str(invalid_content)[:12_000] if invalid_content is not None else "",
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "That final response was rejected: "
+                        + " ".join(str(validation_error).split())[:500]
+                        + ". Correct the JSON object now. Do not call tools."
+                    ),
+                })
+                continue
+            raise validation_error
         raise InvestigatorLimitError("model did not return final claims")
 
     investigate = run
