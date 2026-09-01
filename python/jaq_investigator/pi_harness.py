@@ -225,6 +225,7 @@ class PiToolBroker:
         candidates = self._candidates()
         candidate_by_key = {(item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)): item for item in candidates}
         covered: set[tuple[str, str]] = set()
+        verified_assets: list[dict[str, Any]] = []
         for asset in assets:
             normalized = asset.get("normalized_value")
             if asset.get("type") == "payload_hash" and isinstance(normalized, Mapping) and len(normalized) == 1:
@@ -275,13 +276,15 @@ class PiToolBroker:
                         for item in asserted
                     )
                 if not supported:
-                    raise PiHarnessError(f"asset {asset['id']} is not exactly present in cited evidence")
+                    continue
             else:
                 if candidate.value not in self._leaf_values(asset.get("value")):
                     raise PiHarnessError(f"asset {asset['id']} raw value does not match its deterministic candidate")
                 if not set(asset["evidence_ids"]).intersection(candidate.evidence_ids):
                     raise PiHarnessError(f"asset {asset['id']} does not cite its deterministic candidate evidence")
             covered.add(key)
+            verified_assets.append(asset)
+        assets = verified_assets
         missing = [item.id for item in candidates if (item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)) not in covered]
         if missing:
             raise PiHarnessError("investigation omitted deterministic asset candidate(s): " + ", ".join(missing[:20]))
