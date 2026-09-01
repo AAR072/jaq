@@ -113,6 +113,17 @@ async function main() {
   let session;
   let submittedClaims;
   let statsSnapshot;
+  let finalizing = false;
+  const enterFinalization = (reason) => {
+    if (finalizing || submittedClaims !== undefined) return;
+    finalizing = true;
+    if (session) {
+      session.setActiveTools(["submit_claims"]);
+      void session.steer(
+        `Controller budget notice: ${reason}. Stop investigating and call submit_claims now using the strongest evidence already collected.`,
+      ).catch(() => {});
+    }
+  };
   const guard = new BudgetGuard(init.budgets, () => session?.getSessionStats());
   const runtime = budgetedModelRuntime(
     await ModelRuntime.create({
@@ -176,9 +187,15 @@ async function main() {
       if (submittedClaims !== undefined) {
         return toolResult("The investigation is already complete; no further tool calls are allowed.", undefined, true);
       }
+      if (finalizing) {
+        return toolResult("Evidence collection is closed. Call submit_claims now.", undefined, true);
+      }
       try {
         guard.beforeToolCall();
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
+        if (guard.toolCalls >= Math.max(1, Math.floor(init.budgets.max_tool_calls * 0.75))) {
+          enterFinalization("the tool-call budget is nearly exhausted");
+        }
         return toolResult(
           compactToolResult(definition.name, result, init.budgets.tool_preview_chars),
           { tool: definition.name },
@@ -231,6 +248,14 @@ async function main() {
     settingsManager,
     sessionManager,
   }));
+  session.subscribe((event) => {
+    if (
+      event.type === "turn_end"
+      && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 2)
+    ) {
+      enterFinalization("the model-call budget is nearly exhausted");
+    }
+  });
 
   for (let attempt = 0; submittedClaims === undefined && attempt < 3; attempt += 1) {
     const prompt = attempt === 0
