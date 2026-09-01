@@ -68,6 +68,10 @@ print(json.dumps({"type":"complete","claims":validated["result"],"usage":{"input
             broad["action_requests"][0]["requested_observations"] = ["processes", "registry writes"]
             with self.assertRaises(PiHarnessError):
                 PiToolBroker(store, FakeRuntime()).validate_claims(broad)
+            omitted = json.loads(json.dumps(result.claims))
+            omitted["assets"] = []
+            recovered = PiToolBroker(store, FakeRuntime()).validate_claims(omitted)
+            self.assertEqual(recovered["assets"][0]["type"], "payload_hash")
 
 
 if __name__ == "__main__":

@@ -286,8 +286,15 @@ class PiToolBroker:
             verified_assets.append(asset)
         assets = verified_assets
         missing = [item.id for item in candidates if (item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)) not in covered]
-        if missing:
-            raise PiHarnessError("investigation omitted deterministic asset candidate(s): " + ", ".join(missing[:20]))
+        for candidate in candidates:
+            if candidate.id not in missing:
+                continue
+            assets.append({
+                "schema_version": "1.0", "id": candidate.id, "type": candidate.type,
+                "value": candidate.value, "normalized_value": candidate.normalized_value,
+                "role": candidate.role, "confidence": candidate.confidence,
+                "evidence_ids": list(candidate.evidence_ids), "unresolved": False,
+            })
         requested_urls = {
             str(item.get("target", {}).get("url"))
             for item in requests
