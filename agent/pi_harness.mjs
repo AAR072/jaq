@@ -118,6 +118,7 @@ async function main() {
     if (finalizing || submittedClaims !== undefined) return;
     finalizing = true;
     if (session) {
+      session.setThinkingLevel("off");
       session.setActiveToolsByName(["submit_investigation"]);
       void session.steer(
         `Controller budget notice: ${reason}. Stop investigating and call submit_investigation now using the strongest evidence already collected.`,
@@ -161,7 +162,7 @@ async function main() {
             tool?.name === "submit_investigation" || tool?.function?.name === "submit_investigation"
           );
         }
-        delete payload.tool_choice;
+        payload.tool_choice = { type: "function", function: { name: "submit_investigation" } };
       });
       pi.on("session_before_compact", () => ({
         customInstructions: [
