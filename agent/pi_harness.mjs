@@ -153,6 +153,16 @@ async function main() {
     name: "jaq-compaction",
     hidden: true,
     factory(pi) {
+      pi.on("before_provider_request", (event) => {
+        if (!finalizing || !event.payload || typeof event.payload !== "object") return;
+        const payload = event.payload;
+        if (Array.isArray(payload.tools)) {
+          payload.tools = payload.tools.filter((tool) =>
+            tool?.name === "submit_investigation" || tool?.function?.name === "submit_investigation"
+          );
+        }
+        payload.tool_choice = { type: "function", function: { name: "submit_investigation" } };
+      });
       pi.on("session_before_compact", () => ({
         customInstructions: [
           "Preserve exact JAQ evidence observation IDs and never invent IDs.",
@@ -260,7 +270,7 @@ async function main() {
   session.subscribe((event) => {
     if (
       event.type === "turn_end"
-      && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 2)
+      && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 3)
     ) {
       enterFinalization("the model-call budget is nearly exhausted");
     }
