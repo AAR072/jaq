@@ -26,6 +26,7 @@ _REGISTRY = re.compile(r"\b(?:HKEY_(?:LOCAL_MACHINE|CURRENT_USER)|HKLM|HKCU|SOFT
 _HASH = re.compile(r"\b[a-fA-F0-9]{64}\b")
 _LABELED_SECRET = re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|bearer|password|passwd|secret)\s*[:=]\s*([A-Za-z0-9._~+/=-]{8,512})")
 _COMMAND_START = re.compile(r"(?i)^(?:cmd\.exe\s+/c|powershell(?:\.exe)?\b|wmic\b|vssadmin\b|bcdedit\b|reagentc\b)")
+_NON_NETWORK_DOMAINS = frozenset({"system.io", "system.net"})
 
 
 @dataclass(frozen=True)
@@ -65,11 +66,14 @@ def extract_candidates(observations: Iterable[Any], limit: int = 500) -> list[Ca
             continue
         for text in _strings([getattr(observation, "raw_value", None), getattr(observation, "normalized_value", None)]):
             for url in _URL.findall(text):
-                clean = url.rstrip(".,);]}")
+                # Preserve a closing brace in templated endpoints such as
+                # ``.../{0},{1}``; trimming it creates an unsupported value.
+                clean = url.rstrip(".,);]")
                 parts = urlsplit(clean)
                 normalized = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, ""))
                 role = "remote_payload_reference" if re.search(r"\.(?:exe|dll|bin|dat|zip|rar|7z)(?:$|\?)", normalized, re.I) else "network_infrastructure"
-                key = ("url", normalized)
+                asset_type = "remote_payload" if role == "remote_payload_reference" else "url"
+                key = (asset_type, normalized)
                 values[key] = (clean, role, 0.98)
                 found.setdefault(key, set()).add(observation_id)
                 if parts.hostname:
@@ -90,6 +94,11 @@ def extract_candidates(observations: Iterable[Any], limit: int = 500) -> list[Ca
                 except ValueError:
                     continue
                 if address.is_unspecified or address.is_loopback:
+                    continue
+                octets = raw_ip.split(".")
+                if octets[-2:] == ["0", "0"]:
+                    # Version resources and .NET assembly identities commonly
+                    # contain 1.0.0.0/4.0.0.0; these are not endpoint hosts.
                     continue
                 key = ("ip_address", str(address))
                 values[key] = (raw_ip, "network_infrastructure", 0.95)
@@ -112,6 +121,8 @@ def extract_candidates(observations: Iterable[Any], limit: int = 500) -> list[Ca
                 values[key] = (wallet, "payment_infrastructure", 0.97)
                 found.setdefault(key, set()).add(observation_id)
             for domain in _DOMAIN.findall(text):
+                if domain.lower().rstrip(".") in _NON_NETWORK_DOMAINS:
+                    continue
                 key = ("domain", domain.lower().rstrip("."))
                 values[key] = (domain, "network_infrastructure", 0.9)
                 found.setdefault(key, set()).add(observation_id)

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +66,9 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	}
 	if manifest.Status != "completed" || manifest.Versions["radare2"] != "6.2.0" || manifest.Versions["radare2_mcp"] != "1.8.6" {
 		t.Fatalf("unexpected manifest: %#v", manifest)
+	}
+	if role, ok := manifest.ModelRoles["harvester"]; !ok || role.Model != "investigator" || role.Provider != "mock" {
+		t.Fatalf("missing harvester model role: %#v", manifest.ModelRoles)
 	}
 	if !session.closed {
 		t.Fatal("sandbox session was not closed")
@@ -206,6 +210,10 @@ func mockedController(t *testing.T, sandboxError error) (*Controller, *fakeSessi
 func writeMockDossier(_ context.Context, output string) error {
 	observations, err := evidence.ReadObservationsFile(filepath.Join(output, "observations.jsonl"))
 	if err != nil {
+		return err
+	}
+	checkpoint := fmt.Sprintf("{\"schema_version\":\"1.0\",\"research_complete\":true,\"summary\":\"Fixture research complete.\",\"important_evidence_ids\":[%q],\"unresolved_questions\":[]}\n", observations[0].ID)
+	if err := os.WriteFile(filepath.Join(output, "research.json"), []byte(checkpoint), 0o600); err != nil {
 		return err
 	}
 	claim := evidence.NewClaim("claim-1", "capability", "The fixture contains deterministic static evidence.", 0.8, []string{observations[0].ID})

@@ -20,7 +20,7 @@ Choose a LiteLLM provider/model string and keep its provider key in the environm
 ```sh
 export JAQ_INVESTIGATOR_MODEL='deepseek/deepseek-v4-flash'
 export DEEPSEEK_API_KEY='...'
-./bin/jaq analyze --sample /absolute/path/to/sample.exe --output ./runs/example
+./bin/jaq analyze --sample /absolute/path/to/sample.exe --output /absolute/path/to/runs/example
 ```
 
 For the normal local workflow, put those two assignments in the gitignored `.env` and run:
@@ -33,9 +33,19 @@ The wrapper loads `.env`, activates `.venv` when present, builds the CLI if need
 
 Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may use a different LiteLLM provider; no second key is required for mocked tests.
 
-The investigator runs through the host-side Pi SDK with only JAQ tools enabled. Defaults cap one run at 12 model calls, 40 tool calls, 500,000 cumulative tokens, and an estimated $0.10. Override them with `JAQ_MAX_MODEL_CALLS`, `JAQ_MAX_TOOL_CALLS`, `JAQ_MAX_TOTAL_TOKENS`, and `JAQ_MAX_COST_USD`. Full tool results remain in the evidence ledger; Pi receives bounded previews and automatically compacts older context.
+The investigator uses two fresh Pi sessions. The research session performs static reverse engineering with Radare2 and the offline command sandbox, persists every tool result, and writes `research.json`. A smaller read-only harvest session then reconciles deterministic candidates and searches the completed evidence for claims, credentials, tokens, usernames/passwords, C2 infrastructure, URLs, payload references, and action requests. It cannot use Radare2, shell, filesystem, or network tools.
 
-The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `claims.json`, `assets.json`, `requests.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run. Action requests are evidence-backed `pending_authorization` placeholders only: this milestone does not fetch remote payloads or perform dynamic analysis.
+Research defaults are 12 model calls, 40 tool calls, 500,000 cumulative tokens, and an estimated $0.10; override them with `JAQ_MAX_MODEL_CALLS`, `JAQ_MAX_TOOL_CALLS`, `JAQ_MAX_TOTAL_TOKENS`, and `JAQ_MAX_COST_USD`. Harvest defaults are 5 calls, 16 evidence-tool calls, 180,000 tokens, and $0.03; override them with the corresponding `JAQ_HARVEST_MAX_*` variables. `JAQ_HARVESTER_MODEL` optionally selects a different provider/model and defaults to `JAQ_INVESTIGATOR_MODEL`; `JAQ_HARVESTER_THINKING` defaults to `off`. Full tool results remain in the evidence ledger, while Pi receives bounded previews and automatically compacts older research context.
+
+The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `research.json`, `claims.json`, `assets.json`, `requests.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run. Action requests begin as evidence-backed `pending_authorization` records. JAQ can fetch an explicitly approved remote payload in its bounded fetch container; it still does not perform dynamic analysis.
+
+If the provider fails only during the final harvest, reuse the completed research instead of paying to reverse the sample again:
+
+```sh
+./scripts/jaq-harvest /absolute/path/to/existing/run
+```
+
+Each retry receives a fresh `model-session/harvest-N` directory and still cannot access the static sandbox.
 
 Review and decide requests explicitly:
 

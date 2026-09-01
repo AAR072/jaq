@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "$#" -ne 1 ] || [[ "$1" != /* ]]; then
+    echo "usage: scripts/jaq-harvest /absolute/path/to/existing/run" >&2
+    exit 64
+fi
+
+run_path="$1"
+if [ ! -f "$run_path/observations.jsonl" ] || [ ! -f "$run_path/research.json" ]; then
+    echo "run must contain observations.jsonl and research.json" >&2
+    exit 66
+fi
+
+cd "$project_root"
+if [ -f .venv/bin/activate ]; then
+    source .venv/bin/activate
+fi
+if [ ! -f .env ]; then
+    echo "missing $project_root/.env" >&2
+    exit 78
+fi
+set -a
+source .env
+set +a
+
+if [ -z "${JAQ_INVESTIGATOR_MODEL:-}" ]; then
+    echo ".env must define JAQ_INVESTIGATOR_MODEL" >&2
+    exit 78
+fi
+
+export PYTHONPATH="$project_root/python${PYTHONPATH:+:$PYTHONPATH}"
+exec python -m jaq_investigator \
+    --evidence "$run_path/observations.jsonl" \
+    --output "$run_path" \
+    --harvest-only

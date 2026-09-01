@@ -45,6 +45,7 @@ type SandboxSession interface {
 type Config struct {
 	SandboxImage      string
 	InvestigatorModel string
+	HarvesterModel    string
 	JudgeModel        string
 	PromptHashes      map[string]string
 	PythonVersion     string
@@ -87,6 +88,10 @@ func NewController(projectRoot string) (*Controller, error) {
 		return nil, err
 	}
 	sandbox := sandboxruntime.NewDocker()
+	harvesterModel := os.Getenv("JAQ_HARVESTER_MODEL")
+	if harvesterModel == "" {
+		harvesterModel = os.Getenv("JAQ_INVESTIGATOR_MODEL")
+	}
 	return &Controller{
 		Investigator:        process,
 		AnalyzePE:           peinfo.AnalyzeFile,
@@ -98,9 +103,11 @@ func NewController(projectRoot string) (*Controller, error) {
 		Config: Config{
 			SandboxImage:      sandbox.Image,
 			InvestigatorModel: os.Getenv("JAQ_INVESTIGATOR_MODEL"),
+			HarvesterModel:    harvesterModel,
 			JudgeModel:        os.Getenv("JAQ_JUDGE_MODEL"),
 			PromptHashes: map[string]string{
 				"investigator": promptHash,
+				"harvester":    promptHash,
 				"judge":        promptHash,
 			},
 			PythonVersion:  runtimeVersions.Python,
@@ -135,6 +142,14 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	if c.Investigator == nil || c.ResolveSandboxImage == nil || c.StartSandbox == nil {
 		return errors.New("static sandbox stages are not configured")
 	}
+	harvesterModel := c.Config.HarvesterModel
+	if strings.TrimSpace(harvesterModel) == "" {
+		harvesterModel = c.Config.InvestigatorModel
+	}
+	harvesterPromptHash := c.Config.PromptHashes["harvester"]
+	if harvesterPromptHash == "" {
+		harvesterPromptHash = c.Config.PromptHashes["investigator"]
+	}
 	sandboxImageID, err := c.ResolveSandboxImage(ctx)
 	if err != nil {
 		return err
@@ -165,7 +180,8 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	pipelineConfigHash, err := contentHash(map[string]any{
 		"schema_version":     evidence.SchemaVersion,
 		"native_config_hash": nativeConfigHash, "sandbox_config_hash": sandboxConfigHash,
-		"investigator_model": c.Config.InvestigatorModel, "judge_model": c.Config.JudgeModel,
+		"investigator_model": c.Config.InvestigatorModel,
+		"harvester_model":    harvesterModel, "judge_model": c.Config.JudgeModel,
 	})
 	if err != nil {
 		return fmt.Errorf("hash pipeline configuration: %w", err)
@@ -195,6 +211,7 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		manifest.PromptHashes[role] = hash
 	}
 	manifest.ModelRoles["investigator"] = modelRole(c.Config.InvestigatorModel, c.Config.PromptHashes["investigator"])
+	manifest.ModelRoles["harvester"] = modelRole(harvesterModel, harvesterPromptHash)
 	if c.Config.JudgeModel != "" {
 		manifest.ModelRoles["judge"] = modelRole(c.Config.JudgeModel, c.Config.PromptHashes["judge"])
 	}
@@ -299,6 +316,9 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 }
 
 func validateInvestigatorOutputs(outputDir string, observations []evidence.Observation, judgeRequired bool) error {
+	if err := validateResearchCheckpoint(filepath.Join(outputDir, "research.json"), observations); err != nil {
+		return err
+	}
 	claims, err := evidence.ReadClaims(filepath.Join(outputDir, "claims.json"))
 	if err != nil {
 		return fmt.Errorf("reject investigator claims: %w", err)
@@ -328,6 +348,47 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
 		return errors.New("reject investigator report: report.md must be a nonempty bounded regular file")
+	}
+	return nil
+}
+
+type researchCheckpoint struct {
+	SchemaVersion        string   `json:"schema_version"`
+	ResearchComplete     bool     `json:"research_complete"`
+	Summary              string   `json:"summary"`
+	ImportantEvidenceIDs []string `json:"important_evidence_ids"`
+	UnresolvedQuestions  []string `json:"unresolved_questions"`
+}
+
+func validateResearchCheckpoint(path string, observations []evidence.Observation) error {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 1<<20 {
+		return errors.New("reject research.json: must be a nonempty bounded regular file")
+	}
+	var checkpoint researchCheckpoint
+	if err := readJSONStrict(path, &checkpoint); err != nil {
+		return fmt.Errorf("reject research.json: %w", err)
+	}
+	if checkpoint.SchemaVersion != evidence.SchemaVersion || !checkpoint.ResearchComplete ||
+		strings.TrimSpace(checkpoint.Summary) == "" || len(checkpoint.Summary) > 16000 ||
+		len(checkpoint.ImportantEvidenceIDs) > 200 || len(checkpoint.UnresolvedQuestions) > 100 {
+		return errors.New("reject research.json: invalid research checkpoint")
+	}
+	known := make(map[string]bool, len(observations))
+	for _, observation := range observations {
+		known[observation.ID] = true
+	}
+	seen := make(map[string]bool, len(checkpoint.ImportantEvidenceIDs))
+	for _, id := range checkpoint.ImportantEvidenceIDs {
+		if seen[id] || !known[id] {
+			return errors.New("reject research.json: invalid evidence reference")
+		}
+		seen[id] = true
+	}
+	for _, question := range checkpoint.UnresolvedQuestions {
+		if strings.TrimSpace(question) == "" || len(question) > 1000 {
+			return errors.New("reject research.json: invalid unresolved question")
+		}
 	}
 	return nil
 }
@@ -404,7 +465,7 @@ func fileSize(path string) int64 {
 
 func outputSize(directory string) int64 {
 	var total int64
-	for _, name := range []string{"claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
+	for _, name := range []string{"research.json", "claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
 		total += fileSize(filepath.Join(directory, name))
 	}
 	return total

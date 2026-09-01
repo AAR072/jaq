@@ -40,6 +40,9 @@ function positiveNumber(value, label) {
 
 function validateInit(frame) {
   if (frame.type !== "init") throw new Error("first JAQ harness frame must be init");
+  if (frame.mode !== "research" && frame.mode !== "harvest") {
+    throw new Error("mode must be research or harvest");
+  }
   const budgets = requireObject(frame.budgets, "budgets");
   const compaction = requireObject(frame.compaction, "compaction");
   const tools = frame.tool_definitions;
@@ -59,7 +62,7 @@ function validateInit(frame) {
     }
     requireObject(tool.parameters, `tool ${tool.name} parameters`);
   }
-  requireObject(frame.claims_schema, "claims_schema");
+  requireObject(frame.output_schema, "output_schema");
   if (typeof frame.system_prompt !== "string" || !frame.system_prompt.trim()) {
     throw new Error("system_prompt must be nonempty");
   }
@@ -93,10 +96,16 @@ function toolResult(text, details = undefined, isError = false, terminate = fals
   };
 }
 
-function budgetedModelRuntime(runtime, guard) {
+function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization) {
   for (const method of ["stream", "streamSimple"]) {
     const original = runtime[method].bind(runtime);
     runtime[method] = (...args) => {
+      // A single Pi prompt can perform many provider/tool turns before it emits
+      // session turn_end. Reserve two provider calls for a forced terminal
+      // submission here, at the actual provider-call boundary.
+      if (guard.providerCalls >= Math.max(1, maxModelCalls - 2)) {
+        enterFinalization("the model-call budget is nearly exhausted");
+      }
       guard.beforeProviderCall();
       return original(...args);
     };
@@ -107,21 +116,24 @@ function budgetedModelRuntime(runtime, guard) {
 async function main() {
   const channel = new LineChannel();
   const init = validateInit(await channel.read());
+  const terminalName = init.mode === "research" ? "finish_research" : "submit_investigation";
+  const validationOperation = init.mode === "research" ? "validate_research" : "validate_claims";
+  const validationField = init.mode === "research" ? "research" : "claims";
   const { provider, model: modelID } = parseModelSelector(init.model);
   await mkdir(init.session_dir, { recursive: true, mode: 0o700 });
 
   let session;
-  let submittedClaims;
+  let submission;
   let statsSnapshot;
   let finalizing = false;
   const enterFinalization = (reason) => {
-    if (finalizing || submittedClaims !== undefined) return;
+    if (finalizing || submission !== undefined) return;
     finalizing = true;
     if (session) {
       session.setThinkingLevel("off");
-      session.setActiveToolsByName(["submit_investigation"]);
+      session.setActiveToolsByName([terminalName]);
       void session.steer(
-        `Controller budget notice: ${reason}. Stop investigating and call submit_investigation now using the strongest evidence already collected.`,
+        `Controller budget notice: ${reason}. Stop working and call ${terminalName} now using the strongest evidence already collected.`,
       ).catch(() => {});
     }
   };
@@ -134,6 +146,8 @@ async function main() {
       modelsPath: null,
     }),
     guard,
+    init.budgets.max_model_calls,
+    enterFinalization,
   );
   const catalogModel = runtime.getModel(provider, modelID);
   if (!catalogModel) throw new Error(`Pi model catalog does not contain ${init.model}`);
@@ -159,10 +173,10 @@ async function main() {
         const payload = event.payload;
         if (Array.isArray(payload.tools)) {
           payload.tools = payload.tools.filter((tool) =>
-            tool?.name === "submit_investigation" || tool?.function?.name === "submit_investigation"
+            tool?.name === terminalName || tool?.function?.name === terminalName
           );
         }
-        payload.tool_choice = { type: "function", function: { name: "submit_investigation" } };
+        payload.tool_choice = { type: "function", function: { name: terminalName } };
       });
       pi.on("session_before_compact", () => ({
         customInstructions: [
@@ -184,7 +198,7 @@ async function main() {
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPrompt: `${init.system_prompt}\n\nWhen finished, you MUST call submit_investigation exactly once. Do not print final JSON as assistant text.`,
+    systemPrompt: `${init.system_prompt}\n\nWhen finished, you MUST call ${terminalName} exactly once. Do not print final JSON as assistant text.`,
   });
   await loader.reload();
 
@@ -195,11 +209,11 @@ async function main() {
     parameters: Type.Unsafe(definition.parameters),
     executionMode: "sequential",
     async execute(_callID, params) {
-      if (submittedClaims !== undefined) {
-        return toolResult("The investigation is already complete; no further tool calls are allowed.", undefined, true);
+      if (submission !== undefined) {
+        return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
       }
       if (finalizing) {
-        return toolResult("Evidence collection is closed. Call submit_investigation now.", undefined, true);
+        return toolResult(`Evidence collection is closed. Call ${terminalName} now.`, undefined, true);
       }
       try {
         guard.beforeToolCall();
@@ -222,28 +236,32 @@ async function main() {
   }));
 
   customTools.push({
-    name: "submit_investigation",
-    label: "Submit investigation",
-    description: "Validate and submit final claims, operational assets, and pending action requests. This terminates the investigation.",
-    parameters: Type.Unsafe(init.claims_schema),
+    name: terminalName,
+    label: init.mode === "research" ? "Finish research" : "Submit investigation",
+    description: init.mode === "research"
+      ? "Validate and save a concise research checkpoint. This terminates the research phase."
+      : "Validate and submit final claims, operational assets, and pending action requests. This terminates the harvest phase.",
+    parameters: Type.Unsafe(init.output_schema),
     prepareArguments(args) {
       const value = structuredClone(args ?? {});
       value.schema_version ??= "1.0";
-      for (const item of value.claims ?? []) item.schema_version ??= "1.0";
-      for (const item of value.assets ?? []) item.schema_version ??= "1.0";
-      for (const item of value.action_requests ?? []) item.schema_version ??= "1.0";
-      for (const claim of value.claims ?? []) claim.reachability && (claim.reachability.schema_version ??= "1.0");
+      if (init.mode === "harvest") {
+        for (const item of value.claims ?? []) item.schema_version ??= "1.0";
+        for (const item of value.assets ?? []) item.schema_version ??= "1.0";
+        for (const item of value.action_requests ?? []) item.schema_version ??= "1.0";
+        for (const claim of value.claims ?? []) claim.reachability && (claim.reachability.schema_version ??= "1.0");
+      }
       return value;
     },
     executionMode: "sequential",
     async execute(_callID, params) {
-      if (submittedClaims !== undefined) {
-        return toolResult("Claims were already submitted.", undefined, true);
+      if (submission !== undefined) {
+        return toolResult("This phase was already submitted.", undefined, true);
       }
       try {
-        const canonical = await channel.request("validate_claims", { claims: params });
-        submittedClaims = canonical;
-        return toolResult("Claims validated and accepted. The JAQ investigation is complete.", undefined, false, true);
+        const canonical = await channel.request(validationOperation, { [validationField]: params });
+        submission = canonical;
+        return toolResult(`${init.mode} submission validated and accepted.`, undefined, false, true);
       } catch (error) {
         return toolResult(
           JSON.stringify({ status: "rejected", error_type: error?.name ?? "ClaimsError", message: sanitizeError(error) }),
@@ -277,18 +295,18 @@ async function main() {
     }
   });
 
-  for (let attempt = 0; submittedClaims === undefined && attempt < 3; attempt += 1) {
+  for (let attempt = 0; submission === undefined && attempt < 3; attempt += 1) {
     const prompt = attempt === 0
       ? init.task
-      : "You ended without submitting. Use the existing evidence and call submit_investigation now. Do not request exploratory tools unless required to correct an evidence ID.";
+      : `You ended without submitting. Use the existing evidence and call ${terminalName} now. Do not request exploratory tools unless required to correct an evidence ID.`;
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
   }
   statsSnapshot = session.getSessionStats();
-  if (submittedClaims === undefined) throw new Error("Pi investigator ended without calling submit_investigation");
+  if (submission === undefined) throw new Error(`Pi ${init.mode} phase ended without calling ${terminalName}`);
   channel.send({
     type: "complete",
-    claims: submittedClaims,
+    submission,
     usage: {
       input_tokens: statsSnapshot.tokens.input,
       output_tokens: statsSnapshot.tokens.output,

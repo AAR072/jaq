@@ -16,7 +16,7 @@ from .evidence import EvidenceStore as CanonicalEvidenceStore
 from .investigator import Investigator, InvestigatorConfig
 from .judge import Judge, JudgeConfig
 from .model import ModelError
-from .pi_harness import PiHarnessError, PiInvestigator
+from .pi_harness import EvidenceOnlyRuntime, PiHarnessError, PiInvestigator
 from .report import render_report
 from .runtime import StaticToolRuntime
 from .verifier import verify_and_score
@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", required=True, help="observations.jsonl path or evidence directory")
     parser.add_argument("--output", required=True, help="controller-selected output directory")
     parser.add_argument("--task", default=None, help="optional operational investigation request")
+    parser.add_argument(
+        "--harvest-only", action="store_true",
+        help="reuse research.json and observations.jsonl without rerunning static research",
+    )
     return parser
 
 
@@ -65,6 +69,7 @@ def run_pipeline(
     judge_config: JudgeConfig | None = None,
     task: str | None = None,
     tool_runtime: Any | None = None,
+    harvest_only: bool = False,
 ) -> dict[str, Any]:
     """Run the complete claims → judge → score → report handoff.
 
@@ -83,23 +88,35 @@ def run_pipeline(
         if (output_dir / name).exists():
             raise ValueError(f"refusing to overwrite existing {name}")
     runtime = tool_runtime
-    if runtime is None and os.environ.get("JAQ_SANDBOX_CONTAINER"):
+    if runtime is None and not harvest_only and os.environ.get("JAQ_SANDBOX_CONTAINER"):
         runtime = StaticToolRuntime.from_environment(store)
-    if runtime is None and client is None:
+    if runtime is None and client is None and not harvest_only:
         raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
     investigator: Investigator | PiInvestigator | None = None
     try:
         if client is None:
-            if runtime is None:
-                raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
-            investigator = PiInvestigator(store, runtime, output_dir)
+            if harvest_only:
+                research_path = output_dir / "research.json"
+                try:
+                    research_checkpoint = json.loads(research_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise RuntimeError("harvest retry requires a valid research.json") from error
+                investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
+                claims = investigator.harvest(research_checkpoint)
+            else:
+                if runtime is None:
+                    raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
+                investigator = PiInvestigator(store, runtime, output_dir)
+                claims = investigator.run(task)
         else:
+            if harvest_only:
+                raise ValueError("harvest_only is unavailable with the legacy injected model client")
             investigator = Investigator(
                 store, model_client=client,
                 config=investigator_config or InvestigatorConfig.from_env(),
                 tool_runtime=runtime,
             )
-        claims = investigator.run(task)
+            claims = investigator.run(task)
     finally:
         if runtime is not None:
             runtime.close()
@@ -189,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         # Reuse the canonical immutable loader so malformed observations and
         # schema-version drift fail before any provider call. The investigator
         # itself still sees only typed in-memory operations.
-        run_pipeline(args.evidence, args.output, task=args.task)
+        run_pipeline(args.evidence, args.output, task=args.task, harvest_only=args.harvest_only)
         return 0
     except (ModelError, PiHarnessError, ValueError, OSError, RuntimeError) as error:
         # Keep provider/sample data and credentials out of CLI logs. ModelError
