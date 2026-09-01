@@ -535,7 +535,7 @@ func (m RunManifest) Validate() error {
 		return errors.New("manifest finished_at is before started_at")
 	}
 	switch m.Status {
-	case "running", "completed", "failed", "partial":
+	case "running", "completed", "failed", "partial", "awaiting_authorization", "awaiting_handoff":
 	default:
 		return fmt.Errorf("manifest status %q is invalid", m.Status)
 	}

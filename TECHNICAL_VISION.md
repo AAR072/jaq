@@ -40,6 +40,8 @@ There is an unavoidable semantic boundary here: arbitrary helper code operating 
 
 This slice deliberately excludes dynamic analysis and its request/judge authorization flow, sample acquisition, MalwareBazaar, submissions, corpus/global correlation, campaign graphs, visualization, Temporal, PostgreSQL, production infrastructure, and novelty claims. Static commands must not execute, emulate, or debug the supplied PE.
 
+The acquisition control plane is now present: deterministic candidates must be reconciled into assets, remote stages require pending requests, and an operator may approve or deny requests. Approved remote payloads are fetched in a separate bounded Docker invocation and analyzed as child runs. Dynamic approvals remain handoff-only until a dedicated dynamic sandbox exists.
+
 ## Acceptance boundary
 
 Unit and integration tests generate a harmless PE fixture and exercise malformed input, sandbox startup/cleanup, MCP lifecycle and ID correlation, arbitrary-command isolation, output/time limits, incremental evidence IDs, invalid model tools, unsupported claims, hostile output, and mocked investigator/judge loops. The tagged Docker test verifies the live container, required static tools, read-only PE, offline posture, writable scratch, failed native PE execution, and cleanup.

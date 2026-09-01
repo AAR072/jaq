@@ -29,4 +29,14 @@ The investigator runs through the host-side Pi SDK with only JAQ tools enabled. 
 
 The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `claims.json`, `assets.json`, `requests.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run. Action requests are evidence-backed `pending_authorization` placeholders only: this milestone does not fetch remote payloads or perform dynamic analysis.
 
+Review and decide requests explicitly:
+
+```sh
+./bin/jaq requests --run /absolute/path/to/run
+./bin/jaq approve --run /absolute/path/to/run --request request-1
+./bin/jaq deny --run /absolute/path/to/run --request request-2
+```
+
+An approved `fetch_remote_payload` uses a disposable, rootless Docker fetch with no host mounts, redirects disabled, a 64 MiB limit, and a 45-second deadline. A fetched PE receives a child JAQ run linked by `parent-request.json`. Dynamic-analysis approvals create an `awaiting_external_executor` handoff only; JAQ still has no dynamic executor.
+
 Run the credential-free test suite with `make test`. After building the image, verify the real offline container with `go test -tags=integration ./internal/sandbox -run TestPersistentSandboxRuntimeContract -v`. A live model run remains operator-triggered. Dynamic analysis is deliberately absent. See [TECHNICAL_VISION.md](TECHNICAL_VISION.md) for the detailed trust boundary.

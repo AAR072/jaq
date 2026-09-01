@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PureWindowsPath
 import signal
 import subprocess
 import threading
 from typing import Any, Mapping, Sequence
 
+from .candidates import extract_candidates
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .prompts import INVESTIGATION_SCHEMA, INVESTIGATOR_SYSTEM_PROMPT, INVESTIGATOR_TOOLS, build_investigator_messages
 
@@ -87,7 +89,7 @@ class PiHarnessConfig:
             max_tool_calls=_positive_int_env("JAQ_MAX_TOOL_CALLS", 40, 1000),
             max_total_tokens=_positive_int_env("JAQ_MAX_TOTAL_TOKENS", 500_000, 100_000_000),
             max_cost_usd=_positive_float_env("JAQ_MAX_COST_USD", 0.10, 1000.0),
-            max_output_tokens=_positive_int_env("JAQ_MAX_OUTPUT_TOKENS", 8_000, 100_000),
+            max_output_tokens=_positive_int_env("JAQ_MAX_OUTPUT_TOKENS", 32_768, 100_000),
             tool_preview_chars=_positive_int_env("JAQ_TOOL_PREVIEW_CHARS", 2_400, 64_000),
             max_context_tokens=_positive_int_env("JAQ_MAX_CONTEXT_TOKENS", 64_000, 2_000_000),
             keep_recent_tokens=_positive_int_env("JAQ_KEEP_RECENT_TOKENS", 12_000, 500_000),
@@ -156,6 +158,7 @@ class PiToolBroker:
     def __init__(self, store: Any, runtime: Any) -> None:
         self.store = store
         self.runtime = runtime
+        self.candidate_snapshot = extract_candidates(store.observations)
         self.legacy = Investigator(
             store,
             model_client=object(),
@@ -179,11 +182,35 @@ class PiToolBroker:
                 "description": str(function.get("description", "")),
                 "parameters": dict(function.get("parameters", {})),
             })
+        definitions.append({
+            "name": "list_candidate_assets",
+            "description": "List deterministic infrastructure, credential, wallet, key, and remote-payload candidates that must be reconciled before submission.",
+            "parameters": {"type": "object", "additionalProperties": False, "properties": {}},
+        })
         return definitions
+
+    def _candidates(self):
+        return list(self.candidate_snapshot)
+
+    @staticmethod
+    def _leaf_values(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            result: list[Any] = []
+            for item in value.values(): result.extend(PiToolBroker._leaf_values(item))
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for item in value: result.extend(PiToolBroker._leaf_values(item))
+            return result
+        return [value]
 
     def execute(self, name: str, arguments: Any) -> Any:
         if not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise PiHarnessError("Pi supplied an invalid tool request")
+        if name == "list_candidate_assets":
+            if arguments:
+                raise PiHarnessError("list_candidate_assets accepts no arguments")
+            return {"candidates": [item.to_dict() for item in self._candidates()]}
         return self.legacy._execute_tool(name, dict(arguments))
 
     def validate_claims(self, payload: Any) -> dict[str, Any]:
@@ -195,6 +222,80 @@ class PiToolBroker:
         )
         assets = self._validate_records(payload.get("assets"), "asset", 500)
         requests = self._validate_records(payload.get("action_requests"), "request", 100, requests=True)
+        candidates = self._candidates()
+        candidate_by_key = {(item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)): item for item in candidates}
+        covered: set[tuple[str, str]] = set()
+        for asset in assets:
+            normalized = asset.get("normalized_value")
+            if asset.get("type") == "payload_hash" and isinstance(normalized, Mapping) and len(normalized) == 1:
+                normalized = next(iter(normalized.values()))
+            if asset.get("type") == "registry_path" and isinstance(normalized, str):
+                normalized = normalized.lower()
+                if normalized.startswith(("software\\", "system\\")):
+                    normalized = "hklm\\" + normalized
+            key = (str(asset.get("type")), json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+            if key in covered: raise PiHarnessError("duplicate normalized asset")
+            candidate = candidate_by_key.get(key)
+            if candidate is None:
+                leaves: list[Any] = []
+                for evidence_id in asset["evidence_ids"]:
+                    observation = self.store.get(evidence_id)
+                    leaves.extend(self._leaf_values(observation.raw_value)); leaves.extend(self._leaf_values(observation.normalized_value))
+                asserted = self._leaf_values(asset.get("value"))
+                if asset.get("type") == "service_name" and len(asserted) == 1 and isinstance(asserted[0], str):
+                    asserted = [item.strip() for item in asserted[0].split(";") if item.strip()]
+                if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "," in asserted[0]:
+                    asserted = [item.strip() for item in asserted[0].split(",") if item.strip()]
+                if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "\n" in asserted[0]:
+                    asserted = [item.strip() for item in asserted[0].splitlines() if item.strip()]
+                exact_lines = {
+                    (re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()).group(2)
+                     if re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()) else line.strip())
+                    for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
+                }
+                exact_lines |= {
+                    match.group(1)
+                    for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
+                    if (match := re.search(r"['\"]([^'\"]{1,2048})['\"]\s*$", line.strip()))
+                }
+                if asset.get("type") == "filename":
+                    exact_lines |= {PureWindowsPath(item).name for item in exact_lines}
+                if asset.get("type") == "configuration":
+                    exact_lines |= {item.lstrip(".") for item in exact_lines}
+                if asset.get("type") == "command":
+                    command_lines = {
+                        re.sub(r"^\d+\s+['\"]", "", line.strip()).rstrip("'\"")
+                        for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
+                    }
+                    supported = bool(asserted) and all(item in command_lines for item in asserted)
+                else:
+                    supported = bool(asserted) and all(
+                        item in leaves or item in exact_lines
+                        or (asset.get("type") in {"path", "filename"} and isinstance(item, str) and any(line.endswith(item) for line in exact_lines))
+                        for item in asserted
+                    )
+                if not supported:
+                    raise PiHarnessError(f"asset {asset['id']} is not exactly present in cited evidence")
+            else:
+                if candidate.value not in self._leaf_values(asset.get("value")):
+                    raise PiHarnessError(f"asset {asset['id']} raw value does not match its deterministic candidate")
+                if not set(asset["evidence_ids"]).intersection(candidate.evidence_ids):
+                    raise PiHarnessError(f"asset {asset['id']} does not cite its deterministic candidate evidence")
+            covered.add(key)
+        missing = [item.id for item in candidates if (item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)) not in covered]
+        if missing:
+            raise PiHarnessError("investigation omitted deterministic asset candidate(s): " + ", ".join(missing[:20]))
+        requested_urls = {
+            str(item.get("target", {}).get("url"))
+            for item in requests
+            if item.get("kind") == "fetch_remote_payload" and isinstance(item.get("target"), Mapping)
+        }
+        missing_requests = [
+            item.id for item in candidates
+            if item.role == "remote_payload_reference" and item.value not in requested_urls
+        ]
+        if missing_requests:
+            raise PiHarnessError("remote payload candidate(s) require fetch_remote_payload requests: " + ", ".join(missing_requests[:20]))
         return {"schema_version": "1.0", "claims": canonical_claims["claims"], "assets": assets, "action_requests": requests}
 
     def _validate_records(self, records: Any, label: str, maximum: int, requests: bool = False) -> list[dict[str, Any]]:
@@ -396,8 +497,16 @@ class PiInvestigator:
             "\n\nPi harness override: do not return claims as assistant text. "
             "When the evidence is sufficient, call submit_investigation with claims, assets, and action_requests."
         )
+        broker = PiToolBroker(self.store, self.runtime)
+        candidate_inventory = broker.execute("list_candidate_assets", {})
+        operational_task += (
+            "\n\nMandatory deterministic asset inventory follows. Submit one matching asset for every candidate, "
+            "using its exact type, value, normalized_value, and at least one listed evidence ID. "
+            "Remote payload candidates also require pending fetch_remote_payload requests. Additional assets are allowed only for exact standalone values present in cited evidence; do not synthesize combined paths, configurations, or lists.\n"
+            + json.dumps(candidate_inventory, ensure_ascii=False, sort_keys=True)
+        )
         result = PiHarnessRunner(self.config).run(
-            PiToolBroker(self.store, self.runtime),
+            broker,
             system_prompt=pi_system_prompt,
             task=operational_task,
         )

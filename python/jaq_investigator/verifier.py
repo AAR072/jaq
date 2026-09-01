@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import json
+import re
 from typing import Any
 
 from .evidence import EvidenceStore
@@ -66,6 +68,15 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
             "rejected",
             ("evidence IDs do not exist: " + ", ".join(missing),),
         )
+
+    cited_text = "\n".join(
+        json.dumps(store.get(evidence_id).to_dict(), ensure_ascii=False, sort_keys=True).lower()
+        for evidence_id in normalized.evidence_ids
+    )
+    exact_values = set(re.findall(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b|\b[a-fA-F0-9]{128}\b|https?://[^\s`<>]+", normalized.explanation))
+    unsupported_values = sorted(value for value in exact_values if value.lower().rstrip(".,);") not in cited_text)
+    if unsupported_values:
+        return _result(normalized, "rejected", ("exact value absent from cited evidence: " + ", ".join(unsupported_values[:10]),))
 
     reachability = normalized.reachability
     missing_path = [

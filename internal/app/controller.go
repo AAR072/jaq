@@ -281,6 +281,12 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	closed = true
 
 	manifest.Status = "completed"
+	var requestDocument map[string]any
+	if readErr := readJSONStrict(filepath.Join(outputDir, "requests.json"), &requestDocument); readErr == nil {
+		if requests, ok := requestDocument["action_requests"].([]any); ok && len(requests) > 0 {
+			manifest.Status = "awaiting_authorization"
+		}
+	}
 	manifest.FinishedAt = c.now().UTC()
 	manifest.Error = ""
 	if err := manifest.Validate(); err != nil {
@@ -313,12 +319,55 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 			return fmt.Errorf("reject investigator output: %s must be a nonempty bounded regular file", name)
 		}
 	}
+	if err := validateOperationalReferences(outputDir, observations); err != nil {
+		return err
+	}
 	info, err := os.Stat(filepath.Join(outputDir, "report.md"))
 	if err != nil {
 		return fmt.Errorf("reject investigator report: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
 		return errors.New("reject investigator report: report.md must be a nonempty bounded regular file")
+	}
+	return nil
+}
+
+func validateOperationalReferences(outputDir string, observations []evidence.Observation) error {
+	ids := map[string]bool{}
+	for _, item := range observations {
+		ids[item.ID] = true
+	}
+	for _, spec := range []struct{ name, key string }{{"assets.json", "assets"}, {"requests.json", "action_requests"}} {
+		var document map[string]any
+		if err := readJSONStrict(filepath.Join(outputDir, spec.name), &document); err != nil {
+			return fmt.Errorf("reject %s: %w", spec.name, err)
+		}
+		if document["schema_version"] != "1.0" {
+			return fmt.Errorf("reject %s: unsupported schema", spec.name)
+		}
+		records, ok := document[spec.key].([]any)
+		if !ok {
+			return fmt.Errorf("reject %s: missing %s array", spec.name, spec.key)
+		}
+		for _, raw := range records {
+			record, ok := raw.(map[string]any)
+			if !ok {
+				return fmt.Errorf("reject %s: record must be object", spec.name)
+			}
+			refs, ok := record["evidence_ids"].([]any)
+			if !ok || len(refs) == 0 {
+				return fmt.Errorf("reject %s: evidence_ids required", spec.name)
+			}
+			for _, ref := range refs {
+				text, ok := ref.(string)
+				if !ok || !ids[text] {
+					return fmt.Errorf("reject %s: missing evidence reference", spec.name)
+				}
+			}
+			if spec.name == "requests.json" && record["status"] != "pending_authorization" {
+				return errors.New("reject requests.json: initial requests must be pending_authorization")
+			}
+		}
 	}
 	return nil
 }

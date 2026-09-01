@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import hashlib
 import json
 import os
 import sys
@@ -150,10 +151,16 @@ def run_pipeline(
 
 def _render_operational(investigation: Mapping[str, Any]) -> str:
     safe = lambda value: html.escape(str(value), quote=True).replace("\n", " ")
+    sensitive = {"api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "encryption_key", "database_connection"}
+    def display(item: Mapping[str, Any]) -> str:
+        value = str(item.get("value"))
+        if item.get("type") in sensitive:
+            return value[:4] + "… sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
+        return value
     lines = ["\n## Operational assets\n"]
     assets = investigation.get("assets", [])
     lines.extend(
-        f"- <code>{safe(item.get('type'))}</code> <code>{safe(item.get('value'))}</code> — {safe(item.get('role'))} (confidence {safe(item.get('confidence'))})"
+        f"- <code>{safe(item.get('type'))}</code> <code>{safe(display(item))}</code> — {safe(item.get('role'))} (confidence {safe(item.get('confidence'))})"
         for item in assets
     )
     if not assets:

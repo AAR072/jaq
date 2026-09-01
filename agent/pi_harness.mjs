@@ -215,6 +215,15 @@ async function main() {
     label: "Submit investigation",
     description: "Validate and submit final claims, operational assets, and pending action requests. This terminates the investigation.",
     parameters: Type.Unsafe(init.claims_schema),
+    prepareArguments(args) {
+      const value = structuredClone(args ?? {});
+      value.schema_version ??= "1.0";
+      for (const item of value.claims ?? []) item.schema_version ??= "1.0";
+      for (const item of value.assets ?? []) item.schema_version ??= "1.0";
+      for (const item of value.action_requests ?? []) item.schema_version ??= "1.0";
+      for (const claim of value.claims ?? []) claim.reachability && (claim.reachability.schema_version ??= "1.0");
+      return value;
+    },
     executionMode: "sequential",
     async execute(_callID, params) {
       if (submittedClaims !== undefined) {

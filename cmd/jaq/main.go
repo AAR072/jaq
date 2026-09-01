@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/jaq-project/jaq/internal/acquire"
 	"github.com/jaq-project/jaq/internal/app"
 	invprocess "github.com/jaq-project/jaq/internal/investigator"
+	peinfo "github.com/jaq-project/jaq/internal/pe"
 )
 
 func main() {
@@ -23,14 +25,93 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: jaq analyze --sample <absolute-path> --output <directory>")
+		return errors.New("usage: jaq <analyze|requests|approve|deny|resume> [options]")
 	}
 	if args[0] == "version" || args[0] == "--version" {
 		fmt.Println("jaq", app.Version)
 		return nil
 	}
 	if args[0] != "analyze" {
-		return fmt.Errorf("unknown command %q (expected analyze)", args[0])
+		if args[0] == "resume" {
+			flags := flag.NewFlagSet("jaq resume", flag.ContinueOnError)
+			runDir := flags.String("run", "", "absolute existing run directory")
+			if err := flags.Parse(args[1:]); err != nil {
+				return err
+			}
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			results, err := acquire.Resume(ctx, *runDir)
+			if err != nil {
+				return err
+			}
+			for _, result := range results {
+				fmt.Printf("JAQ request %s: %s\n", result.RequestID, result.Status)
+				if result.ArtifactPath != "" {
+					fmt.Println("Fetched artifact:", result.ArtifactPath, "sha256:", result.SHA256)
+					if _, parseErr := peinfo.AnalyzeFile(result.ArtifactPath); parseErr == nil {
+						root, rootErr := projectRoot()
+						if rootErr != nil {
+							return rootErr
+						}
+						controller, controllerErr := app.NewController(root)
+						if controllerErr != nil {
+							return controllerErr
+						}
+						childOutput := filepath.Join(filepath.Dir(result.ArtifactPath), "analysis")
+						if analyzeErr := controller.Analyze(ctx, result.ArtifactPath, childOutput); analyzeErr != nil {
+							return analyzeErr
+						}
+						provenance := fmt.Sprintf("{\"schema_version\":\"1.0\",\"parent_run\":%q,\"request_id\":%q,\"artifact_sha256\":%q}\n", *runDir, result.RequestID, result.SHA256)
+						if writeErr := os.WriteFile(filepath.Join(childOutput, "parent-request.json"), []byte(provenance), 0o600); writeErr != nil {
+							return writeErr
+						}
+						if recordErr := acquire.RecordChild(*runDir, result.RequestID, childOutput); recordErr != nil {
+							return recordErr
+						}
+						fmt.Println("Child dossier:", childOutput)
+					}
+				}
+			}
+			return nil
+		}
+		if args[0] == "requests" {
+			flags := flag.NewFlagSet("jaq requests", flag.ContinueOnError)
+			runDir := flags.String("run", "", "absolute completed run directory")
+			if err := flags.Parse(args[1:]); err != nil {
+				return err
+			}
+			value, err := acquire.ReadRequests(filepath.Join(*runDir, "requests.json"))
+			if err != nil {
+				return err
+			}
+			for _, item := range value.ActionRequests {
+				fmt.Printf("%s\t%s\t%s\n", item.ID, item.Kind, item.Status)
+			}
+			return nil
+		}
+		if args[0] == "approve" || args[0] == "deny" {
+			flags := flag.NewFlagSet("jaq "+args[0], flag.ContinueOnError)
+			runDir := flags.String("run", "", "absolute completed run directory")
+			requestID := flags.String("request", "", "pending action request ID")
+			if err := flags.Parse(args[1:]); err != nil {
+				return err
+			}
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			var result acquire.ApprovalResult
+			var err error
+			if args[0] == "approve" {
+				result, err = acquire.Approve(ctx, *runDir, *requestID)
+			} else {
+				result, err = acquire.Deny(*runDir, *requestID)
+			}
+			if err != nil {
+				return err
+			}
+			fmt.Printf("JAQ request %s: %s\n", result.RequestID, result.Status)
+			return nil
+		}
+		return fmt.Errorf("unknown command %q (expected analyze, requests, approve, deny, or resume)", args[0])
 	}
 	flags := flag.NewFlagSet("jaq analyze", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)

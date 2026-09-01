@@ -58,6 +58,18 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertIn("missing", result.reasons[0])
 
+    def test_exact_hash_in_explanation_must_exist_in_cited_evidence(self):
+        actual = "a" * 64
+        store = self.store([self.observation("hash", actual, type="artifact.hash.sha256")])
+        claim = Claim(
+            id="claim-hash", classification="metadata", explanation="SHA256 " + "b" * 64,
+            confidence=0.9, evidence_ids=("hash",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(claim, store)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("exact value absent", result.reasons[0])
+
     def test_reachable_without_relationship_is_rejected(self):
         store = self.store([self.observation("main", "main"), self.observation("asset", "secret")])
         claim = self.claim(

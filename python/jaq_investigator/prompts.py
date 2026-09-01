@@ -151,7 +151,7 @@ ASSET_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": {"type": "string", "const": "1.0"},
         "id": {"type": "string", "minLength": 1, "maxLength": 200},
-        "type": {"type": "string", "enum": ["url", "domain", "ip_address", "email", "crypto_wallet", "c2_endpoint", "download_location", "api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "certificate", "encryption_key", "webhook", "cloud_bucket", "database_connection", "mutex", "named_pipe", "registry_path", "service_name", "scheduled_task", "payload_hash", "embedded_payload", "remote_payload", "configuration", "other"]},
+        "type": {"type": "string", "enum": ["url", "domain", "ip_address", "email", "crypto_wallet", "c2_endpoint", "download_location", "api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "certificate", "encryption_key", "webhook", "cloud_bucket", "database_connection", "command", "filename", "path", "mutex", "named_pipe", "registry_path", "service_name", "scheduled_task", "payload_hash", "embedded_payload", "remote_payload", "configuration", "other"]},
         "value": {}, "normalized_value": {},
         "role": {"type": "string", "minLength": 1, "maxLength": 200},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
