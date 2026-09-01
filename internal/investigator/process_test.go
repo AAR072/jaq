@@ -36,3 +36,11 @@ func TestRedactSensitiveRemovesProviderCredential(t *testing.T) {
 		t.Fatalf("credential remained in diagnostic: %q", message)
 	}
 }
+
+func TestConfigureSandboxStoresOnlyLogicalSessionMetadata(t *testing.T) {
+	p := NewProcess("")
+	p.ConfigureSandbox("jaq-sandbox-test", strings.Repeat("a", 64), "6.2.0", "1.8.6")
+	if p.SandboxContainer != "jaq-sandbox-test" || p.SampleSHA256 != strings.Repeat("a", 64) || p.RadareVersion != "6.2.0" || p.MCPVersion != "1.8.6" {
+		t.Fatalf("sandbox configuration mismatch: %#v", p)
+	}
+}

@@ -6,42 +6,44 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/jaq-project/jaq/internal/analyzer"
 	"github.com/jaq-project/jaq/internal/evidence"
 	invprocess "github.com/jaq-project/jaq/internal/investigator"
 	peinfo "github.com/jaq-project/jaq/internal/pe"
+	sandboxruntime "github.com/jaq-project/jaq/internal/sandbox"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
-const ghidraArchiveSHA256 = "93a5d11a9ad510622acaaf908c556a7b9b764d338e78a7567f3689bf5081fd54"
-const analyzerBaseDigest = "sha256:ce5767b7222312d42395f5bab033cd91f09e44032a2f21bdfd7b5b912dbe1e77"
-
-type StaticAnalyzer interface {
-	Analyze(ctx context.Context, samplePath, evidenceDir string) error
-}
+const (
+	radare2Version       = "6.2.0"
+	radare2ArchiveSHA256 = "098488a3a0a4c11b893ae9e74496cf65561d17cefd9b7f2661a48b4be97b663a"
+	r2MCPVersion         = "1.8.6"
+	r2MCPCommit          = "d74b6b9855622c9a7070165b1961262afd686a3f"
+	sandboxBaseDigest    = "sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
+)
 
 type Investigator interface {
 	Investigate(ctx context.Context, evidenceDir string) error
 }
 
-type imageIdentifier interface {
-	ImageID(ctx context.Context) (string, error)
+type sandboxAwareInvestigator interface {
+	ConfigureSandbox(containerName, sampleSHA256, radareVersion, mcpVersion string)
 }
 
-type artifactBoundAnalyzer interface {
-	AnalyzeExpected(ctx context.Context, samplePath, evidenceDir, expectedSHA256 string) error
+type SandboxSession interface {
+	ContainerName() string
+	ImageID() string
+	Close(ctx context.Context) error
 }
 
 type Config struct {
-	AnalyzerImage     string
+	SandboxImage      string
 	InvestigatorModel string
 	JudgeModel        string
 	PromptHashes      map[string]string
@@ -50,15 +52,15 @@ type Config struct {
 }
 
 type Controller struct {
-	Analyzer     StaticAnalyzer
-	Investigator Investigator
-	AnalyzePE    func(string) (*peinfo.Analysis, error)
-	Now          func() time.Time
-	Config       Config
+	Investigator        Investigator
+	AnalyzePE           func(string) (*peinfo.Analysis, error)
+	ResolveSandboxImage func(context.Context) (string, error)
+	StartSandbox        func(context.Context, string, string) (SandboxSession, error)
+	Now                 func() time.Time
+	Config              Config
 }
 
 func NewController(projectRoot string) (*Controller, error) {
-	docker := analyzer.NewDocker()
 	promptHash, err := hashFile(filepath.Join(projectRoot, "python", "jaq_investigator", "prompts.py"))
 	if err != nil {
 		return nil, fmt.Errorf("hash investigator prompts: %w", err)
@@ -68,13 +70,17 @@ func NewController(projectRoot string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandbox := sandboxruntime.NewDocker()
 	return &Controller{
-		Analyzer:     docker,
-		Investigator: process,
-		AnalyzePE:    peinfo.AnalyzeFile,
-		Now:          time.Now,
+		Investigator:        process,
+		AnalyzePE:           peinfo.AnalyzeFile,
+		ResolveSandboxImage: sandbox.ImageID,
+		StartSandbox: func(ctx context.Context, sample, expectedSHA256 string) (SandboxSession, error) {
+			return sandbox.Start(ctx, sample, expectedSHA256)
+		},
+		Now: time.Now,
 		Config: Config{
-			AnalyzerImage:     docker.Image,
+			SandboxImage:      sandbox.Image,
 			InvestigatorModel: os.Getenv("JAQ_INVESTIGATOR_MODEL"),
 			JudgeModel:        os.Getenv("JAQ_JUDGE_MODEL"),
 			PromptHashes: map[string]string{
@@ -108,15 +114,12 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	if strings.TrimSpace(c.Config.InvestigatorModel) == "" {
 		return errors.New("JAQ_INVESTIGATOR_MODEL is required (LiteLLM provider/model string)")
 	}
-	if c.Analyzer == nil || c.Investigator == nil {
-		return errors.New("analysis stages are not configured")
+	if c.Investigator == nil || c.ResolveSandboxImage == nil || c.StartSandbox == nil {
+		return errors.New("static sandbox stages are not configured")
 	}
-	analyzerImageID := "not-reported-by-analyzer"
-	if identifier, ok := c.Analyzer.(imageIdentifier); ok {
-		analyzerImageID, err = identifier.ImageID(ctx)
-		if err != nil {
-			return err
-		}
+	sandboxImageID, err := c.ResolveSandboxImage(ctx)
+	if err != nil {
+		return err
 	}
 	outputDir, err := prepareOutput(outputPath)
 	if err != nil {
@@ -124,61 +127,55 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	}
 
 	nativeConfigHash, err := contentHash(map[string]any{
-		"schema_version":  evidence.SchemaVersion,
-		"analyzer":        "jaq-pe",
-		"version":         nativeAnalyzerVersion,
+		"schema_version": evidence.SchemaVersion, "analyzer": "jaq-pe", "version": nativeAnalyzerVersion,
 		"file_size_limit": peinfo.MaxPEFileSize,
 		"string_limits":   map[string]int{"count": peinfo.MaxStrings, "length": peinfo.MaxStringLength},
 	})
 	if err != nil {
 		return fmt.Errorf("hash native analyzer configuration: %w", err)
 	}
-	ghidraConfigHash, err := contentHash(map[string]any{
-		"jaq_version": Version, "ghidra_version": "12.1.3",
-		"ghidra_archive_sha256": ghidraArchiveSHA256, "analyzer_image": c.Config.AnalyzerImage,
-		"base_image_digest": analyzerBaseDigest,
-		"runtime_image_id":  analyzerImageID,
+	sandboxConfigHash, err := contentHash(map[string]any{
+		"jaq_version": Version, "image": c.Config.SandboxImage, "image_id": sandboxImageID,
+		"base_digest": sandboxBaseDigest,
+		"radare2":     radare2Version, "radare2_archive_sha256": radare2ArchiveSHA256,
+		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
+		"network": "none", "sample": "read-only", "scratch": "tmpfs",
 	})
 	if err != nil {
-		return fmt.Errorf("hash Ghidra analyzer configuration: %w", err)
+		return fmt.Errorf("hash static sandbox configuration: %w", err)
 	}
 	pipelineConfigHash, err := contentHash(map[string]any{
-		"schema_version": evidence.SchemaVersion, "native_config_hash": nativeConfigHash,
-		"ghidra_config_hash": ghidraConfigHash, "investigator_model": c.Config.InvestigatorModel,
-		"judge_model": c.Config.JudgeModel,
+		"schema_version":     evidence.SchemaVersion,
+		"native_config_hash": nativeConfigHash, "sandbox_config_hash": sandboxConfigHash,
+		"investigator_model": c.Config.InvestigatorModel, "judge_model": c.Config.JudgeModel,
 	})
 	if err != nil {
 		return fmt.Errorf("hash pipeline configuration: %w", err)
 	}
+
 	started := c.now().UTC()
 	runID := "run-" + peResult.Hashes.SHA256[:16] + "-" + pipelineConfigHash[:8]
 	manifest := evidence.NewRunManifest(runID, evidence.ArtifactMetadata{
 		Name: filepath.Base(samplePath), Size: peResult.Size, Hashes: peResult.Hashes,
 	}, started)
 	manifest.Versions = map[string]string{
-		"jaq":                   Version,
-		"schema":                evidence.SchemaVersion,
-		"go":                    runtime.Version(),
-		"go_platform":           runtime.GOOS + "/" + runtime.GOARCH,
-		"native_pe_analyzer":    nativeAnalyzerVersion,
-		"ghidra":                "12.1.3",
-		"ghidra_archive_sha256": ghidraArchiveSHA256,
-		"analyzer_image":        c.Config.AnalyzerImage,
-		"analyzer_base_digest":  analyzerBaseDigest,
-		"analyzer_image_id":     analyzerImageID,
-		"python":                c.Config.PythonVersion,
-		"python_package":        "jaq-investigator/" + Version,
-		"litellm":               c.Config.LiteLLMVersion,
+		"jaq": Version, "schema": evidence.SchemaVersion,
+		"go": runtime.Version(), "go_platform": runtime.GOOS + "/" + runtime.GOARCH,
+		"native_pe_analyzer": nativeAnalyzerVersion,
+		"radare2":            radare2Version, "radare2_archive_sha256": radare2ArchiveSHA256,
+		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
+		"sandbox_base_digest": sandboxBaseDigest,
+		"sandbox_image":       c.Config.SandboxImage, "sandbox_image_id": sandboxImageID,
+		"python": c.Config.PythonVersion, "python_package": "jaq-investigator/" + Version,
+		"litellm": c.Config.LiteLLMVersion,
 	}
 	manifest.ConfigurationHashes["native_pe"] = nativeConfigHash
-	manifest.ConfigurationHashes["ghidra"] = ghidraConfigHash
+	manifest.ConfigurationHashes["static_sandbox"] = sandboxConfigHash
 	manifest.ConfigurationHashes["pipeline"] = pipelineConfigHash
 	for role, hash := range c.Config.PromptHashes {
 		manifest.PromptHashes[role] = hash
 	}
-	if c.Config.InvestigatorModel != "" {
-		manifest.ModelRoles["investigator"] = modelRole(c.Config.InvestigatorModel, c.Config.PromptHashes["investigator"])
-	}
+	manifest.ModelRoles["investigator"] = modelRole(c.Config.InvestigatorModel, c.Config.PromptHashes["investigator"])
 	if c.Config.JudgeModel != "" {
 		manifest.ModelRoles["judge"] = modelRole(c.Config.JudgeModel, c.Config.PromptHashes["judge"])
 	}
@@ -191,7 +188,11 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 			return
 		}
 		resultErr = errors.New(invprocess.RedactSensitive(resultErr.Error()))
-		manifest.Status = "failed"
+		if fileSize(filepath.Join(outputDir, "observations.jsonl")) > 0 {
+			manifest.Status = "partial"
+		} else {
+			manifest.Status = "failed"
+		}
 		manifest.Error = sanitizeManifestError(resultErr.Error())
 		manifest.FinishedAt = c.now().UTC()
 		if writeErr := writeJSONAtomic(manifestPath, manifest); writeErr != nil {
@@ -201,58 +202,64 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 
 	nativeStarted := c.now().UTC()
 	observations := nativeObservations(peResult, nativeConfigHash)
-	manifest.StageUsage["native_pe"] = stageUsage(nativeStarted, c.now().UTC(), peResult.Size, 0)
-
-	ghidraStarted := c.now().UTC()
-	if err := verifySampleHash(samplePath, peResult.Hashes.SHA256); err != nil {
-		return err
-	}
-	var analyzerErr error
-	if bound, ok := c.Analyzer.(artifactBoundAnalyzer); ok {
-		analyzerErr = bound.AnalyzeExpected(ctx, samplePath, outputDir, peResult.Hashes.SHA256)
-	} else {
-		analyzerErr = c.Analyzer.Analyze(ctx, samplePath, outputDir)
-	}
-	if analyzerErr != nil {
-		manifest.StageUsage["ghidra"] = stageUsage(ghidraStarted, c.now().UTC(), peResult.Size, 0)
-		return analyzerErr
-	}
-	if err := verifySampleHash(samplePath, peResult.Hashes.SHA256); err != nil {
-		return err
-	}
-	rawPath := filepath.Join(outputDir, "raw-observations.jsonl")
-	ghidraObservations, err := readRawObservations(rawPath, peResult.Hashes.SHA256, ghidraConfigHash)
-	if err != nil {
-		manifest.StageUsage["ghidra"] = stageUsage(ghidraStarted, c.now().UTC(), peResult.Size, fileSize(rawPath))
-		return err
-	}
-	observations = append(observations, ghidraObservations...)
-	observations, err = evidence.DeduplicateObservations(observations)
-	if err != nil {
-		return fmt.Errorf("validate merged evidence: %w", err)
-	}
 	observationsPath := filepath.Join(outputDir, "observations.jsonl")
 	if err := evidence.WriteObservationsFile(observationsPath, observations); err != nil {
-		return fmt.Errorf("write evidence package: %w", err)
+		return fmt.Errorf("write native evidence package: %w", err)
 	}
 	if err := os.Chmod(observationsPath, 0o600); err != nil {
 		return fmt.Errorf("protect evidence package: %w", err)
 	}
-	manifest.StageUsage["ghidra"] = stageUsage(ghidraStarted, c.now().UTC(), peResult.Size, fileSize(observationsPath))
-	if err := os.Remove(rawPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove transient Ghidra output: %w", err)
+	manifest.StageUsage["native_pe"] = stageUsage(nativeStarted, c.now().UTC(), peResult.Size, fileSize(observationsPath))
+
+	sandboxStarted := c.now().UTC()
+	session, err := c.StartSandbox(ctx, samplePath, peResult.Hashes.SHA256)
+	if err != nil {
+		if session != nil {
+			_ = session.Close(context.Background())
+		}
+		return fmt.Errorf("start static sandbox: %w", err)
 	}
+	if session == nil {
+		return errors.New("start static sandbox returned no session")
+	}
+	if session.ImageID() != sandboxImageID {
+		_ = session.Close(context.Background())
+		return fmt.Errorf("static sandbox image mismatch: resolved %s, started %s", sandboxImageID, session.ImageID())
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = session.Close(context.Background())
+		}
+	}()
+	configured, ok := c.Investigator.(sandboxAwareInvestigator)
+	if !ok {
+		return errors.New("investigator cannot accept a static sandbox session")
+	}
+	configured.ConfigureSandbox(session.ContainerName(), peResult.Hashes.SHA256, radare2Version, r2MCPVersion)
+	manifest.StageUsage["static_sandbox"] = stageUsage(sandboxStarted, c.now().UTC(), peResult.Size, 0)
 
 	investigatorStarted := c.now().UTC()
 	if err := c.Investigator.Investigate(ctx, outputDir); err != nil {
 		manifest.StageUsage["investigator"] = stageUsage(investigatorStarted, c.now().UTC(), fileSize(observationsPath), 0)
 		return err
 	}
+	observations, err = evidence.ReadObservationsFile(observationsPath)
+	if err != nil {
+		return fmt.Errorf("validate interactive evidence package: %w", err)
+	}
+	if err := evidence.WriteObservationsFile(observationsPath, observations); err != nil {
+		return fmt.Errorf("canonicalize interactive evidence package: %w", err)
+	}
 	if err := validateInvestigatorOutputs(outputDir, observations, c.Config.JudgeModel != ""); err != nil {
 		manifest.StageUsage["investigator"] = stageUsage(investigatorStarted, c.now().UTC(), fileSize(observationsPath), outputSize(outputDir))
 		return err
 	}
 	manifest.StageUsage["investigator"] = stageUsage(investigatorStarted, c.now().UTC(), fileSize(observationsPath), outputSize(outputDir))
+	if err := session.Close(context.Background()); err != nil {
+		return fmt.Errorf("close static sandbox: %w", err)
+	}
+	closed = true
 
 	manifest.Status = "completed"
 	manifest.FinishedAt = c.now().UTC()
@@ -281,8 +288,7 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 	if judgeRequired && len(score.Judgments) != len(claims) {
 		return fmt.Errorf("reject investigator score: configured judge returned %d judgments for %d claims", len(score.Judgments), len(claims))
 	}
-	reportPath := filepath.Join(outputDir, "report.md")
-	info, err := os.Stat(reportPath)
+	info, err := os.Stat(filepath.Join(outputDir, "report.md"))
 	if err != nil {
 		return fmt.Errorf("reject investigator report: %w", err)
 	}
@@ -337,28 +343,6 @@ func hashFile(path string) (string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func verifySampleHash(path, expectedSHA256 string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("reopen sample for consistency check: %w", err)
-	}
-	hashes, size, hashErr := evidence.HashReader(io.LimitReader(file, peinfo.MaxPEFileSize+1))
-	closeErr := file.Close()
-	if hashErr != nil {
-		return fmt.Errorf("hash sample consistency check: %w", hashErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close sample consistency check: %w", closeErr)
-	}
-	if size > peinfo.MaxPEFileSize {
-		return errors.New("sample grew beyond the configured PE size limit")
-	}
-	if hashes.SHA256 != expectedSHA256 {
-		return errors.New("sample changed after initial validation; refusing inconsistent analysis")
-	}
-	return nil
 }
 
 func sanitizeManifestError(message string) string {

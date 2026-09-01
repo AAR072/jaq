@@ -89,17 +89,31 @@ class EvidenceStore(Protocol):
         ...
 
 
+@runtime_checkable
+class ToolRuntime(Protocol):
+    """Controller-created Radare2 MCP and static-command tool boundary."""
+
+    def model_tools(self) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def execute(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
 @dataclass
 class InvestigatorConfig:
     """Bounds and model selector for one investigator run."""
 
     model: str | None = None
     timeout: float = 60.0
-    max_rounds: int = 8
+    max_rounds: int = 20
     max_tool_output_chars: int = 16_000
-    max_tool_calls: int = 64
+    max_tool_calls: int = 128
     max_claims: int = 100
-    max_tokens: int = 4_000
+    max_tokens: int = 8_000
     temperature: float | None = None
     schema_version: str = DEFAULT_SCHEMA_VERSION
 
@@ -570,6 +584,7 @@ class Investigator:
         config: InvestigatorConfig | None = None,
         *,
         client: ModelClient | Any | None = None,
+        tool_runtime: ToolRuntime | None = None,
     ) -> None:
         if client is not None:
             if model_client is not None:
@@ -579,6 +594,10 @@ class Investigator:
         self.config = config or InvestigatorConfig.from_env()
         self.config.validate()
         self.model_client = model_client
+        self.tool_runtime = tool_runtime
+        self._model_tools = list(INVESTIGATOR_TOOLS)
+        if tool_runtime is not None:
+            self._model_tools.extend(dict(tool) for tool in tool_runtime.model_tools())
         self.last_run: InvestigatorRun | None = None
 
     def _get_client(self) -> Any:
@@ -604,7 +623,7 @@ class Investigator:
         kwargs = {
             "messages": messages,
             "schema": CLAIMS_SCHEMA,
-            "tools": INVESTIGATOR_TOOLS,
+            "tools": self._model_tools,
             "timeout": self.config.timeout,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -622,9 +641,72 @@ class Investigator:
             raise ModelTimeoutError("investigator model timed out") from error
 
     def _execute_tool(self, name: str, raw_arguments: Any) -> Any:
-        if name not in _ALLOWED_TOOL_NAMES:
-            raise InvalidToolCallError(f"tool {name!r} is not allowed")
         arguments = _parse_mapping_arguments(raw_arguments)
+        if name not in _ALLOWED_TOOL_NAMES:
+            if self.tool_runtime is None:
+                raise InvalidToolCallError(f"tool {name!r} is not allowed")
+            runtime_names = {
+                str(tool.get("function", {}).get("name"))
+                for tool in self.tool_runtime.model_tools()
+                if isinstance(tool, Mapping)
+            }
+            if name not in runtime_names:
+                raise InvalidToolCallError(f"tool {name!r} is not allowed")
+            try:
+                result = self.tool_runtime.execute(name, arguments)
+                if not isinstance(result, Mapping):
+                    raise EvidenceToolError("static tool returned an invalid evidence envelope")
+                observation_id = result.get("observation_id")
+                persisted = (
+                    self.evidence_store.get(observation_id)
+                    if isinstance(observation_id, str)
+                    else None
+                )
+                if persisted is None:
+                    raise EvidenceToolError("static tool result was not persisted before return")
+                status = result.get("status")
+                if status not in {"ok", "error", "timeout"}:
+                    raise EvidenceToolError("static tool returned an invalid status")
+                raw_value = getattr(persisted, "raw_value", None)
+                normalized_value = getattr(persisted, "normalized_value", None)
+                metadata = getattr(persisted, "metadata", None)
+                provenance = getattr(persisted, "provenance", None)
+                observation_type = getattr(persisted, "type", "")
+                if (
+                    observation_type not in {
+                        "radare2-mcp.tool_result",
+                        "static-sandbox.tool_result",
+                    }
+                    or not isinstance(raw_value, Mapping)
+                    or raw_value.get("tool") != name
+                    or raw_value.get("result") != result.get("untrusted_static_result")
+                    or not isinstance(normalized_value, Mapping)
+                    or normalized_value.get("status") != status
+                    or not isinstance(metadata, Mapping)
+                    or metadata.get("tool_name") != name
+                    or metadata.get("status") != status
+                    or not isinstance(provenance, Mapping)
+                    or provenance.get("stage") != "agent-tool-result"
+                ):
+                    raise EvidenceToolError("static tool evidence does not match its returned result")
+                parents = provenance.get("parent_observation_ids")
+                if not isinstance(parents, list) or len(parents) != 1:
+                    raise EvidenceToolError("static tool evidence has no unique request parent")
+                request = self.evidence_store.get(parents[0]) if isinstance(parents[0], str) else None
+                request_raw = getattr(request, "raw_value", None)
+                if (
+                    request is None
+                    or getattr(request, "type", "")
+                    != observation_type.removesuffix(".tool_result") + ".tool_request"
+                    or not isinstance(request_raw, Mapping)
+                    or request_raw.get("tool") != name
+                ):
+                    raise EvidenceToolError("static tool result is not correlated to its request")
+                return _cap_tool_result(result, self.config.max_tool_output_chars)
+            except InvestigatorError:
+                raise
+            except Exception as error:
+                raise EvidenceToolError(f"static tool {name!r} failed") from error
         if name == "list_observation_types":
             _require_only(arguments, set())
             call_kwargs: dict[str, Any] = {}

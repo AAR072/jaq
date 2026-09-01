@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const DefaultTimeout = 10 * time.Minute
+const DefaultTimeout = 30 * time.Minute
 
 var credentialPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]+`),
@@ -22,9 +22,22 @@ var credentialPatterns = []*regexp.Regexp{
 }
 
 type Process struct {
-	Python      string
-	ProjectRoot string
-	Timeout     time.Duration
+	Python           string
+	ProjectRoot      string
+	Timeout          time.Duration
+	SandboxContainer string
+	SampleSHA256     string
+	RadareVersion    string
+	MCPVersion       string
+}
+
+// ConfigureSandbox binds the host-side investigator to one controller-owned
+// offline container. No sample host path or provider credential is passed.
+func (p *Process) ConfigureSandbox(containerName, sampleSHA256, radareVersion, mcpVersion string) {
+	p.SandboxContainer = containerName
+	p.SampleSHA256 = sampleSHA256
+	p.RadareVersion = radareVersion
+	p.MCPVersion = mcpVersion
 }
 
 func NewProcess(projectRoot string) *Process {
@@ -67,6 +80,9 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 	if !filepath.IsAbs(evidenceDir) {
 		return errors.New("evidence directory must be absolute")
 	}
+	if p.SandboxContainer == "" || p.SampleSHA256 == "" {
+		return errors.New("static sandbox session is not configured")
+	}
 	python := p.Python
 	if python == "" {
 		python = "python3"
@@ -93,6 +109,12 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 		env = append(env, "PYTHONPATH="+pythonPath)
 	}
 	cmd.Env = env
+	cmd.Env = append(cmd.Env,
+		"JAQ_SANDBOX_CONTAINER="+p.SandboxContainer,
+		"JAQ_SAMPLE_SHA256="+p.SampleSHA256,
+		"JAQ_RADARE2_VERSION="+p.RadareVersion,
+		"JAQ_R2MCP_VERSION="+p.MCPVersion,
+	)
 	if err := cmd.Run(); err != nil {
 		if errors.Is(stageCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("investigator timed out after %s: %w", timeout, stageCtx.Err())

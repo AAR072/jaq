@@ -156,9 +156,9 @@ func TestStructuredRelationshipSupportsReachability(t *testing.T) {
 	source := testObservation("entry")
 	target := testObservation("asset")
 	relation := NewObservation(
-		"ghidra.call", "call", "call",
+		"radare2.call", "call", "call",
 		ArtifactLocation{Artifact: "sample"},
-		AnalyzerIdentity{Name: "ghidra", Version: "12.1.3"},
+		AnalyzerIdentity{Name: "radare2-mcp", Version: "1.8.6"},
 		Provenance{Source: "callgraph"},
 	)
 	relation.Relationships = map[string]any{"source_id": source.ID, "target_id": target.ID, "kind": "call"}

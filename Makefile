@@ -1,4 +1,4 @@
-.PHONY: build test test-go test-python fmt analyzer-image
+.PHONY: build test test-go test-python fmt sandbox-image
 
 build:
 	go build -o bin/jaq ./cmd/jaq
@@ -14,5 +14,5 @@ test-python:
 fmt:
 	gofmt -w $$(find cmd internal -name '*.go' -type f)
 
-analyzer-image:
-	docker build --pull --platform linux/amd64 -t jaq-ghidra:12.1.3 analysis
+sandbox-image:
+	docker build --pull --platform linux/amd64 -t jaq-radare2:6.2.0-mcp1.8.6 analysis

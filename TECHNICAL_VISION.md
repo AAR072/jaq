@@ -2,7 +2,7 @@
 
 ## Milestone 1: Autonomous Static PE Investigator
 
-JAQ's first milestone is a local, evidence-first vertical slice for defensively investigating a manually supplied Windows Portable Executable. The sample is inert input: JAQ validates and hashes it, mounts it read-only into a network-disabled static-analysis container, and never executes it or contacts any endpoint it contains.
+JAQ's first milestone is a local, evidence-first vertical slice for defensively investigating a manually supplied Windows Portable Executable. The sample is inert input: JAQ validates and hashes it, mounts it read-only into a network-disabled static-analysis container, and never launches it or contacts any endpoint it contains.
 
 The command-line contract is:
 
@@ -10,11 +10,11 @@ The command-line contract is:
 jaq analyze --sample <absolute-path> --output <directory>
 ```
 
-Go is the trusted controller. It validates the input, records a versioned run manifest, performs deterministic lightweight PE extraction, invokes the pinned Ghidra container with resource and privilege restrictions, merges the evidence package, launches the bounded Python investigator, and validates every persisted output before accepting a run. Stage failures and timeouts are recorded in the manifest.
+Go is the trusted controller. It validates the input, records a versioned run manifest, performs deterministic lightweight PE extraction, starts a pinned persistent Radare2 static sandbox, launches the Python investigator, and validates every persisted output before accepting a run. Native PE evidence is published before the sandbox starts, so later failures retain a partial evidence package.
 
-Python is the untrusted-model boundary. The investigator can only use typed, read-only queries over `observations.jsonl`; it has no shell, general filesystem operation, or network tool. LiteLLM sits behind a project-owned `ModelClient`, while logical `investigator` and optional `judge` roles select provider/model strings through configuration. Provider credentials remain in environment variables understood by LiteLLM and are never persisted in prompts, traces, manifests, or reports.
+Python is the untrusted-model boundary. The investigator may query existing evidence, drive a project-owned facade over the official Radare2 MCP stdio server, and run arbitrary shell commands inside the disposable static sandbox. It may write and execute helper Python or compiled code under `/work` to test deobfuscation, decoding, and decryption ideas. It receives no host shell, host filesystem, provider credentials, or network path. LiteLLM remains behind the project-owned `ModelClient`; logical `investigator` and optional static `judge` roles select provider/model strings through environment configuration.
 
-All binary-derived text is hostile data. Strings, symbol names, decompiler output, comments, resources, and embedded documents are delimited as evidence and never promoted to instructions. Model claims must conform to a versioned schema and cite observation IDs. Deterministic verification checks schema constraints, evidence existence, extracted values, reference relationships, and reachability claims where the evidence supports them. An optional independent judge adds a `supported`, `unsupported`, or `unclear` verdict; the pipeline remains fully testable with mocked clients and no provider credentials.
+All binary-derived text and all tool output are hostile data. Every investigator-selected Radare MCP or shell request is persisted before execution, and its bounded result is persisted before it is returned to the model. MCP initialization and tool discovery are bounded control traffic, not sample evidence. Claims may cite only observation IDs. Deterministic verification checks schemas, evidence existence, structured relationships, reachability where available, and judge consistency. The optional judge remains tool-free and sees only cited static evidence.
 
 Each completed run writes:
 
@@ -24,18 +24,20 @@ Each completed run writes:
 - `score.json`: verification results, optional judgments, and model usage.
 - `report.md`: an evidence-backed analyst dossier.
 
-Formats are versioned and validated at every trust boundary. Comparable runs use content-derived observation IDs, normalized ordering, pinned analyzer versions, and complete configuration metadata; wall-clock timestamps and resource usage are intentionally run-specific.
+Formats are versioned and validated at every trust boundary. Native observations remain comparable across identical runs; interactive command observations form a provenance chain containing the logical tool, arguments, result digest, analyzer version, and parent request ID.
 
 ## Security and isolation
 
-The Ghidra 12.1.3 image uses the official public release archive and SHA-256 checksum atop a digest-pinned JDK 21 base. At runtime Docker supplies no network, no Linux capabilities, no privilege escalation, a read-only root filesystem, a fixed non-root UID/GID, bounded processes and memory, a read-only single-file copy of the sample, and disposable in-memory project/temp storage. The container receives no writable host bind: it emits bounded raw evidence over stdout, which the controller validates and publishes afterward. The image and controller expose no dynamic-analysis path.
+The image pins Radare2 6.2.0 and the official radare2-mcp 1.8.6. The controller resolves and runs the local image by immutable content ID. Docker supplies no network, no Linux capabilities, no privilege escalation, a read-only root filesystem, fixed UID/GID 65532, bounded CPU/memory/processes, one read-only staged PE mount, and disposable tmpfs storage at `/work` and `/tmp`. No host directory is writable from the container.
 
-The host controller never interprets extracted endpoints as destinations. The investigator receives evidence records through an allowlisted in-process API, not paths or commands. Output paths are controller-selected and model responses cannot change them. Raw provider traces, credentials, samples, generated runs, Ghidra projects, and artifacts stay outside version control.
+The model may choose arbitrary command strings, but the host always launches one fixed `docker exec` argv and the string is interpreted only by `/bin/bash` inside the offline container. The image contains static utilities and compilers but intentionally excludes PE runtimes, emulators, Frida, and debugger tooling. The sample remains read-only and JAQ never launches it. Per-command and whole-run deadlines, container resource limits, and forced container cleanup bound helper processes. Raw provider traces, credentials, samples, generated runs, scratch files, and derived artifacts stay outside version control.
+
+There is an unavoidable semantic boundary here: arbitrary helper code operating on PE bytes is Turing-complete, so a kernel cannot reliably distinguish a static decoder from a hand-written emulator. This milestone enforces the absence of native PE execution and supplied dynamic toolchains, while the investigator policy forbids emulation and runtime analysis. A future hard semantic guarantee would require replacing arbitrary commands with brokered transformations; that would conflict with the deliberately open-ended deobfuscation workflow selected for this milestone.
 
 ## Deferred milestones
 
-This slice deliberately excludes sample acquisition, MalwareBazaar, submission workflows, corpus/global correlation, campaign graphs, visualization, dynamic execution, Temporal, PostgreSQL, production infrastructure, and novelty claims. It may record candidate hidden assets and scoring hooks, but global novelty requires a later prospective corpus evaluation.
+This slice deliberately excludes dynamic analysis and its request/judge authorization flow, sample acquisition, MalwareBazaar, submissions, corpus/global correlation, campaign graphs, visualization, Temporal, PostgreSQL, production infrastructure, and novelty claims. Static commands must not execute, emulate, or debug the supplied PE.
 
 ## Acceptance boundary
 
-Unit and integration tests generate a harmless PE fixture in memory and exercise malformed inputs, analyzer crashes and timeouts, missing models, invalid tool calls, unsupported claims, prompt-like hostile strings, and mocked investigator/judge loops. Container contract tests verify the isolation arguments without requiring a running daemon. A live acceptance run is intentionally operator-triggered after Docker is started and a provider model/key is supplied through the environment.
+Unit and integration tests generate a harmless PE fixture and exercise malformed input, sandbox startup/cleanup, MCP lifecycle and ID correlation, arbitrary-command isolation, output/time limits, incremental evidence IDs, invalid model tools, unsupported claims, hostile output, and mocked investigator/judge loops. The tagged Docker test verifies the live container, required static tools, read-only PE, offline posture, writable scratch, failed native PE execution, and cleanup.

@@ -2,7 +2,6 @@
 samples/
 runs/
 artifacts/
-ghidra-projects/
 model-traces/
 
 # Credentials and local configuration

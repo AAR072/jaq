@@ -162,7 +162,9 @@ def render_report(
         )
 
     default_limitations = (
-        "Static evidence only; the supplied sample was never executed.",
+        "Static evidence only; JAQ did not launch the supplied sample.",
+        "Agent-authored helper commands ran only inside an offline disposable static sandbox.",
+        "Dynamic analysis, debugging, and runtime unpacking were not attempted.",
         "Reachability is accepted only when structured call/reference evidence supplies a path.",
         "Global novelty and corpus correlation are outside this milestone.",
     )

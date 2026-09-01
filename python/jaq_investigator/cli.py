@@ -15,6 +15,7 @@ from .investigator import Investigator, InvestigatorConfig
 from .judge import Judge, JudgeConfig
 from .model import ModelError
 from .report import render_report
+from .runtime import StaticToolRuntime
 from .verifier import verify_and_score
 
 
@@ -60,6 +61,7 @@ def run_pipeline(
     investigator_config: InvestigatorConfig | None = None,
     judge_config: JudgeConfig | None = None,
     task: str | None = None,
+    tool_runtime: Any | None = None,
 ) -> dict[str, Any]:
     """Run the complete claims → judge → score → report handoff.
 
@@ -77,12 +79,24 @@ def run_pipeline(
     for name in ("claims.json", "score.json", "report.md"):
         if (output_dir / name).exists():
             raise ValueError(f"refusing to overwrite existing {name}")
-    investigator = Investigator(
-        store,
-        model_client=client,
-        config=investigator_config or InvestigatorConfig.from_env(),
-    )
-    claims = investigator.run(task)
+    runtime = tool_runtime
+    if runtime is None and os.environ.get("JAQ_SANDBOX_CONTAINER"):
+        runtime = StaticToolRuntime.from_environment(store)
+    if runtime is None and client is None:
+        raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
+    investigator: Investigator | None = None
+    try:
+        investigator = Investigator(
+            store, model_client=client,
+            config=investigator_config or InvestigatorConfig.from_env(),
+            tool_runtime=runtime,
+        )
+        claims = investigator.run(task)
+    finally:
+        if runtime is not None:
+            runtime.close()
+    if investigator is None:  # pragma: no cover - construction failures re-raise
+        raise RuntimeError("investigator was not initialized")
 
     judge = Judge(
         store,

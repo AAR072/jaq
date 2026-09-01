@@ -9,8 +9,12 @@ search terms only.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import threading
 from typing import Any
 
 from .schemas import Observation, SchemaError, as_observation
@@ -21,7 +25,7 @@ class EvidenceError(ValueError):
 
 
 class EvidenceStore:
-    """A small, immutable-in-use index over ``observations.jsonl``."""
+    """Read-only model view plus controller-only append ledger."""
 
     MAX_SEARCH_CHARS = 256
     MAX_RESULTS = 100
@@ -61,6 +65,8 @@ class EvidenceStore:
             raise EvidenceError(f"could not read observations file: {path}") from exc
         self._observations = tuple(sorted(observations, key=lambda item: item.id))
         self._by_id = by_id
+        self._last_tool_observation_id: str | None = None
+        self._append_lock = threading.RLock()
 
     @classmethod
     def from_observations(cls, observations: Iterable[Observation | Mapping[str, Any]]) -> "EvidenceStore":
@@ -81,7 +87,156 @@ class EvidenceStore:
         instance._observations_path = None
         instance._observations = tuple(sorted(normalized, key=lambda item: item.id))
         instance._by_id = by_id
+        instance._last_tool_observation_id = None
+        instance._append_lock = threading.RLock()
         return instance
+
+    @staticmethod
+    def _stable_json_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): EvidenceStore._stable_json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [EvidenceStore._stable_json_value(item) for item in value]
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return str(value)
+            if value.is_integer():
+                return int(value)
+            return format(value, ".17g")
+        if value is None or isinstance(value, (str, int, bool)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _go_canonical_json(value: Mapping[str, Any]) -> bytes:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        text = (
+            text.replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
+        return text.encode("utf-8")
+
+    @classmethod
+    def _content_id(cls, record: Mapping[str, Any]) -> str:
+        unsigned = dict(record)
+        unsigned["id"] = ""
+        return "obs-" + hashlib.sha256(cls._go_canonical_json(unsigned)).hexdigest()
+
+    def _append(self, record: Mapping[str, Any]) -> Observation:
+        if self._observations_path is None:
+            raise EvidenceError("in-memory EvidenceStore cannot persist tool evidence")
+        with self._append_lock:
+            data = dict(record)
+            data["schema_version"] = "1.0"
+            data["id"] = self._content_id(data)
+            try:
+                observation = as_observation(data)
+            except SchemaError as exc:
+                raise EvidenceError(f"invalid generated tool observation: {exc}") from exc
+            if observation.id in self._by_id:
+                return self._by_id[observation.id]
+            encoded = json.dumps(
+                observation.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ) + "\n"
+            try:
+                with self._observations_path.open("a", encoding="utf-8", newline="") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise EvidenceError("could not append tool observation") from exc
+            self._by_id[observation.id] = observation
+            self._observations = tuple(sorted((*self._observations, observation), key=lambda item: item.id))
+            self._last_tool_observation_id = observation.id
+            return observation
+
+    def append_tool_request(
+        self,
+        *,
+        source: str,
+        version: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        sample_sha256: str,
+        sequence: int,
+    ) -> Observation:
+        """Persist a controller-validated tool request before execution."""
+
+        parents = [self._last_tool_observation_id] if self._last_tool_observation_id else []
+        config_hash = hashlib.sha256(f"{source}:{version}".encode()).hexdigest()
+        stable_arguments = self._stable_json_value(arguments)
+        provenance: dict[str, Any] = {
+            "source": source,
+            "stage": "agent-tool-request",
+            "input_sha256": sample_sha256,
+        }
+        if parents:
+            provenance["parent_observation_ids"] = parents
+        return self._append(
+            {
+                "schema_version": "1.0",
+                "id": "",
+                "type": f"{source}.tool_request",
+                "raw_value": {"tool": tool_name, "arguments": stable_arguments},
+                "normalized_value": {"tool": tool_name, "sequence": sequence},
+                "artifact_location": {"artifact": "sample", "path": "sandbox:/input/sample.exe"},
+                "analyzer": {"name": source, "version": version, "config_hash": config_hash},
+                "provenance": provenance,
+                "metadata": {"tool_name": tool_name, "sequence": sequence},
+            }
+        )
+
+    def append_tool_result(
+        self,
+        *,
+        request_id: str,
+        source: str,
+        version: str,
+        tool_name: str,
+        result: Any,
+        sample_sha256: str,
+        sequence: int,
+        status: str,
+        duration_ms: int,
+        truncated: bool = False,
+        exit_code: int | None = None,
+    ) -> Observation:
+        """Persist a bounded tool result before returning it to the model."""
+
+        if request_id not in self._by_id:
+            raise EvidenceError("tool result request observation does not exist")
+        config_hash = hashlib.sha256(f"{source}:{version}".encode()).hexdigest()
+        stable_result = self._stable_json_value(result)
+        result_json = json.dumps(stable_result, ensure_ascii=False, sort_keys=True, default=str)
+        return self._append(
+            {
+                "schema_version": "1.0",
+                "id": "",
+                "type": f"{source}.tool_result",
+                "raw_value": {"tool": tool_name, "result": stable_result},
+                "normalized_value": {"tool": tool_name, "status": status, "result": stable_result},
+                "artifact_location": {"artifact": "sample", "path": "sandbox:/work"},
+                "analyzer": {"name": source, "version": version, "config_hash": config_hash},
+                "provenance": {
+                    "source": source,
+                    "stage": "agent-tool-result",
+                    "input_sha256": sample_sha256,
+                    "parent_observation_ids": [request_id],
+                },
+                "metadata": {
+                    "tool_name": tool_name,
+                    "sequence": sequence,
+                    "status": status,
+                    "duration_ms": int(duration_ms),
+                    "truncated": bool(truncated),
+                    "exit_code": exit_code,
+                    "result_sha256": hashlib.sha256(result_json.encode()).hexdigest(),
+                },
+            }
+        )
 
     @property
     def observations(self) -> list[Observation]:

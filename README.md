@@ -1,16 +1,16 @@
 # JAQ
 
-JAQ is a local, evidence-first static investigator for Windows PE files. Milestone 1 never executes a sample and confines Ghidra to a network-disabled, rootless container.
+JAQ is an autonomous, evidence-first static investigator for Windows PE files. DeepSeek drives Radare2 MCP and arbitrary helper commands inside a network-disabled disposable container; JAQ never launches the supplied PE.
 
 ## Quick start
 
-Prerequisites are Go 1.24+, Python 3.11+, and Docker with its daemon running. Install the local Python package with the LiteLLM extra, then build the analyzer and CLI:
+Prerequisites are Go 1.24+, Python 3.11+, and Docker with its daemon running. Install the local Python package with the LiteLLM extra, then build the static sandbox and CLI:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[llm]'
-make analyzer-image
+make sandbox-image
 make build
 ```
 
@@ -26,4 +26,4 @@ Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may us
 
 The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `claims.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run.
 
-Run the credential-free test suite with `make test`. The Docker contract is tested without a daemon, while the image build and a live model run remain operator-triggered acceptance steps. See [TECHNICAL_VISION.md](TECHNICAL_VISION.md) for the trust model and deferred scope.
+Run the credential-free test suite with `make test`. After building the image, verify the real offline container with `go test -tags=integration ./internal/sandbox -run TestPersistentSandboxRuntimeContract -v`. A live model run remains operator-triggered. Dynamic analysis is deliberately absent. See [TECHNICAL_VISION.md](TECHNICAL_VISION.md) for the detailed trust boundary.

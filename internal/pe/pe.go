@@ -117,9 +117,8 @@ type Function struct {
 	FileOffset uint64 `json:"file_offset"`
 }
 
-// Reference and CallRelationship are schema placeholders for richer Ghidra
-// evidence.  Lightweight parsing never invents relationships, so these slices
-// are empty unless a future deterministic stage populates them.
+// Reference and CallRelationship are schema placeholders for richer static
+// tool evidence. Lightweight parsing never invents relationships.
 type Reference struct {
 	FromRVA uint32 `json:"from_rva"`
 	ToRVA   uint32 `json:"to_rva"`
@@ -130,14 +129,6 @@ type CallRelationship struct {
 	CallerRVA  uint32 `json:"caller_rva"`
 	CalleeRVA  uint32 `json:"callee_rva"`
 	CalleeName string `json:"callee_name,omitempty"`
-}
-
-// Decompilation is reserved for the pinned Ghidra stage. The lightweight
-// parser never disassembles or executes bytes, so Analysis.Decompilations is
-// empty until that stage's observations are merged by the controller.
-type Decompilation struct {
-	FunctionRVA uint32 `json:"function_rva"`
-	Text        string `json:"text"`
 }
 
 // ResourceEntry records a resource leaf without exposing or interpreting its
@@ -168,9 +159,7 @@ type CapabilityHint struct {
 	Confidence     string   `json:"confidence"`
 }
 
-// Analysis is the complete deterministic lightweight package.  Ghidra-only
-// fields are represented explicitly so consumers can merge richer evidence
-// without changing the top-level schema.
+// Analysis is the complete deterministic lightweight package.
 type Analysis struct {
 	SchemaVersion     string             `json:"schema_version"`
 	Size              int64              `json:"size"`
@@ -182,7 +171,6 @@ type Analysis struct {
 	Imports           []Import           `json:"imports"`
 	Exports           []Function         `json:"exports"`
 	Functions         []Function         `json:"functions"`
-	Decompilations    []Decompilation    `json:"decompilations"`
 	References        []Reference        `json:"references"`
 	CallRelationships []CallRelationship `json:"call_relationships"`
 	Resources         ResourceSummary    `json:"resources"`
@@ -272,9 +260,6 @@ func AnalyzeBytes(data []byte) (*Analysis, error) {
 	}
 	if parsed.Functions == nil {
 		parsed.Functions = []Function{}
-	}
-	if parsed.Decompilations == nil {
-		parsed.Decompilations = []Decompilation{}
 	}
 	if parsed.References == nil {
 		parsed.References = []Reference{}

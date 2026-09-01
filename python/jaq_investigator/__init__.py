@@ -1,6 +1,7 @@
 """JAQ's dependency-free evidence and claim core."""
 
 from .evidence import EvidenceError, EvidenceStore
+from .mcp_client import MCPClient, MCPToolResult, MCPToolSpec
 from .report import (
     render_dossier,
     render_markdown_report,
@@ -20,6 +21,8 @@ from .schemas import (
     ValidationError,
     VerificationResult,
 )
+from .runtime import StaticToolRuntime
+from .sandbox import DockerStaticSandbox, SandboxResult
 from .verifier import (
     apply_judgments,
     build_score,
@@ -45,6 +48,12 @@ __all__ = [
     "RunManifest",
     "EvidenceError",
     "EvidenceStore",
+    "MCPClient",
+    "MCPToolResult",
+    "MCPToolSpec",
+    "StaticToolRuntime",
+    "DockerStaticSandbox",
+    "SandboxResult",
     "verify_claim",
     "verify_claims",
     "apply_judgments",
