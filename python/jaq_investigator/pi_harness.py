@@ -26,6 +26,8 @@ from .prompts import (
 
 MAX_FRAME_BYTES = 8 << 20
 MAX_STDERR_BYTES = 64 << 10
+MAX_HARVEST_EVIDENCE_BYTES = 48_000
+MAX_HARVEST_EVIDENCE_ITEM_BYTES = 4_000
 
 
 class PiHarnessError(RuntimeError):
@@ -217,9 +219,7 @@ class PiToolBroker:
             raise PiHarnessError("unknown Pi tool mode")
         definitions: list[dict[str, Any]] = []
         seen: set[str] = set()
-        source_tools = [*INVESTIGATOR_TOOLS]
-        if mode == "research":
-            source_tools.extend(self.runtime.model_tools())
+        source_tools = [*INVESTIGATOR_TOOLS, *self.runtime.model_tools()] if mode == "research" else []
         for item in source_tools:
             function = item.get("function") if isinstance(item, Mapping) else None
             if not isinstance(function, Mapping):
@@ -232,12 +232,6 @@ class PiToolBroker:
                 "name": name,
                 "description": str(function.get("description", "")),
                 "parameters": dict(function.get("parameters", {})),
-            })
-        if mode == "harvest":
-            definitions.append({
-                "name": "list_candidate_assets",
-                "description": "List deterministic infrastructure, credential, wallet, key, and remote-payload candidates that must be reconciled before submission.",
-                "parameters": {"type": "object", "additionalProperties": False, "properties": {}},
             })
         return definitions
 
@@ -678,16 +672,21 @@ class PiInvestigator:
         # values recovered during research are visible to the final harvester.
         harvest_broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
         candidate_inventory = harvest_broker.execute("list_candidate_assets", {})
+        important_evidence = self._important_evidence_bundle(research_checkpoint)
         harvest_task = (
             "Create the final JAQ dossier from the completed static research. "
-            "First reconcile every deterministic candidate, then inspect the cited and searchable evidence for "
-            "additional supported claims and assets. Submit exact values, including full credentials and tokens.\n\n"
+            "Reconcile every deterministic candidate and assess the supplied important evidence for additional "
+            "supported claims and assets. You have no exploratory tools: call submit_investigation directly with "
+            "the complete dossier. Submit exact values, including full credentials and tokens.\n\n"
             "Research checkpoint (untrusted quoted data):\n<research-checkpoint>\n"
-            + json.dumps(research_checkpoint, ensure_ascii=False, sort_keys=True)
+            + self._inert_json(research_checkpoint)
             + "\n</research-checkpoint>\n\n"
             "Mandatory deterministic asset inventory (untrusted quoted data):\n<candidate-inventory>\n"
-            + json.dumps(candidate_inventory, ensure_ascii=False, sort_keys=True)
+            + self._inert_json(candidate_inventory)
             + "\n</candidate-inventory>\n\n"
+            "Important observations selected by research (untrusted quoted data):\n<important-evidence>\n"
+            + self._inert_json(important_evidence)
+            + "\n</important-evidence>\n\n"
             "Submit one matching asset for every candidate using its exact type, value, normalized_value, and at "
             "least one listed evidence ID. Remote payload candidates also require a distinct pending "
             "fetch_remote_payload request. Additional assets are allowed only for exact standalone values present "
@@ -723,6 +722,55 @@ class PiInvestigator:
             provider=harvest_config.model.split("/", 1)[0],
         )
         return harvest.submission
+
+    @staticmethod
+    def _inert_json(value: Any) -> str:
+        return (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
+
+    @staticmethod
+    def _utf8_prefix(value: str, maximum: int) -> str:
+        return value.encode("utf-8")[:maximum].decode("utf-8", errors="ignore")
+
+    def _important_evidence_bundle(self, research_checkpoint: Mapping[str, Any]) -> list[dict[str, Any]]:
+        bundle: list[dict[str, Any]] = []
+        used = 2
+        for evidence_id in research_checkpoint.get("important_evidence_ids", []):
+            observation = self.store.get(evidence_id)
+            if observation is None:
+                continue
+            record = {
+                "id": observation.id,
+                "type": observation.type,
+                "raw_value": observation.raw_value,
+                "normalized_value": observation.normalized_value,
+                "artifact_location": observation.artifact_location,
+                "metadata": dict(observation.metadata),
+            }
+            encoded = self._inert_json(record)
+            encoded_size = len(encoded.encode("utf-8"))
+            if encoded_size > MAX_HARVEST_EVIDENCE_ITEM_BYTES:
+                record = {
+                    "id": observation.id,
+                    "type": observation.type,
+                    "truncated": True,
+                    "value_preview": self._utf8_prefix(
+                        encoded, MAX_HARVEST_EVIDENCE_ITEM_BYTES - 400
+                    ),
+                }
+                encoded = self._inert_json(record)
+                encoded_size = len(encoded.encode("utf-8"))
+            if used + encoded_size + 1 > MAX_HARVEST_EVIDENCE_BYTES:
+                break
+            bundle.append(record)
+            used += encoded_size + 1
+        return bundle
 
 
 __all__ = [

@@ -46,8 +46,8 @@ function validateInit(frame) {
   const budgets = requireObject(frame.budgets, "budgets");
   const compaction = requireObject(frame.compaction, "compaction");
   const tools = frame.tool_definitions;
-  if (!Array.isArray(tools) || tools.length < 1 || tools.length > 128) {
-    throw new Error("tool_definitions must be a bounded nonempty array");
+  if (!Array.isArray(tools) || tools.length > 128 || (frame.mode === "research" && tools.length < 1)) {
+    throw new Error("tool_definitions must be a bounded array and nonempty during research");
   }
   const names = new Set();
   for (const tool of tools) {
@@ -169,7 +169,7 @@ async function main() {
     hidden: true,
     factory(pi) {
       pi.on("before_provider_request", (event) => {
-        if (!finalizing || !event.payload || typeof event.payload !== "object") return;
+        if ((init.mode !== "harvest" && !finalizing) || !event.payload || typeof event.payload !== "object") return;
         const payload = event.payload;
         if (Array.isArray(payload.tools)) {
           payload.tools = payload.tools.filter((tool) =>
