@@ -155,7 +155,7 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
     def display(item: Mapping[str, Any]) -> str:
         value = str(item.get("value"))
         if item.get("type") in sensitive:
-            return value[:4] + "… sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
+            return value + " sha256:" + hashlib.sha256(value.encode()).hexdigest()
         return value
     lines = ["\n## Operational assets\n"]
     assets = investigation.get("assets", [])
