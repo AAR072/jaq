@@ -118,9 +118,9 @@ async function main() {
     if (finalizing || submittedClaims !== undefined) return;
     finalizing = true;
     if (session) {
-      session.setActiveToolsByName(["submit_claims"]);
+      session.setActiveToolsByName(["submit_investigation"]);
       void session.steer(
-        `Controller budget notice: ${reason}. Stop investigating and call submit_claims now using the strongest evidence already collected.`,
+        `Controller budget notice: ${reason}. Stop investigating and call submit_investigation now using the strongest evidence already collected.`,
       ).catch(() => {});
     }
   };
@@ -173,7 +173,7 @@ async function main() {
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPrompt: `${init.system_prompt}\n\nWhen finished, you MUST call submit_claims exactly once. Do not print final JSON as assistant text.`,
+    systemPrompt: `${init.system_prompt}\n\nWhen finished, you MUST call submit_investigation exactly once. Do not print final JSON as assistant text.`,
   });
   await loader.reload();
 
@@ -188,7 +188,7 @@ async function main() {
         return toolResult("The investigation is already complete; no further tool calls are allowed.", undefined, true);
       }
       if (finalizing) {
-        return toolResult("Evidence collection is closed. Call submit_claims now.", undefined, true);
+        return toolResult("Evidence collection is closed. Call submit_investigation now.", undefined, true);
       }
       try {
         guard.beforeToolCall();
@@ -211,9 +211,9 @@ async function main() {
   }));
 
   customTools.push({
-    name: "submit_claims",
-    label: "Submit claims",
-    description: "Validate and submit the final evidence-backed JAQ claims. This terminates the investigation.",
+    name: "submit_investigation",
+    label: "Submit investigation",
+    description: "Validate and submit final claims, operational assets, and pending action requests. This terminates the investigation.",
     parameters: Type.Unsafe(init.claims_schema),
     executionMode: "sequential",
     async execute(_callID, params) {
@@ -260,12 +260,12 @@ async function main() {
   for (let attempt = 0; submittedClaims === undefined && attempt < 3; attempt += 1) {
     const prompt = attempt === 0
       ? init.task
-      : "You ended without submitting claims. Use the existing evidence and call submit_claims now. Do not request exploratory tools unless required to correct an evidence ID.";
+      : "You ended without submitting. Use the existing evidence and call submit_investigation now. Do not request exploratory tools unless required to correct an evidence ID.";
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
   }
   statsSnapshot = session.getSessionStats();
-  if (submittedClaims === undefined) throw new Error("Pi investigator ended without calling submit_claims");
+  if (submittedClaims === undefined) throw new Error("Pi investigator ended without calling submit_investigation");
   channel.send({
     type: "complete",
     claims: submittedClaims,

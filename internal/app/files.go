@@ -15,6 +15,8 @@ var persistedOutputs = []string{
 	"run-manifest.json",
 	"observations.jsonl",
 	"claims.json",
+	"assets.json",
+	"requests.json",
 	"score.json",
 	"report.md",
 }

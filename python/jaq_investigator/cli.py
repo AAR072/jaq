@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .evidence import EvidenceStore as CanonicalEvidenceStore
 from .investigator import Investigator, InvestigatorConfig
@@ -77,7 +77,7 @@ def run_pipeline(
     if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
         raise ValueError("output must be a real directory, not a file or symlink")
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("claims.json", "score.json", "report.md"):
+    for name in ("claims.json", "assets.json", "requests.json", "score.json", "report.md"):
         if (output_dir / name).exists():
             raise ValueError(f"refusing to overwrite existing {name}")
     runtime = tool_runtime
@@ -104,12 +104,13 @@ def run_pipeline(
     if investigator is None:  # pragma: no cover - construction failures re-raise
         raise RuntimeError("investigator was not initialized")
 
+    claims_only = {"schema_version": claims["schema_version"], "claims": claims["claims"]}
     judge = Judge(
         store,
         model_client=judge_client,
         config=judge_config or JudgeConfig.from_env(),
     )
-    judgments = judge.run(claims)
+    judgments = judge.run(claims_only)
     usage = {"investigator": dict(investigator.last_run.usage if investigator.last_run else {})}
     if judge.last_usage:
         usage["judge"] = dict(judge.last_usage)
@@ -121,9 +122,11 @@ def run_pipeline(
     )
 
     contents = {
-        "claims.json": json.dumps(claims, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "claims.json": json.dumps(claims_only, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "assets.json": json.dumps({"schema_version": "1.0", "assets": claims.get("assets", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        "report.md": render_report(claims["claims"], score, store),
+        "report.md": render_report(claims["claims"], score, store) + _render_operational(claims),
     }
     targets = [output_dir / name for name in contents]
     if any(path.exists() for path in targets):
@@ -142,6 +145,26 @@ def run_pipeline(
                 pass
         raise
     return {"claims": claims, "judgments": judgments, "score": score.to_dict()}
+
+
+def _render_operational(investigation: Mapping[str, Any]) -> str:
+    lines = ["\n## Operational assets\n"]
+    assets = investigation.get("assets", [])
+    lines.extend(
+        f"- `{item.get('type')}` `{str(item.get('value'))}` — {item.get('role')} (confidence {item.get('confidence')})"
+        for item in assets
+    )
+    if not assets:
+        lines.append("- None identified.")
+    lines.append("\n## Pending action requests\n")
+    requests = investigation.get("action_requests", [])
+    lines.extend(
+        f"- `{item.get('id')}` `{item.get('kind')}` — {item.get('reason')} (`pending_authorization`)"
+        for item in requests
+    )
+    if not requests:
+        lines.append("- None.")
+    return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:

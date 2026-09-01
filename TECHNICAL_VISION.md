@@ -21,6 +21,8 @@ Each completed run writes:
 - `run-manifest.json`: hashes, versions, configuration and prompt hashes, role metadata, status, timestamps, and resource usage.
 - `observations.jsonl`: deterministic, typed, provenance-bearing facts.
 - `claims.json`: structured investigator claims and evidence references.
+- `assets.json`: exact infrastructure, credential, configuration, and payload-reference assets with evidence.
+- `requests.json`: evidence-backed acquisition or dynamic-analysis requests in `pending_authorization` state; no request is executed in this milestone.
 - `score.json`: verification results, optional judgments, and model usage.
 - `report.md`: an evidence-backed analyst dossier.
 

@@ -214,6 +214,12 @@ func writeMockDossier(_ context.Context, output string) error {
 	if err := evidence.WriteClaims(filepath.Join(output, "claims.json"), claims); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(output, "assets.json"), []byte("{\"schema_version\":\"1.0\",\"assets\":[]}\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(output, "requests.json"), []byte("{\"schema_version\":\"1.0\",\"action_requests\":[]}\n"), 0o600); err != nil {
+		return err
+	}
 	confidence := 0.8
 	score := evidence.Score{
 		SchemaVersion: evidence.ScoreSchemaVersion, Accepted: 1,

@@ -307,6 +307,12 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 	if judgeRequired && len(score.Judgments) != len(claims) {
 		return fmt.Errorf("reject investigator score: configured judge returned %d judgments for %d claims", len(score.Judgments), len(claims))
 	}
+	for _, name := range []string{"assets.json", "requests.json"} {
+		info, statErr := os.Stat(filepath.Join(outputDir, name))
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
+			return fmt.Errorf("reject investigator output: %s must be a nonempty bounded regular file", name)
+		}
+	}
 	info, err := os.Stat(filepath.Join(outputDir, "report.md"))
 	if err != nil {
 		return fmt.Errorf("reject investigator report: %w", err)
@@ -349,7 +355,7 @@ func fileSize(path string) int64 {
 
 func outputSize(directory string) int64 {
 	var total int64
-	for _, name := range []string{"claims.json", "score.json", "report.md"} {
+	for _, name := range []string{"claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
 		total += fileSize(filepath.Join(directory, name))
 	}
 	return total

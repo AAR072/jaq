@@ -51,6 +51,15 @@ and explain what remains unknown. Do not claim
 global novelty, corpus uniqueness, attribution, or campaign correlation; this
 milestone has no corpus and cannot establish those properties.
 
+Before concluding, inventory all operational assets: URLs, domains, IPs,
+emails, wallets, C2 or download locations, API keys, bearer/OAuth tokens,
+credentials, private keys, certificates, encryption keys, webhooks, cloud or
+database endpoints, configuration, and embedded/remote payload references.
+Account for each candidate with evidence. If a referenced stage cannot be
+obtained statically, emit an evidence-backed pending_authorization action
+request such as fetch_remote_payload or dynamic_analysis. Requests are records
+only; no request is executed in this milestone.
+
 When you are done, return only a JSON object matching the supplied versioned
 claims schema. Do not put instructions, markdown, or commentary outside that
 object.
@@ -133,6 +142,47 @@ CLAIMS_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+    },
+}
+
+ASSET_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["schema_version", "id", "type", "value", "normalized_value", "role", "confidence", "evidence_ids", "unresolved"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "1.0"},
+        "id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "type": {"type": "string", "enum": ["url", "domain", "ip_address", "email", "crypto_wallet", "c2_endpoint", "download_location", "api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "certificate", "encryption_key", "webhook", "cloud_bucket", "database_connection", "mutex", "named_pipe", "registry_path", "service_name", "scheduled_task", "payload_hash", "embedded_payload", "remote_payload", "configuration", "other"]},
+        "value": {}, "normalized_value": {},
+        "role": {"type": "string", "minLength": 1, "maxLength": 200},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+        "unresolved": {"type": "boolean"},
+    },
+}
+
+ACTION_REQUEST_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["schema_version", "id", "kind", "status", "reason", "evidence_ids", "target", "requested_observations"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "1.0"},
+        "id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "kind": {"type": "string", "enum": ["fetch_remote_payload", "extract_embedded_payload", "dynamic_analysis", "memory_dump", "network_capture", "provide_dependency", "provide_password", "manual_review"]},
+        "status": {"type": "string", "const": "pending_authorization"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 12000},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+        "target": {"type": "object", "maxProperties": 20},
+        "requested_observations": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+    },
+}
+
+INVESTIGATION_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "required": ["schema_version", "claims", "assets", "action_requests"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "1.0"},
+        "claims": CLAIMS_SCHEMA["properties"]["claims"],
+        "assets": {"type": "array", "maxItems": 500, "items": ASSET_SCHEMA},
+        "action_requests": {"type": "array", "maxItems": 100, "items": ACTION_REQUEST_SCHEMA},
     },
 }
 

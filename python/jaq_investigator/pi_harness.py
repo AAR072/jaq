@@ -12,7 +12,7 @@ import threading
 from typing import Any, Mapping, Sequence
 
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
-from .prompts import CLAIMS_SCHEMA, INVESTIGATOR_SYSTEM_PROMPT, INVESTIGATOR_TOOLS, build_investigator_messages
+from .prompts import INVESTIGATION_SCHEMA, INVESTIGATOR_SYSTEM_PROMPT, INVESTIGATOR_TOOLS, build_investigator_messages
 
 
 MAX_FRAME_BYTES = 8 << 20
@@ -108,7 +108,7 @@ class PiHarnessConfig:
             "task": task,
             "session_dir": str(self.session_dir),
             "tool_definitions": [dict(item) for item in tool_definitions],
-            "claims_schema": CLAIMS_SCHEMA,
+            "claims_schema": INVESTIGATION_SCHEMA,
             "budgets": {
                 "max_model_calls": self.max_model_calls,
                 "max_tool_calls": self.max_tool_calls,
@@ -187,7 +187,54 @@ class PiToolBroker:
         return self.legacy._execute_tool(name, dict(arguments))
 
     def validate_claims(self, payload: Any) -> dict[str, Any]:
-        return validate_claims(payload, evidence_store=self.store)
+        if not isinstance(payload, Mapping) or set(payload) != {"schema_version", "claims", "assets", "action_requests"}:
+            raise PiHarnessError("investigation must contain schema_version, claims, assets, and action_requests")
+        canonical_claims = validate_claims(
+            {"schema_version": payload.get("schema_version"), "claims": payload.get("claims")},
+            evidence_store=self.store,
+        )
+        assets = self._validate_records(payload.get("assets"), "asset", 500)
+        requests = self._validate_records(payload.get("action_requests"), "request", 100, requests=True)
+        return {"schema_version": "1.0", "claims": canonical_claims["claims"], "assets": assets, "action_requests": requests}
+
+    def _validate_records(self, records: Any, label: str, maximum: int, requests: bool = False) -> list[dict[str, Any]]:
+        if not isinstance(records, list) or len(records) > maximum:
+            raise PiHarnessError(f"{label} records must be a bounded array")
+        canonical: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in records:
+            if not isinstance(record, Mapping) or record.get("schema_version") != "1.0":
+                raise PiHarnessError(f"invalid {label} record")
+            item_schema = (
+                INVESTIGATION_SCHEMA["properties"]["action_requests"]["items"]
+                if requests else INVESTIGATION_SCHEMA["properties"]["assets"]["items"]
+            )
+            if set(record) != set(item_schema["required"]):
+                raise PiHarnessError(f"{label} has missing or unsupported fields")
+            record_id = record.get("id")
+            evidence_ids = record.get("evidence_ids")
+            if not isinstance(record_id, str) or not record_id or record_id in seen:
+                raise PiHarnessError(f"invalid or duplicate {label} id")
+            if not isinstance(evidence_ids, list) or not evidence_ids or any(
+                not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids
+            ):
+                raise PiHarnessError(f"{label} cites missing evidence")
+            if requests and record.get("status") != "pending_authorization":
+                raise PiHarnessError("action requests must remain pending_authorization")
+            if requests:
+                if record.get("kind") not in item_schema["properties"]["kind"]["enum"] or not isinstance(record.get("target"), Mapping):
+                    raise PiHarnessError("invalid action request kind or target")
+                if not isinstance(record.get("reason"), str) or not record["reason"].strip() or not isinstance(record.get("requested_observations"), list):
+                    raise PiHarnessError("invalid action request details")
+            else:
+                confidence = record.get("confidence")
+                if record.get("type") not in item_schema["properties"]["type"]["enum"] or not isinstance(record.get("role"), str):
+                    raise PiHarnessError("invalid asset type or role")
+                if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+                    raise PiHarnessError("invalid asset confidence")
+            seen.add(record_id)
+            canonical.append(dict(record))
+        return canonical
 
 
 @dataclass(frozen=True)
@@ -347,7 +394,7 @@ class PiInvestigator:
         operational_task = messages[1]["content"]
         pi_system_prompt = INVESTIGATOR_SYSTEM_PROMPT + (
             "\n\nPi harness override: do not return claims as assistant text. "
-            "When the evidence is sufficient, call the submit_claims tool with the complete versioned claims object."
+            "When the evidence is sufficient, call submit_investigation with claims, assets, and action_requests."
         )
         result = PiHarnessRunner(self.config).run(
             PiToolBroker(self.store, self.runtime),

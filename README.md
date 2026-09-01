@@ -27,6 +27,6 @@ Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may us
 
 The investigator runs through the host-side Pi SDK with only JAQ tools enabled. Defaults cap one run at 12 model calls, 40 tool calls, 500,000 cumulative tokens, and an estimated $0.10. Override them with `JAQ_MAX_MODEL_CALLS`, `JAQ_MAX_TOOL_CALLS`, `JAQ_MAX_TOTAL_TOKENS`, and `JAQ_MAX_COST_USD`. Full tool results remain in the evidence ledger; Pi receives bounded previews and automatically compacts older context.
 
-The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `claims.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run.
+The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `claims.json`, `assets.json`, `requests.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run. Action requests are evidence-backed `pending_authorization` placeholders only: this milestone does not fetch remote payloads or perform dynamic analysis.
 
 Run the credential-free test suite with `make test`. After building the image, verify the real offline container with `go test -tags=integration ./internal/sandbox -run TestPersistentSandboxRuntimeContract -v`. A live model run remains operator-triggered. Dynamic analysis is deliberately absent. See [TECHNICAL_VISION.md](TECHNICAL_VISION.md) for the detailed trust boundary.

@@ -40,7 +40,7 @@ assert "submit_claims" not in {item["name"] for item in init["tool_definitions"]
 print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"list_observation_types","arguments":{}}}), flush=True)
 reply = json.loads(sys.stdin.readline())
 assert reply["ok"] is True
-claims = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}]}
+claims = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[{"schema_version":"1.0","id":"asset-1","type":"payload_hash","value":"a"*64,"normalized_value":"a"*64,"role":"sample","confidence":1.0,"evidence_ids":["obs-native"],"unresolved":False}],"action_requests":[{"schema_version":"1.0","id":"request-1","kind":"dynamic_analysis","status":"pending_authorization","reason":"Confirm runtime behavior.","evidence_ids":["obs-native"],"target":{},"requested_observations":["processes"]}]}
 print(json.dumps({"type":"request","id":2,"operation":"validate_claims","payload":{"claims":claims}}), flush=True)
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
@@ -60,6 +60,8 @@ print(json.dumps({"type":"complete","claims":validated["result"],"usage":{"input
                 PiToolBroker(store, FakeRuntime()), system_prompt="Static fixture investigator.", task="Inspect it.",
             )
             self.assertEqual(result.claims["claims"][0]["id"], "claim-1")
+            self.assertEqual(result.claims["assets"][0]["id"], "asset-1")
+            self.assertEqual(result.claims["action_requests"][0]["status"], "pending_authorization")
             self.assertEqual(result.usage["total_tokens"], 17)
             self.assertEqual(result.session["id"], "fake-session")
 
