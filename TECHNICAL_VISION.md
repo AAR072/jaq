@@ -40,7 +40,7 @@ There is an unavoidable semantic boundary here: arbitrary helper code operating 
 
 This slice deliberately excludes dynamic analysis and its request/judge authorization flow, sample acquisition, MalwareBazaar, submissions, corpus/global correlation, campaign graphs, visualization, Temporal, PostgreSQL, production infrastructure, and novelty claims. Static commands must not execute, emulate, or debug the supplied PE.
 
-The acquisition control plane is now present: deterministic candidates must be reconciled into assets, remote stages require pending requests, and an operator may approve or deny requests. Approved remote payloads are fetched in a separate bounded Docker invocation and analyzed as child runs. Dynamic approvals remain handoff-only until a dedicated dynamic sandbox exists.
+The acquisition control plane is now present: evidence-backed remote stages may produce pending requests, and an operator may approve or deny requests. Operational assets are proposed by the final model and retained only when their exact values are supported by cited observations; JAQ does not promote regex matches automatically. Approved remote payloads are fetched in a separate bounded Docker invocation and analyzed as child runs. Dynamic approvals remain handoff-only until a dedicated dynamic sandbox exists.
 
 ## Acceptance boundary
 

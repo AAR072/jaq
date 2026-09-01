@@ -14,6 +14,7 @@ from jaq_investigator import (
     render_report,
     verify_claim,
 )
+from jaq_investigator.cli import _render_operational
 
 
 class CoreTest(unittest.TestCase):
@@ -179,6 +180,18 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertIn("A" * 64, first)
         self.assertIn("&lt;binary&gt;", first)
+
+    def test_private_report_shows_full_credential_and_sha256(self):
+        token = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        report = _render_operational({
+            "assets": [{
+                "type": "api_key", "value": token,
+                "role": "telegram_bot_token", "confidence": 0.99,
+            }],
+            "action_requests": [],
+        })
+        self.assertIn(token, report)
+        self.assertIn("sha256:", report)
 
 
 if __name__ == "__main__":

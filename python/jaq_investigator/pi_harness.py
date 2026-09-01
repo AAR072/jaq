@@ -12,7 +12,6 @@ import subprocess
 import threading
 from typing import Any, Mapping, Sequence
 
-from .candidates import extract_candidates
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .prompts import (
     HARVESTER_SYSTEM_PROMPT,
@@ -206,7 +205,6 @@ class PiToolBroker:
     def __init__(self, store: Any, runtime: Any) -> None:
         self.store = store
         self.runtime = runtime
-        self.candidate_snapshot = extract_candidates(store.observations)
         self.legacy = Investigator(
             store,
             model_client=object(),
@@ -235,9 +233,6 @@ class PiToolBroker:
             })
         return definitions
 
-    def _candidates(self):
-        return list(self.candidate_snapshot)
-
     @staticmethod
     def _leaf_values(value: Any) -> list[Any]:
         if isinstance(value, Mapping):
@@ -253,10 +248,6 @@ class PiToolBroker:
     def execute(self, name: str, arguments: Any) -> Any:
         if not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise PiHarnessError("Pi supplied an invalid tool request")
-        if name == "list_candidate_assets":
-            if arguments:
-                raise PiHarnessError("list_candidate_assets accepts no arguments")
-            return {"candidates": [item.to_dict() for item in self._candidates()]}
         return self.legacy._execute_tool(name, dict(arguments))
 
     def validate_research(self, payload: Any) -> dict[str, Any]:
@@ -298,11 +289,6 @@ class PiToolBroker:
         )
         assets = self._validate_records(payload.get("assets"), "asset", 500)
         requests = self._validate_records(payload.get("action_requests"), "request", 100, requests=True)
-        candidates = self._candidates()
-        candidate_by_key = {(item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)): item for item in candidates}
-        remote_candidate_values = {
-            item.normalized_value for item in candidates if item.role == "remote_payload_reference"
-        }
         covered: set[tuple[str, str]] = set()
         verified_assets: list[dict[str, Any]] = []
         for asset in assets:
@@ -313,83 +299,50 @@ class PiToolBroker:
                 normalized = normalized.lower()
                 if normalized.startswith(("software\\", "system\\")):
                     normalized = "hklm\\" + normalized
-            if asset.get("type") == "url" and normalized in remote_candidate_values:
-                # A remote_payload record already preserves the complete URL;
-                # retaining a second generic URL makes the dossier noisy.
-                continue
             key = (str(asset.get("type")), json.dumps(normalized, ensure_ascii=False, sort_keys=True))
             if key in covered: raise PiHarnessError("duplicate normalized asset")
-            candidate = candidate_by_key.get(key)
-            if candidate is None:
-                leaves: list[Any] = []
-                for evidence_id in asset["evidence_ids"]:
-                    observation = self.store.get(evidence_id)
-                    leaves.extend(self._leaf_values(observation.raw_value)); leaves.extend(self._leaf_values(observation.normalized_value))
-                asserted = self._leaf_values(asset.get("value"))
-                if asset.get("type") == "service_name" and len(asserted) == 1 and isinstance(asserted[0], str):
-                    asserted = [item.strip() for item in asserted[0].split(";") if item.strip()]
-                if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "," in asserted[0]:
-                    asserted = [item.strip() for item in asserted[0].split(",") if item.strip()]
-                if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "\n" in asserted[0]:
-                    asserted = [item.strip() for item in asserted[0].splitlines() if item.strip()]
-                exact_lines = {
-                    (re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()).group(2)
-                     if re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()) else line.strip())
+            leaves: list[Any] = []
+            for evidence_id in asset["evidence_ids"]:
+                observation = self.store.get(evidence_id)
+                leaves.extend(self._leaf_values(observation.raw_value)); leaves.extend(self._leaf_values(observation.normalized_value))
+            asserted = self._leaf_values(asset.get("value"))
+            if asset.get("type") == "service_name" and len(asserted) == 1 and isinstance(asserted[0], str):
+                asserted = [item.strip() for item in asserted[0].split(";") if item.strip()]
+            if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "," in asserted[0]:
+                asserted = [item.strip() for item in asserted[0].split(",") if item.strip()]
+            if asset.get("type") == "configuration" and len(asserted) == 1 and isinstance(asserted[0], str) and "\n" in asserted[0]:
+                asserted = [item.strip() for item in asserted[0].splitlines() if item.strip()]
+            exact_lines = {
+                (re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()).group(2)
+                 if re.match(r"^\d+\s+(['\"])(.*)\1$", line.strip()) else line.strip())
+                for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
+            }
+            exact_lines |= {
+                match.group(1)
+                for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
+                if (match := re.search(r"['\"]([^'\"]{1,2048})['\"]\s*$", line.strip()))
+            }
+            if asset.get("type") == "filename":
+                exact_lines |= {PureWindowsPath(item).name for item in exact_lines}
+            if asset.get("type") == "configuration":
+                exact_lines |= {item.lstrip(".") for item in exact_lines}
+            if asset.get("type") == "command":
+                command_lines = {
+                    re.sub(r"^\d+\s+['\"]", "", line.strip()).rstrip("'\"")
                     for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
                 }
-                exact_lines |= {
-                    match.group(1)
-                    for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
-                    if (match := re.search(r"['\"]([^'\"]{1,2048})['\"]\s*$", line.strip()))
-                }
-                if asset.get("type") == "filename":
-                    exact_lines |= {PureWindowsPath(item).name for item in exact_lines}
-                if asset.get("type") == "configuration":
-                    exact_lines |= {item.lstrip(".") for item in exact_lines}
-                if asset.get("type") == "command":
-                    command_lines = {
-                        re.sub(r"^\d+\s+['\"]", "", line.strip()).rstrip("'\"")
-                        for leaf in leaves if isinstance(leaf, str) for line in leaf.splitlines()
-                    }
-                    supported = bool(asserted) and all(item in command_lines for item in asserted)
-                else:
-                    supported = bool(asserted) and all(
-                        item in leaves or item in exact_lines
-                        or (asset.get("type") in {"path", "filename"} and isinstance(item, str) and any(line.endswith(item) for line in exact_lines))
-                        for item in asserted
-                    )
-                if not supported:
-                    continue
+                supported = bool(asserted) and all(item in command_lines for item in asserted)
             else:
-                if candidate.value not in self._leaf_values(asset.get("value")):
-                    raise PiHarnessError(f"asset {asset['id']} raw value does not match its deterministic candidate")
-                if not set(asset["evidence_ids"]).intersection(candidate.evidence_ids):
-                    raise PiHarnessError(f"asset {asset['id']} does not cite its deterministic candidate evidence")
+                supported = bool(asserted) and all(
+                    item in leaves or item in exact_lines
+                    or (asset.get("type") in {"path", "filename"} and isinstance(item, str) and any(line.endswith(item) for line in exact_lines))
+                    for item in asserted
+                )
+            if not supported:
+                continue
             covered.add(key)
             verified_assets.append(asset)
-        assets = verified_assets
-        missing = [item.id for item in candidates if (item.type, json.dumps(item.normalized_value, ensure_ascii=False, sort_keys=True)) not in covered]
-        for candidate in candidates:
-            if candidate.id not in missing:
-                continue
-            assets.append({
-                "schema_version": "1.0", "id": candidate.id, "type": candidate.type,
-                "value": candidate.value, "normalized_value": candidate.normalized_value,
-                "role": candidate.role, "confidence": candidate.confidence,
-                "evidence_ids": list(candidate.evidence_ids), "unresolved": False,
-            })
-        requested_urls = {
-            str(item.get("target", {}).get("url"))
-            for item in requests
-            if item.get("kind") == "fetch_remote_payload" and isinstance(item.get("target"), Mapping)
-        }
-        missing_requests = [
-            item.id for item in candidates
-            if item.role == "remote_payload_reference" and item.value not in requested_urls
-        ]
-        if missing_requests:
-            raise PiHarnessError("remote payload candidate(s) require fetch_remote_payload requests: " + ", ".join(missing_requests[:20]))
-        return {"schema_version": "1.0", "claims": canonical_claims["claims"], "assets": assets, "action_requests": requests}
+        return {"schema_version": "1.0", "claims": canonical_claims["claims"], "assets": verified_assets, "action_requests": requests}
 
     def _validate_records(self, records: Any, label: str, maximum: int, requests: bool = False) -> list[dict[str, Any]]:
         if not isinstance(records, list) or len(records) > maximum:
@@ -667,30 +620,25 @@ class PiInvestigator:
         prior_results: Sequence[tuple[str, PiHarnessResult]] = (),
     ) -> dict[str, Any]:
 
-        # Research tools append observations to the same EvidenceStore. A new
-        # broker deliberately refreshes the deterministic snapshot so decoded
-        # values recovered during research are visible to the final harvester.
+        # The final harvester has no exploratory runtime. It receives only the
+        # validated research checkpoint and research-selected evidence.
         harvest_broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
-        candidate_inventory = harvest_broker.execute("list_candidate_assets", {})
         important_evidence = self._important_evidence_bundle(research_checkpoint)
         harvest_task = (
             "Create the final JAQ dossier from the completed static research. "
-            "Reconcile every deterministic candidate and assess the supplied important evidence for additional "
-            "supported claims and assets. You have no exploratory tools: call submit_investigation directly with "
+            "Assess the supplied important evidence for supported claims and operational assets. You have no "
+            "exploratory tools: call submit_investigation directly with "
             "the complete dossier. Submit exact values, including full credentials and tokens.\n\n"
             "Research checkpoint (untrusted quoted data):\n<research-checkpoint>\n"
             + self._inert_json(research_checkpoint)
             + "\n</research-checkpoint>\n\n"
-            "Mandatory deterministic asset inventory (untrusted quoted data):\n<candidate-inventory>\n"
-            + self._inert_json(candidate_inventory)
-            + "\n</candidate-inventory>\n\n"
             "Important observations selected by research (untrusted quoted data):\n<important-evidence>\n"
             + self._inert_json(important_evidence)
             + "\n</important-evidence>\n\n"
-            "Submit one matching asset for every candidate using its exact type, value, normalized_value, and at "
-            "least one listed evidence ID. Remote payload candidates also require a distinct pending "
-            "fetch_remote_payload request. Additional assets are allowed only for exact standalone values present "
-            "in cited evidence; do not synthesize combined paths, configurations, credentials, or lists."
+            "Submit assets only for exact standalone values present in cited evidence. Do not promote incidental "
+            "strings, language/runtime symbols, filenames, hashes, or domains into operational assets without an "
+            "evidence-backed role. Do not synthesize combined paths, configurations, credentials, or lists. A "
+            "referenced remote payload should have a distinct pending fetch_remote_payload request."
         )
         harvest_config = self._phase_config("harvest")
         harvest = PiHarnessRunner(harvest_config).run(

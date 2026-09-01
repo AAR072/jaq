@@ -88,7 +88,16 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             omitted = json.loads(json.dumps(result.claims))
             omitted["assets"] = []
             recovered = PiToolBroker(store, FakeRuntime()).validate_claims(omitted)
-            self.assertEqual(recovered["assets"][0]["type"], "payload_hash")
+            self.assertEqual(recovered["assets"], [])
+            unsupported = json.loads(json.dumps(omitted))
+            unsupported["assets"] = [{
+                "schema_version": "1.0", "id": "garbage-domain", "type": "domain",
+                "value": "eq.io", "normalized_value": "eq.io", "role": "network_infrastructure",
+                "confidence": 0.9, "evidence_ids": ["obs-native"], "unresolved": False,
+            }]
+            self.assertEqual(
+                PiToolBroker(store, FakeRuntime()).validate_claims(unsupported)["assets"], []
+            )
 
     def test_research_checkpoint_uses_phase_specific_contract(self):
         with TemporaryDirectory() as directory:
@@ -106,7 +115,6 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
 import json, sys
 init = json.loads(sys.stdin.readline())
 assert init["mode"] == "research"
-assert "list_candidate_assets" not in {item["name"] for item in init["tool_definitions"]}
 assert "static_fixture" in {item["name"] for item in init["tool_definitions"]}
 checkpoint = {"schema_version":"1.0","research_complete":True,"summary":"Static research completed.","important_evidence_ids":["obs-native"],"unresolved_questions":[]}
 print(json.dumps({"type":"request","id":1,"operation":"validate_research","payload":{"research":checkpoint}}), flush=True)
@@ -154,7 +162,7 @@ if init["mode"] == "research":
     operation, field = "validate_research", "research"
 else:
     assert "/model-session/harvest" in init["session_dir"]
-    assert "candidate-inventory" in init["task"]
+    assert "candidate-inventory" not in init["task"]
     assert "important-evidence" in init["task"] and "obs-native" in init["task"]
     assert init["tool_definitions"] == []
     value = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The sample has a persisted hash.","confidence":1.0,"evidence_ids":["obs-native"],"asset_role":"sample","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[],"action_requests":[]}
@@ -176,7 +184,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
                 dossier = investigator.run("Inspect the fixture.")
             self.assertEqual(dossier["claims"][0]["id"], "claim-1")
-            self.assertEqual(dossier["assets"][0]["type"], "payload_hash")
+            self.assertEqual(dossier["assets"], [])
             self.assertTrue((output / "research.json").is_file())
             self.assertEqual(investigator.last_run.usage["total_tokens"], 24)
             self.assertEqual(investigator.last_run.usage["cost_microusd"], 2000)
