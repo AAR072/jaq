@@ -384,16 +384,29 @@ class LiteLLMModelClient:
         completion = getattr(litellm, "completion", None)
         if not callable(completion):
             raise ModelProviderError("LiteLLM does not expose completion()")
+        response_format: dict[str, Any]
+        if self.provider == "deepseek":
+            # DeepSeek supports JSON object mode but currently rejects the
+            # OpenAI-style strict json_schema response format. JAQ still
+            # validates the returned object against its project-owned schema.
+            response_format = {"type": "json_object"}
+        else:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "jaq_structured", "schema": dict(schema), "strict": True},
+            }
         request: dict[str, Any] = {
             "model": self.model,
             "messages": [dict(message) for message in messages],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "jaq_structured", "schema": dict(schema), "strict": True},
-            },
+            "response_format": response_format,
             "timeout": self.default_timeout if timeout is None else float(timeout),
             "max_tokens": self.default_max_tokens if max_tokens is None else int(max_tokens),
         }
+        if self.provider == "deepseek" and "deepseek-v4-" in self.model:
+            # V4 thinking models require reasoning state on later tool-call
+            # turns. LiteLLM's DeepSeek adapter supplies it when reasoning is
+            # explicitly enabled.
+            request["reasoning_effort"] = "high"
         if request["timeout"] <= 0:
             raise ModelConfigurationError("timeout must be positive")
         if request["max_tokens"] <= 0:

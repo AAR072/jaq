@@ -17,7 +17,7 @@ make build
 Choose a LiteLLM provider/model string and keep its provider key in the environment:
 
 ```sh
-export JAQ_INVESTIGATOR_MODEL='deepseek/deepseek-chat'
+export JAQ_INVESTIGATOR_MODEL='deepseek/deepseek-v4-flash'
 export DEEPSEEK_API_KEY='...'
 ./bin/jaq analyze --sample /absolute/path/to/sample.exe --output ./runs/example
 ```

@@ -240,6 +240,44 @@ class ModelLoopTests(unittest.TestCase):
             with self.assertRaises(ModelResponseError):
                 client.generate_structured(messages=[{"role": "user", "content": "x"}], schema={"type": "object"})
 
+    def test_litellm_deepseek_uses_supported_json_mode(self):
+        captured = {}
+
+        def completion(**kwargs):
+            captured.update(kwargs)
+            return {
+                "choices": [{"message": {"content": '{"schema_version":"1.0","claims":[]}'}}],
+                "model": kwargs["model"],
+            }
+
+        fake = types.SimpleNamespace(completion=completion)
+        with mock.patch.dict(sys.modules, {"litellm": fake}):
+            LiteLLMModelClient("deepseek/deepseek-v4-flash").generate_structured(
+                messages=[{"role": "user", "content": "Return JSON"}],
+                schema={"type": "object"},
+            )
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["reasoning_effort"], "high")
+
+    def test_litellm_other_providers_keep_strict_json_schema(self):
+        captured = {}
+
+        def completion(**kwargs):
+            captured.update(kwargs)
+            return {
+                "choices": [{"message": {"content": '{}'}}],
+                "model": kwargs["model"],
+            }
+
+        fake = types.SimpleNamespace(completion=completion)
+        schema = {"type": "object", "additionalProperties": False}
+        with mock.patch.dict(sys.modules, {"litellm": fake}):
+            LiteLLMModelClient("openai/example").generate_structured(
+                messages=[{"role": "user", "content": "Return JSON"}], schema=schema,
+            )
+        self.assertEqual(captured["response_format"]["type"], "json_schema")
+        self.assertEqual(captured["response_format"]["json_schema"]["schema"], schema)
+
     def test_litellm_auth_and_provider_failures_are_stable_and_redacted(self):
         class AuthFailure(Exception):
             status_code = 401
