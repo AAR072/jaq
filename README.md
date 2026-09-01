@@ -23,6 +23,14 @@ export DEEPSEEK_API_KEY='...'
 ./bin/jaq analyze --sample /absolute/path/to/sample.exe --output ./runs/example
 ```
 
+For the normal local workflow, put those two assignments in the gitignored `.env` and run:
+
+```sh
+./scripts/jaq-run /absolute/path/to/sample.exe
+```
+
+The wrapper loads `.env`, activates `.venv` when present, builds the CLI if needed, and writes to a fresh timestamped directory under `runs/`. Supply an absolute second argument to choose a different output directory.
+
 Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may use a different LiteLLM provider; no second key is required for mocked tests.
 
 The investigator runs through the host-side Pi SDK with only JAQ tools enabled. Defaults cap one run at 12 model calls, 40 tool calls, 500,000 cumulative tokens, and an estimated $0.10. Override them with `JAQ_MAX_MODEL_CALLS`, `JAQ_MAX_TOOL_CALLS`, `JAQ_MAX_TOTAL_TOKENS`, and `JAQ_MAX_COST_USD`. Full tool results remain in the evidence ledger; Pi receives bounded previews and automatically compacts older context.
