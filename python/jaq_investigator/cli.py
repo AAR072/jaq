@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -148,10 +149,11 @@ def run_pipeline(
 
 
 def _render_operational(investigation: Mapping[str, Any]) -> str:
+    safe = lambda value: html.escape(str(value), quote=True).replace("\n", " ")
     lines = ["\n## Operational assets\n"]
     assets = investigation.get("assets", [])
     lines.extend(
-        f"- `{item.get('type')}` `{str(item.get('value'))}` — {item.get('role')} (confidence {item.get('confidence')})"
+        f"- <code>{safe(item.get('type'))}</code> <code>{safe(item.get('value'))}</code> — {safe(item.get('role'))} (confidence {safe(item.get('confidence'))})"
         for item in assets
     )
     if not assets:
@@ -159,7 +161,7 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
     lines.append("\n## Pending action requests\n")
     requests = investigation.get("action_requests", [])
     lines.extend(
-        f"- `{item.get('id')}` `{item.get('kind')}` — {item.get('reason')} (`pending_authorization`)"
+        f"- <code>{safe(item.get('id'))}</code> <code>{safe(item.get('kind'))}</code> — {safe(item.get('reason'))} (<code>pending_authorization</code>)"
         for item in requests
     )
     if not requests:
