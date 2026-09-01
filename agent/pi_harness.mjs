@@ -118,7 +118,7 @@ async function main() {
     if (finalizing || submittedClaims !== undefined) return;
     finalizing = true;
     if (session) {
-      session.setActiveTools(["submit_claims"]);
+      session.setActiveToolsByName(["submit_claims"]);
       void session.steer(
         `Controller budget notice: ${reason}. Stop investigating and call submit_claims now using the strongest evidence already collected.`,
       ).catch(() => {});
