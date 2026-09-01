@@ -60,6 +60,14 @@ obtained statically, emit an evidence-backed pending_authorization action
 request such as fetch_remote_payload or dynamic_analysis. Requests are records
 only; no request is executed in this milestone.
 
+Dynamic-analysis requests are exceptional artifact-recovery requests. Use one
+only when packing, obfuscation, runtime decryption, injection, or runtime key
+derivation prevents recovery of a deobfuscated/unpacked payload, decrypted
+configuration, injected code, memory-mapped image, or key material. Do not
+request dynamic analysis merely to confirm reachability, commands, registry
+writes, file activity, network behavior, or an already-supported capability;
+leave those claims unresolved or request manual_review instead.
+
 When you are done, return only a JSON object matching the supplied versioned
 claims schema. Do not put instructions, markdown, or commentary outside that
 object.

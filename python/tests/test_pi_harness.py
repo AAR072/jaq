@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from jaq_investigator.evidence import EvidenceStore
-from jaq_investigator.pi_harness import PiHarnessConfig, PiHarnessRunner, PiToolBroker
+from jaq_investigator.pi_harness import PiHarnessConfig, PiHarnessError, PiHarnessRunner, PiToolBroker
 from jaq_investigator.schemas import Observation
 
 
@@ -40,7 +40,7 @@ assert "submit_claims" not in {item["name"] for item in init["tool_definitions"]
 print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"list_observation_types","arguments":{}}}), flush=True)
 reply = json.loads(sys.stdin.readline())
 assert reply["ok"] is True
-claims = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[{"schema_version":"1.0","id":"asset-1","type":"payload_hash","value":"a"*64,"normalized_value":"a"*64,"role":"sample","confidence":1.0,"evidence_ids":["obs-native"],"unresolved":False}],"action_requests":[{"schema_version":"1.0","id":"request-1","kind":"dynamic_analysis","status":"pending_authorization","reason":"Confirm runtime behavior.","evidence_ids":["obs-native"],"target":{},"requested_observations":["processes"]}]}
+claims = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[{"schema_version":"1.0","id":"asset-1","type":"payload_hash","value":"a"*64,"normalized_value":"a"*64,"role":"sample","confidence":1.0,"evidence_ids":["obs-native"],"unresolved":False}],"action_requests":[{"schema_version":"1.0","id":"request-1","kind":"dynamic_analysis","status":"pending_authorization","reason":"Recover a runtime-decrypted payload.","evidence_ids":["obs-native"],"target":{},"requested_observations":["decrypted_payload"]}]}
 print(json.dumps({"type":"request","id":2,"operation":"validate_claims","payload":{"claims":claims}}), flush=True)
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
@@ -64,6 +64,10 @@ print(json.dumps({"type":"complete","claims":validated["result"],"usage":{"input
             self.assertEqual(result.claims["action_requests"][0]["status"], "pending_authorization")
             self.assertEqual(result.usage["total_tokens"], 17)
             self.assertEqual(result.session["id"], "fake-session")
+            broad = json.loads(json.dumps(result.claims))
+            broad["action_requests"][0]["requested_observations"] = ["processes", "registry writes"]
+            with self.assertRaises(PiHarnessError):
+                PiToolBroker(store, FakeRuntime()).validate_claims(broad)
 
 
 if __name__ == "__main__":

@@ -327,6 +327,17 @@ class PiToolBroker:
                     raise PiHarnessError("invalid action request kind or target")
                 if not isinstance(record.get("reason"), str) or not record["reason"].strip() or not isinstance(record.get("requested_observations"), list):
                     raise PiHarnessError("invalid action request details")
+                if record.get("kind") == "dynamic_analysis":
+                    recovery_outputs = {
+                        "deobfuscated_payload", "unpacked_payload", "decrypted_payload",
+                        "decrypted_configuration", "runtime_key_material",
+                        "memory_mapped_image", "injected_code",
+                    }
+                    requested = {str(item).strip().lower().replace(" ", "_") for item in record["requested_observations"]}
+                    if not requested.intersection(recovery_outputs):
+                        raise PiHarnessError(
+                            "dynamic_analysis must request recovery of a deobfuscated/unpacked/decrypted artifact, configuration, code, image, or key material"
+                        )
             else:
                 confidence = record.get("confidence")
                 if record.get("type") not in item_schema["properties"]["type"]["enum"] or not isinstance(record.get("role"), str):
