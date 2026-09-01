@@ -14,6 +14,7 @@ _URL = re.compile(r"https?://[^\s\"'<>]{4,2048}", re.IGNORECASE)
 _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}\b", re.IGNORECASE)
 _IP = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])")
 _TOKEN = re.compile(r"\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,255}|xox[baprs]-[A-Za-z0-9-]{10,255}|sk-[A-Za-z0-9_-]{16,255}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b")
+_DISCORD_TOKEN = re.compile(r"(?<![A-Za-z0-9_-])(?:mfa\.[A-Za-z0-9_-]{40,120}|[A-Za-z0-9_-]{20,30}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,120})(?![A-Za-z0-9_-])")
 _WALLET = re.compile(r"\b(?:bc1[a-zA-HJ-NP-Z0-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[a-fA-F0-9]{40})\b")
 _PEM = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
 _PEM_BLOCK = re.compile(r"-----BEGIN (?P<label>(?:(?:RSA|EC|OPENSSH) )?PRIVATE KEY|CERTIFICATE)-----[A-Za-z0-9+/=\r\n]{16,65536}-----END (?P=label)-----")
@@ -96,6 +97,10 @@ def extract_candidates(observations: Iterable[Any], limit: int = 500) -> list[Ca
                 asset_type = "bearer_token" if token.startswith("eyJ") else "api_key"
                 key = (asset_type, token)
                 values[key] = (token, "embedded_credential", 0.99)
+                found.setdefault(key, set()).add(observation_id)
+            for token in _DISCORD_TOKEN.findall(text):
+                key = ("bearer_token", token)
+                values[key] = (token, "discord_api_token", 0.99)
                 found.setdefault(key, set()).add(observation_id)
             for wallet in _WALLET.findall(text):
                 key = ("crypto_wallet", wallet)

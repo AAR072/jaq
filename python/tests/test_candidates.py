@@ -10,13 +10,13 @@ class CandidateTest(unittest.TestCase):
     def test_extracts_operational_candidates_with_evidence(self):
         observation = Observation(
             id="obs-1", type="pe.string.ascii",
-            raw_value="download https://stage.example/payload.exe contact ops@example.com key ghp_abcdefghijklmnopqrstuvwxyz1234",
+            raw_value="download https://stage.example/payload.exe contact ops@example.com key ghp_abcdefghijklmnopqrstuvwxyz1234 token AAAAAAAAAAAAAAAAAAAAAAAA.BBBBBB.CCCCCCCCCCCCCCCCCCCCCCCCCCC",
             normalized_value="", artifact_location={"artifact":"sample"},
             analyzer={"name":"fixture","version":"1"}, provenance={"source":"fixture"},
         )
         candidates = extract_candidates([observation])
         kinds = {item.type for item in candidates}
-        self.assertTrue({"url", "email", "api_key"}.issubset(kinds))
+        self.assertTrue({"url", "email", "api_key", "bearer_token"}.issubset(kinds))
         self.assertTrue(all(item.evidence_ids == ("obs-1",) for item in candidates))
 
 
