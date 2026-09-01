@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/jaq-project/jaq/internal/acquire"
@@ -77,6 +79,7 @@ func run(args []string) error {
 		if args[0] == "requests" {
 			flags := flag.NewFlagSet("jaq requests", flag.ContinueOnError)
 			runDir := flags.String("run", "", "absolute completed run directory")
+			asJSON := flags.Bool("json", false, "print the complete request document as JSON")
 			if err := flags.Parse(args[1:]); err != nil {
 				return err
 			}
@@ -84,8 +87,31 @@ func run(args []string) error {
 			if err != nil {
 				return err
 			}
-			for _, item := range value.ActionRequests {
-				fmt.Printf("%s\t%s\t%s\n", item.ID, item.Kind, item.Status)
+			if *asJSON {
+				encoded, marshalErr := json.MarshalIndent(value, "", "  ")
+				if marshalErr != nil {
+					return marshalErr
+				}
+				fmt.Println(string(encoded))
+				return nil
+			}
+			if len(value.ActionRequests) == 0 {
+				fmt.Println("No action requests.")
+				return nil
+			}
+			for index, item := range value.ActionRequests {
+				if index > 0 {
+					fmt.Println()
+				}
+				fmt.Printf("[%s] %s — %s\n", item.ID, item.Kind, item.Status)
+				if targetURL, ok := item.Target["url"].(string); ok {
+					fmt.Println("  Target:", targetURL)
+				} else if target, marshalErr := json.Marshal(item.Target); marshalErr == nil {
+					fmt.Println("  Target:", string(target))
+				}
+				fmt.Println("  Reason:", item.Reason)
+				fmt.Println("  Requested:", strings.Join(item.RequestedObservations, ", "))
+				fmt.Println("  Evidence:", strings.Join(item.EvidenceIDs, ", "))
 			}
 			return nil
 		}
