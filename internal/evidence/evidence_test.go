@@ -150,6 +150,10 @@ func TestScoreRejectsSemanticVerificationBypass(t *testing.T) {
 	if err := score.Validate([]Claim{claim}, []Observation{observation}); err == nil {
 		t.Fatal("reachable claim without a structured path was accepted")
 	}
+	supported = false
+	if err := score.Validate([]Claim{claim}, []Observation{observation}); err != nil {
+		t.Fatalf("finding with explicitly downgraded reachability was rejected: %v", err)
+	}
 }
 
 func TestStructuredRelationshipSupportsReachability(t *testing.T) {

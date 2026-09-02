@@ -389,6 +389,15 @@ class ModelLoopTests(unittest.TestCase):
             self.assertEqual(result["score"]["accepted"], 1)
             self.assertEqual({item.name for item in output.iterdir()}, {"claims.json", "assets.json", "requests.json", "score.json", "report.md"})
             self.assertEqual(json.loads((output / "claims.json").read_text())["schema_version"], "1.0")
+            asset_document = json.loads((output / "assets.json").read_text())
+            self.assertEqual(
+                set(asset_document["categories"]),
+                {
+                    "credentials_and_tokens", "c2_and_infrastructure", "payloads",
+                    "execution_and_persistence", "contacts_and_financial",
+                    "configuration", "other",
+                },
+            )
 
 
 def json_truth(text, key):

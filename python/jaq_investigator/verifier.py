@@ -99,30 +99,28 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
             normalized.evidence_ids,
         )
         if not supported:
-            return _result(
-                normalized,
-                "rejected",
-                (
-                    "reachable claim has no supporting structured call/reference "
-                    "relationship path",
-                ),
-                reachability_supported=False,
+            reachability_reason = (
+                "finding accepted; asserted reachability downgraded to unknown because no "
+                "supporting structured call/reference relationship path exists"
             )
+        else:
+            reachability_reason = "all cited evidence and the structured reachability path passed deterministic checks"
     else:
         supported = None
+        reachability_reason = "all cited evidence exists and deterministic checks passed"
 
     if normalized.unresolved:
         return _result(
             normalized,
             "unclear",
-            ("claim is marked unresolved",),
+            tuple(dict.fromkeys(("claim is marked unresolved", reachability_reason))),
             reachability_supported=supported,
         )
 
     return _result(
         normalized,
         "accepted",
-        ("all cited evidence exists and deterministic checks passed",),
+        (reachability_reason,),
         reachability_supported=supported,
     )
 

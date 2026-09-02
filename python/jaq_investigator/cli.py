@@ -22,6 +22,58 @@ from .runtime import StaticToolRuntime
 from .verifier import verify_and_score
 
 
+_ASSET_CATEGORY_ORDER = (
+    "credentials_and_tokens",
+    "c2_and_infrastructure",
+    "payloads",
+    "execution_and_persistence",
+    "contacts_and_financial",
+    "configuration",
+    "other",
+)
+_ASSET_CATEGORY_LABELS = {
+    "credentials_and_tokens": "Credentials and tokens",
+    "c2_and_infrastructure": "C2 and infrastructure",
+    "payloads": "Payloads",
+    "execution_and_persistence": "Execution and persistence",
+    "contacts_and_financial": "Contacts and financial",
+    "configuration": "Configuration",
+    "other": "Other assets",
+}
+_ASSET_TYPE_CATEGORIES = {
+    **dict.fromkeys({
+        "api_key", "bearer_token", "oauth_credential", "username_password",
+        "private_key", "certificate", "encryption_key", "database_connection",
+    }, "credentials_and_tokens"),
+    **dict.fromkeys({
+        "c2_endpoint", "domain", "ip_address", "url", "download_location",
+        "webhook", "cloud_bucket",
+    }, "c2_and_infrastructure"),
+    **dict.fromkeys({"payload_hash", "embedded_payload", "remote_payload"}, "payloads"),
+    **dict.fromkeys({
+        "command", "path", "mutex", "named_pipe", "registry_path",
+        "service_name", "scheduled_task",
+    }, "execution_and_persistence"),
+    **dict.fromkeys({"email", "crypto_wallet"}, "contacts_and_financial"),
+    "configuration": "configuration",
+}
+
+
+def _group_assets(assets: Any) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {name: [] for name in _ASSET_CATEGORY_ORDER}
+    if not isinstance(assets, list):
+        return groups
+    for raw in assets:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        category = _ASSET_TYPE_CATEGORIES.get(str(item.get("type")), "other")
+        groups[category].append(item)
+    for records in groups.values():
+        records.sort(key=lambda item: (str(item.get("type")), str(item.get("id"))))
+    return groups
+
+
 def _resolve_evidence_path(value: str) -> Path:
     path = Path(value)
     if path.is_dir():
@@ -142,7 +194,11 @@ def run_pipeline(
 
     contents = {
         "claims.json": json.dumps(claims_only, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        "assets.json": json.dumps({"schema_version": "1.0", "assets": claims.get("assets", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "assets.json": json.dumps({
+            "schema_version": "1.0",
+            "assets": claims.get("assets", []),
+            "categories": _group_assets(claims.get("assets", [])),
+        }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "report.md": render_report(claims["claims"], score, store) + _render_operational(claims),
@@ -176,12 +232,18 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
         return value
     lines = ["\n## Operational assets\n"]
     assets = investigation.get("assets", [])
-    lines.extend(
-        f"- <code>{safe(item.get('type'))}</code> <code>{safe(display(item))}</code> — {safe(item.get('role'))} (confidence {safe(item.get('confidence'))})"
-        for item in assets
-    )
-    if not assets:
-        lines.append("- None identified.")
+    groups = _group_assets(assets)
+    for category in _ASSET_CATEGORY_ORDER:
+        lines.append(f"### {_ASSET_CATEGORY_LABELS[category]}\n")
+        records = groups[category]
+        if records:
+            lines.extend(
+                f"- <code>{safe(item.get('type'))}</code> <code>{safe(display(item))}</code> — {safe(item.get('role'))} (confidence {safe(item.get('confidence'))})"
+                for item in records
+            )
+        else:
+            lines.append("- None identified.")
+        lines.append("")
     lines.append("\n## Pending action requests\n")
     requests = investigation.get("action_requests", [])
     lines.extend(

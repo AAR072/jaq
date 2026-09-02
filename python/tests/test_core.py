@@ -14,7 +14,7 @@ from jaq_investigator import (
     render_report,
     verify_claim,
 )
-from jaq_investigator.cli import _render_operational
+from jaq_investigator.cli import _group_assets, _render_operational
 
 
 class CoreTest(unittest.TestCase):
@@ -71,7 +71,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(result.status, "rejected")
         self.assertIn("exact value absent", result.reasons[0])
 
-    def test_reachable_without_relationship_is_rejected(self):
+    def test_reachable_without_relationship_downgrades_only_reachability(self):
         store = self.store([self.observation("main", "main"), self.observation("asset", "secret")])
         claim = self.claim(
             ("main", "asset"),
@@ -80,8 +80,11 @@ class CoreTest(unittest.TestCase):
             entrypoints=("main",),
         )
         result = verify_claim(claim, store)
-        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.status, "accepted")
         self.assertFalse(result.reachability_supported)
+        self.assertIn("downgraded to unknown", result.reasons[0])
+        report = render_report([claim], build_score([claim], [result]), store)
+        self.assertIn("unknown (downgraded from reachable)", report)
 
     def test_structured_relationship_supports_reachability(self):
         store = self.store(
@@ -192,6 +195,27 @@ class CoreTest(unittest.TestCase):
         })
         self.assertIn(token, report)
         self.assertIn("sha256:", report)
+        self.assertIn("### Credentials and tokens", report)
+        self.assertIn("### C2 and infrastructure", report)
+
+    def test_assets_are_grouped_by_validated_type(self):
+        assets = [
+            {"id": "token", "type": "bearer_token", "value": "secret"},
+            {"id": "c2", "type": "c2_endpoint", "value": "example.invalid"},
+            {"id": "payload", "type": "remote_payload", "value": "stage.bin"},
+            {"id": "run", "type": "registry_path", "value": "HKCU\\Run"},
+            {"id": "mail", "type": "email", "value": "x@example.invalid"},
+            {"id": "config", "type": "configuration", "value": "x"},
+            {"id": "file", "type": "filename", "value": "sample.exe"},
+        ]
+        groups = _group_assets(assets)
+        self.assertEqual(groups["credentials_and_tokens"][0]["id"], "token")
+        self.assertEqual(groups["c2_and_infrastructure"][0]["id"], "c2")
+        self.assertEqual(groups["payloads"][0]["id"], "payload")
+        self.assertEqual(groups["execution_and_persistence"][0]["id"], "run")
+        self.assertEqual(groups["contacts_and_financial"][0]["id"], "mail")
+        self.assertEqual(groups["configuration"][0]["id"], "config")
+        self.assertEqual(groups["other"][0]["id"], "file")
 
 
 if __name__ == "__main__":

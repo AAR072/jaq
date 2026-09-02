@@ -209,7 +209,15 @@ def render_report(
         )
         lines.append(f"- Asset role: {_code(claim.asset_role) if claim.asset_role is not None else 'null'}")
         reachability = claim.reachability
-        lines.append(f"- Reachability: {_code(reachability.status)}")
+        result = result_by_id.get(claim.id)
+        effective_reachability = (
+            "unknown (downgraded from reachable)"
+            if reachability.status == "reachable" and result is not None and result.reachability_supported is False
+            else reachability.status
+        )
+        lines.append(f"- Reachability: {_code(effective_reachability)}")
+        if result is not None and result.reasons:
+            lines.append("- Verification: " + "; ".join(_code(reason) for reason in result.reasons))
         if reachability.entrypoints:
             lines.append(
                 "- Entrypoints: "

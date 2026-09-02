@@ -823,10 +823,10 @@ func (s Score) Validate(claims []Claim, observations []Observation) error {
 			return fmt.Errorf("unresolved claim %q cannot be accepted", v.ClaimID)
 		}
 		if v.Status == "accepted" && claim.Reachability.Status == "reachable" {
-			if v.ReachabilitySupported == nil || !*v.ReachabilitySupported {
-				return fmt.Errorf("accepted reachable claim %q is not marked reachability-supported", v.ClaimID)
+			if v.ReachabilitySupported == nil {
+				return fmt.Errorf("accepted reachable claim %q has no reachability decision", v.ClaimID)
 			}
-			if !SupportsReachability(claim, observations) {
+			if *v.ReachabilitySupported && !SupportsReachability(claim, observations) {
 				return fmt.Errorf("accepted reachable claim %q has no structured evidence path", v.ClaimID)
 			}
 		}
