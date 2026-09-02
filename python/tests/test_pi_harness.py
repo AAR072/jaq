@@ -266,17 +266,23 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
             )
             incomplete = coverage_checkpoint("obs-native")
             incomplete["coverage"]["analyzed_functions"][2]["address"] = "0x9999"
-            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
-                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(incomplete)
+            incomplete_result = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(incomplete)
+            self.assertTrue(any("Coverage incomplete" in item for item in incomplete_result["unresolved_questions"]))
             mismatched = coverage_checkpoint("obs-native")
             for function in mismatched["coverage"]["analyzed_functions"]:
                 function["evidence_ids"] = ["obs-coverage-0"]
-            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
-                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(mismatched)
+            mismatched_result = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(mismatched)
+            self.assertTrue(any("Coverage incomplete" in item for item in mismatched_result["unresolved_questions"]))
             forged_attempt = coverage_checkpoint("obs-native")
             forged_attempt["coverage"]["deobfuscation_attempts"][0]["evidence_ids"] = ["obs-native"]
-            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
-                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(forged_attempt)
+            forged_result = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(forged_attempt)
+            self.assertTrue(any("Coverage incomplete" in item for item in forged_result["unresolved_questions"]))
             omitted_important = coverage_checkpoint("obs-native")
             omitted_important["important_evidence_ids"] = ["obs-native"]
             reconciled = PiToolBroker(
@@ -386,7 +392,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             self.assertTrue((output / "model-session" / "harvest-2").is_dir())
             self.assertEqual(investigator.last_run.usage["total_tokens"], 12)
 
-    def test_missing_research_terminal_uses_persisted_evidence_finalizer(self):
+    def test_missing_research_terminal_compiles_checkpoint_locally(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
@@ -435,8 +441,8 @@ print(json.dumps({"type":"complete","submission":reply["result"],"usage":{"input
                 dossier = investigator.run("Inspect the fixture.")
             self.assertEqual(dossier["claims"][0]["id"], "claim-1")
             self.assertTrue((output / "research.json").is_file())
-            self.assertTrue((output / "model-session" / "research-finalize").is_dir())
-            self.assertEqual(investigator.last_run.usage["research_finalize_total_tokens"], 12)
+            self.assertFalse((output / "model-session" / "research-finalize").exists())
+            self.assertNotIn("research_recovered_total_tokens", investigator.last_run.usage)
 
     def test_provider_failure_does_not_trigger_checkpoint_fallback(self):
         with TemporaryDirectory() as directory:

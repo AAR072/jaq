@@ -45,8 +45,8 @@ function positiveNumber(value, label) {
 
 function validateInit(frame) {
   if (frame.type !== "init") throw new Error("first JAQ harness frame must be init");
-  if (!["research", "research_finalize", "harvest"].includes(frame.mode)) {
-    throw new Error("mode must be research, research_finalize, or harvest");
+  if (!["research", "harvest"].includes(frame.mode)) {
+    throw new Error("mode must be research or harvest");
   }
   const budgets = requireObject(frame.budgets, "budgets");
   const compaction = requireObject(frame.compaction, "compaction");
@@ -125,7 +125,7 @@ function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, 
 async function main() {
   const channel = new LineChannel();
   const init = validateInit(await channel.read());
-  const researchMode = init.mode === "research" || init.mode === "research_finalize";
+  const researchMode = init.mode === "research";
   const terminalName = researchMode ? "finish_research" : "submit_investigation";
   const validationOperation = researchMode ? "validate_research" : "validate_claims";
   const validationField = researchMode ? "research" : "claims";
