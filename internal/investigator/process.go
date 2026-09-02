@@ -6,15 +6,83 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 const DefaultTimeout = 30 * time.Minute
+const progressPrefix = "JAQ_PROGRESS "
+
+var progressLinePattern = regexp.MustCompile(`^\[(research|harvest)\] (started|model calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5}|tool #[0-9]+: [A-Za-z][A-Za-z0-9_]{0,99}|preparing checkpoint at cost=\$[0-9]+\.[0-9]{5}|submission attempt #[0-9]+|submission rejected; correcting|submission accepted|completed calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5})$`)
+
+type progressFilter struct {
+	mu          sync.Mutex
+	pending     []byte
+	diagnostics bytes.Buffer
+	display     io.Writer
+}
+
+func newProgressFilter(display io.Writer) *progressFilter {
+	return &progressFilter{display: display}
+}
+
+func (w *progressFilter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pending = append(w.pending, data...)
+	for {
+		newline := bytes.IndexByte(w.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := append([]byte(nil), w.pending[:newline]...)
+		w.pending = w.pending[newline+1:]
+		w.handle(line)
+	}
+	if len(w.pending) > 64*1024 {
+		w.handle(w.pending[:64*1024])
+		w.pending = nil
+	}
+	return len(data), nil
+}
+
+func (w *progressFilter) handle(line []byte) {
+	text := strings.TrimSuffix(string(line), "\r")
+	payload := strings.TrimPrefix(text, progressPrefix)
+	if strings.HasPrefix(text, progressPrefix) && len(text) <= 600 && progressLinePattern.MatchString(payload) {
+		_, _ = fmt.Fprintln(w.display, "jaq:", payload)
+		return
+	}
+	if w.diagnostics.Len() < 64*1024 {
+		remaining := 64*1024 - w.diagnostics.Len()
+		if len(line)+1 > remaining {
+			line = line[:max(0, remaining-1)]
+		}
+		w.diagnostics.Write(line)
+		w.diagnostics.WriteByte('\n')
+	}
+}
+
+func (w *progressFilter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) > 0 {
+		w.handle(w.pending)
+		w.pending = nil
+	}
+}
+
+func (w *progressFilter) Diagnostics() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.diagnostics.String()
+}
 
 var credentialPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]+`),
@@ -143,9 +211,10 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 		"--evidence", filepath.Join(evidenceDir, "observations.jsonl"),
 		"--output", evidenceDir)
 	cmd.Stdin = nil
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	var stdout bytes.Buffer
+	progress := newProgressFilter(os.Stderr)
+	cmd.Stdout = &stdout
+	cmd.Stderr = progress
 	env := os.Environ()
 	if p.ProjectRoot != "" {
 		pythonPath := filepath.Join(p.ProjectRoot, "python")
@@ -161,17 +230,20 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 		"JAQ_SAMPLE_SHA256="+p.SampleSHA256,
 		"JAQ_RADARE2_VERSION="+p.RadareVersion,
 		"JAQ_R2MCP_VERSION="+p.MCPVersion,
+		"JAQ_PROGRESS_TRANSPORT=1",
 	)
 	if err := cmd.Run(); err != nil {
+		progress.Flush()
 		if errors.Is(stageCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("investigator timed out after %s: %w", timeout, stageCtx.Err())
 		}
-		message := RedactSensitive(output.String())
+		message := RedactSensitive(stdout.String() + progress.Diagnostics())
 		if len(message) > 64*1024 {
 			message = message[:64*1024]
 		}
 		return fmt.Errorf("investigator failed: %w: %s", err, strings.TrimSpace(message))
 	}
+	progress.Flush()
 	return nil
 }
 

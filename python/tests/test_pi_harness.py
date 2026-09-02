@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest.mock import patch
 from jaq_investigator.evidence import EvidenceStore
 from jaq_investigator.pi_harness import (
     PiHarnessConfig, PiHarnessError, PiHarnessRunner, PiInvestigator, PiToolBroker,
+    _emit_progress,
 )
 from jaq_investigator.prompts import INVESTIGATION_SCHEMA, RESEARCH_SCHEMA
 from jaq_investigator.schemas import Observation
@@ -95,6 +98,33 @@ def coverage_checkpoint(important_id: str) -> dict:
 
 
 class PiHarnessProtocolTest(unittest.TestCase):
+    def test_progress_frames_render_only_bounded_controller_fields(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"JAQ_PROGRESS_TRANSPORT": "1"}), redirect_stderr(output):
+            _emit_progress({
+                "type": "progress", "phase": "research", "event": "tool_started",
+                "provider_calls": 3, "tool_calls": 7, "cost_usd": 0.01234,
+                "tool": "r2_decompile_function",
+            })
+        self.assertEqual(
+            output.getvalue(),
+            "JAQ_PROGRESS [research] tool #7: r2_decompile_function\n",
+        )
+        with self.assertRaises(PiHarnessError):
+            _emit_progress({
+                "type": "progress", "phase": "research", "event": "tool_started",
+                "provider_calls": 3, "tool_calls": 7, "cost_usd": 0.01234,
+                "tool": "r2_decompile_function", "raw_output": "untrusted",
+            })
+        for bad_field, bad_value in (("phase", []), ("event", []), ("cost_usd", 10**10_000)):
+            malformed = {
+                "type": "progress", "phase": "research", "event": "model_progress",
+                "provider_calls": 3, "tool_calls": 7, "cost_usd": 0.01234,
+            }
+            malformed[bad_field] = bad_value
+            with self.assertRaises(PiHarnessError):
+                _emit_progress(malformed)
+
     def test_fake_pi_process_completes_through_broker_and_submit_claims(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

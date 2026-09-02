@@ -31,6 +31,16 @@ For the normal local workflow, put those two assignments in the gitignored `.env
 
 The wrapper loads `.env`, activates `.venv` when present, builds the CLI if needed, and writes to a fresh timestamped directory under `runs/`. Supply an absolute second argument to choose a different output directory.
 
+Runs emit safe structured progress without exposing model prose, sample strings, commands, endpoints, or credentials. Specialized analysis tools are shown immediately; repeated static-command work and model/cost counters are summarized periodically:
+
+```text
+jaq: [research] started
+jaq: [research] tool #8: r2_decompile_function
+jaq: [research] model calls=10 tools=14 cost=$0.00642
+jaq: [research] submission accepted
+jaq: [harvest] started
+```
+
 Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may use a different LiteLLM provider; no second key is required for mocked tests.
 
 The investigator uses two fresh Pi sessions. The research session performs static reverse engineering with Radare2 and the offline command sandbox, persists every tool result, and writes `research.json`. A smaller terminal-only harvest session receives the research checkpoint and a bounded bundle of important evidence directly in its prompt, then produces claims, credentials, tokens, usernames/passwords, C2 infrastructure, URLs, payload references, and action requests. Its only tool is `submit_investigation`; it cannot explore with Radare2, shell, filesystem, network, or evidence tools. Model-submitted assets must cite evidence containing their exact values; incidental regex matches are not promoted automatically.

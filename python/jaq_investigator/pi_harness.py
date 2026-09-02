@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
 import os
 import re
 from pathlib import Path, PureWindowsPath
 import signal
 import subprocess
+import sys
 import threading
 from typing import Any, Mapping, Sequence
 
@@ -27,6 +29,59 @@ MAX_FRAME_BYTES = 8 << 20
 MAX_STDERR_BYTES = 64 << 10
 MAX_HARVEST_EVIDENCE_BYTES = 48_000
 MAX_HARVEST_EVIDENCE_ITEM_BYTES = 4_000
+_PROGRESS_EVENTS = {
+    "phase_started", "model_progress", "tool_started", "finalizing",
+    "submission_attempt", "submission_rejected", "submission_accepted",
+    "phase_completed",
+}
+
+
+def _emit_progress(frame: Mapping[str, Any]) -> None:
+    if not set(frame).issubset({
+        "type", "phase", "event", "provider_calls", "tool_calls",
+        "cost_usd", "tool", "attempt",
+    }):
+        raise PiHarnessError("Pi progress frame has unsupported fields")
+    phase = frame.get("phase")
+    event = frame.get("event")
+    provider_calls = frame.get("provider_calls")
+    tool_calls = frame.get("tool_calls")
+    cost = frame.get("cost_usd")
+    if not isinstance(phase, str) or not isinstance(event, str) or phase not in {"research", "harvest"} or event not in _PROGRESS_EVENTS:
+        raise PiHarnessError("Pi progress frame is invalid")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (provider_calls, tool_calls)):
+        raise PiHarnessError("Pi progress counters are invalid")
+    if (
+        not isinstance(cost, (int, float)) or isinstance(cost, bool)
+        or (isinstance(cost, float) and not math.isfinite(cost))
+        or not 0 <= cost <= 1000
+    ):
+        raise PiHarnessError("Pi progress cost is invalid")
+    prefix = f"[{phase}]"
+    if event == "phase_started":
+        message = f"{prefix} started"
+    elif event == "model_progress":
+        message = f"{prefix} model calls={provider_calls} tools={tool_calls} cost=${float(cost):.5f}"
+    elif event == "tool_started":
+        tool = frame.get("tool")
+        if not isinstance(tool, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", tool):
+            raise PiHarnessError("Pi progress tool name is invalid")
+        message = f"{prefix} tool #{tool_calls}: {tool}"
+    elif event == "finalizing":
+        message = f"{prefix} preparing checkpoint at cost=${float(cost):.5f}"
+    elif event == "submission_attempt":
+        attempt = frame.get("attempt")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            raise PiHarnessError("Pi progress attempt is invalid")
+        message = f"{prefix} submission attempt #{attempt}"
+    elif event == "submission_rejected":
+        message = f"{prefix} submission rejected; correcting"
+    elif event == "submission_accepted":
+        message = f"{prefix} submission accepted"
+    else:
+        message = f"{prefix} completed calls={provider_calls} tools={tool_calls} cost=${float(cost):.5f}"
+    transport_prefix = "JAQ_PROGRESS " if os.environ.get("JAQ_PROGRESS_TRANSPORT") == "1" else "jaq: "
+    print(transport_prefix + message, file=sys.stderr, flush=True)
 
 
 class PiHarnessError(RuntimeError):
@@ -691,6 +746,11 @@ class PiHarnessRunner:
                         f"Pi exited before completing the dossier (status {code}): {diagnostics.text()}"
                     )
                 kind = frame.get("type")
+                if kind == "progress":
+                    if frame.get("phase") != mode:
+                        raise PiHarnessError("Pi progress phase does not match the active phase")
+                    _emit_progress(frame)
+                    continue
                 if kind == "request":
                     request_id = frame.get("id")
                     operation = frame.get("operation")

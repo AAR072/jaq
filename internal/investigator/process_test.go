@@ -1,11 +1,46 @@
 package investigator
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestProgressFilterDisplaysOnlyValidatedProgressLines(t *testing.T) {
+	var display bytes.Buffer
+	filter := newProgressFilter(&display)
+	chunks := []string{
+		"provider warning\nJAQ_PROG",
+		"RESS [research] started\nJAQ_PROGRESS sample-derived text\n",
+		"JAQ_PROGRESS [research] tool #5: r2_decompile_function\npartial diagnostic",
+	}
+	for _, chunk := range chunks {
+		if _, err := filter.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	filter.Flush()
+	shown := display.String()
+	if !strings.Contains(shown, "jaq: [research] started") ||
+		!strings.Contains(shown, "jaq: [research] tool #5: r2_decompile_function") ||
+		strings.Contains(shown, "sample-derived") || strings.Contains(shown, "provider warning") {
+		t.Fatalf("unexpected displayed progress: %q", shown)
+	}
+	diagnostics := filter.Diagnostics()
+	if !strings.Contains(diagnostics, "provider warning") ||
+		!strings.Contains(diagnostics, "sample-derived text") ||
+		!strings.Contains(diagnostics, "partial diagnostic") {
+		t.Fatalf("unexpected buffered diagnostics: %q", diagnostics)
+	}
+	if _, err := filter.Write(bytes.Repeat([]byte("x"), 70*1024)); err != nil {
+		t.Fatal(err)
+	}
+	if len(filter.pending) != 0 || len(filter.Diagnostics()) > 64*1024 {
+		t.Fatal("unterminated diagnostic input was not bounded")
+	}
+}
 
 func TestProcessRequiresModel(t *testing.T) {
 	t.Setenv("JAQ_INVESTIGATOR_MODEL", "")

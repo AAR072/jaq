@@ -100,7 +100,7 @@ function toolResult(text, details = undefined, isError = false, terminate = fals
   };
 }
 
-function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, shouldFinalizeForCost) {
+function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, shouldFinalizeForCost, onProviderCall) {
   for (const method of ["stream", "streamSimple"]) {
     const original = runtime[method].bind(runtime);
     runtime[method] = (...args) => {
@@ -114,6 +114,7 @@ function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, 
         enterFinalization("the cost budget is nearly exhausted");
       }
       guard.beforeProviderCall();
+      onProviderCall();
       return original(...args);
     };
   }
@@ -135,9 +136,11 @@ async function main() {
   let statsSnapshot;
   let finalizing = false;
   let costFinalizationFraction = 0.70;
+  let sendProgress = () => {};
   const enterFinalization = (reason) => {
     if (finalizing || submission !== undefined) return;
     finalizing = true;
+    sendProgress("finalizing");
     if (session) {
       session.setThinkingLevel("off");
       session.setActiveToolsByName([terminalName]);
@@ -147,6 +150,20 @@ async function main() {
     }
   };
   const guard = new BudgetGuard(init.budgets, () => session?.getSessionStats());
+  sendProgress = (event, extra = {}) => {
+    const stats = session?.getSessionStats();
+    const frame = {
+      type: "progress",
+      phase: init.mode,
+      event,
+      provider_calls: guard.providerCalls,
+      tool_calls: guard.toolCalls,
+      cost_usd: typeof stats?.cost === "number" ? stats.cost : 0,
+    };
+    if (event === "tool_started") frame.tool = extra.tool;
+    if (event.startsWith("submission_")) frame.attempt = extra.attempt;
+    channel.send(frame);
+  };
   const runtime = budgetedModelRuntime(
     await ModelRuntime.create({
       credentials: new InMemoryCredentialStore(),
@@ -158,6 +175,11 @@ async function main() {
     init.budgets.max_model_calls,
     enterFinalization,
     () => guard.nearCost(costFinalizationFraction),
+    () => {
+      if (guard.providerCalls === 1 || guard.providerCalls % 5 === 0) {
+        sendProgress("model_progress");
+      }
+    },
   );
   const catalogModel = runtime.getModel(provider, modelID);
   if (!catalogModel) throw new Error(`Pi model catalog does not contain ${init.model}`);
@@ -227,6 +249,9 @@ async function main() {
       }
       try {
         guard.beforeToolCall();
+        if (definition.name !== "run_static_command" || guard.toolCalls % 5 === 0) {
+          sendProgress("tool_started", { tool: definition.name });
+        }
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
         if (
           Number.isInteger(init.budgets.max_tool_calls)
@@ -269,12 +294,14 @@ async function main() {
     executionMode: "sequential",
     async execute(_callID, params) {
       terminalAttempts += 1;
+      sendProgress("submission_attempt", { attempt: terminalAttempts });
       if (submission !== undefined) {
         return toolResult("This phase was already submitted.", undefined, true);
       }
       try {
         const canonical = await channel.request(validationOperation, { [validationField]: params });
         submission = canonical;
+        sendProgress("submission_accepted", { attempt: terminalAttempts });
         return toolResult(`${init.mode} submission validated and accepted.`, undefined, false, true);
       } catch (error) {
         if (init.mode === "research" && finalizing && session) {
@@ -286,6 +313,7 @@ async function main() {
             terminalName,
           ]);
         }
+        sendProgress("submission_rejected", { attempt: terminalAttempts });
         return toolResult(
           JSON.stringify({ status: "rejected", error_type: error?.name ?? "ClaimsError", message: sanitizeError(error) }),
           undefined,
@@ -309,6 +337,7 @@ async function main() {
     settingsManager,
     sessionManager,
   }));
+  sendProgress("phase_started");
   session.subscribe((event) => {
     if (
       event.type === "turn_end"
@@ -335,6 +364,7 @@ async function main() {
     }
     throw new Error(`Pi ${init.mode} phase ended without calling ${terminalName}`);
   }
+  sendProgress("phase_completed");
   channel.send({
     type: "complete",
     submission,
