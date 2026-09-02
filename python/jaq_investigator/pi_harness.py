@@ -872,9 +872,9 @@ class PiInvestigator:
                 "ended without calling finish_research" in message
                 or ("finish_research attempt" in message and "none passed validation" in message)
             )
-            if not checkpoint_failure:
-                raise
             recovered = self.recover_rejected_research_checkpoint()
+            if recovered is None and not checkpoint_failure:
+                raise
             research = (
                 PiHarnessResult(
                     submission=recovered,
