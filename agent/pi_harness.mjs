@@ -124,6 +124,7 @@ async function main() {
 
   let session;
   let submission;
+  let terminalAttempts = 0;
   let statsSnapshot;
   let finalizing = false;
   const enterFinalization = (reason) => {
@@ -209,6 +210,7 @@ async function main() {
     parameters: Type.Unsafe(definition.parameters),
     executionMode: "sequential",
     async execute(_callID, params) {
+      terminalAttempts += 1;
       if (submission !== undefined) {
         return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
       }
@@ -298,12 +300,19 @@ async function main() {
   for (let attempt = 0; submission === undefined && attempt < 3; attempt += 1) {
     const prompt = attempt === 0
       ? init.task
-      : `You ended without submitting. Use the existing evidence and call ${terminalName} now. Do not request exploratory tools unless required to correct an evidence ID.`;
+      : terminalAttempts > 0
+        ? `Your previous ${terminalName} submission was not accepted. Correct the validation error and call ${terminalName} again now.`
+        : `You ended without submitting. Use the existing evidence and call ${terminalName} now.`;
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
   }
   statsSnapshot = session.getSessionStats();
-  if (submission === undefined) throw new Error(`Pi ${init.mode} phase ended without calling ${terminalName}`);
+  if (submission === undefined) {
+    if (terminalAttempts > 0) {
+      throw new Error(`Pi ${init.mode} phase made ${terminalAttempts} ${terminalName} attempt(s), but none passed validation`);
+    }
+    throw new Error(`Pi ${init.mode} phase ended without calling ${terminalName}`);
+  }
   channel.send({
     type: "complete",
     submission,

@@ -381,9 +381,10 @@ class PiToolBroker:
                     }
                     requested = {str(item).strip().lower().replace(" ", "_") for item in record["requested_observations"]}
                     if not requested.intersection(recovery_outputs):
-                        raise PiHarnessError(
-                            "dynamic_analysis must request recovery of a deobfuscated/unpacked/decrypted artifact, configuration, code, image, or key material"
-                        )
+                        # Broad behavior-confirmation requests are optional
+                        # model output, not a reason to discard an otherwise
+                        # valid dossier. Leave them out of requests.json.
+                        continue
             else:
                 confidence = record.get("confidence")
                 if record.get("type") not in item_schema["properties"]["type"]["enum"] or not isinstance(record.get("role"), str):

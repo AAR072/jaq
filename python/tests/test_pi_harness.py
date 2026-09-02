@@ -83,8 +83,19 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             self.assertEqual(result.session["id"], "fake-session")
             broad = json.loads(json.dumps(result.claims))
             broad["action_requests"][0]["requested_observations"] = ["processes", "registry writes"]
-            with self.assertRaises(PiHarnessError):
-                PiToolBroker(store, FakeRuntime()).validate_claims(broad)
+            filtered = PiToolBroker(store, FakeRuntime()).validate_claims(broad)
+            self.assertEqual(filtered["action_requests"], [])
+            mixed = json.loads(json.dumps(result.claims))
+            rejected_request = json.loads(json.dumps(mixed["action_requests"][0]))
+            rejected_request["id"] = "request-broad-confirmation"
+            rejected_request["requested_observations"] = ["processes", "registry writes"]
+            mixed["action_requests"].insert(0, rejected_request)
+            mixed_result = PiToolBroker(store, FakeRuntime()).validate_claims(mixed)
+            self.assertEqual(mixed_result["claims"], result.claims["claims"])
+            self.assertEqual(mixed_result["assets"], result.claims["assets"])
+            self.assertEqual(
+                [item["id"] for item in mixed_result["action_requests"]], ["request-1"]
+            )
             omitted = json.loads(json.dumps(result.claims))
             omitted["assets"] = []
             recovered = PiToolBroker(store, FakeRuntime()).validate_claims(omitted)
