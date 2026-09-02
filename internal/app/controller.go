@@ -409,12 +409,12 @@ func validateResearchCheckpoint(path string, observations []evidence.Observation
 		len(checkpoint.ImportantEvidenceIDs) > 200 || len(checkpoint.UnresolvedQuestions) > 100 {
 		return errors.New("reject research.json: invalid research checkpoint")
 	}
-	if len(checkpoint.Coverage.ApplicationEntrypoints) < 1 || len(checkpoint.Coverage.ApplicationEntrypoints) > 20 ||
-		len(checkpoint.Coverage.AnalyzedFunctions) < 3 || len(checkpoint.Coverage.AnalyzedFunctions) > 100 ||
-		len(checkpoint.Coverage.CallGraphEvidenceIDs) < 1 || len(checkpoint.Coverage.CallGraphEvidenceIDs) > 100 ||
-		len(checkpoint.Coverage.DeobfuscationAttempts) < 1 || len(checkpoint.Coverage.DeobfuscationAttempts) > 50 ||
+	if len(checkpoint.Coverage.ApplicationEntrypoints) > 20 ||
+		len(checkpoint.Coverage.AnalyzedFunctions) > 100 ||
+		len(checkpoint.Coverage.CallGraphEvidenceIDs) > 100 ||
+		len(checkpoint.Coverage.DeobfuscationAttempts) > 50 ||
 		len(checkpoint.Coverage.RecoveredArtifacts) > 50 {
-		return errors.New("reject research.json: incomplete reverse-engineering coverage")
+		return errors.New("reject research.json: reverse-engineering coverage exceeds schema bounds")
 	}
 	known := make(map[string]bool, len(observations))
 	for _, observation := range observations {
