@@ -237,9 +237,11 @@ def finalize_research_only(evidence_path: str | Path, output_dir: str | Path) ->
         raise ValueError("research.json already exists; use --harvest-only")
     store = CanonicalEvidenceStore(evidence_path)
     investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
-    result = investigator.finalize_persisted_research()
-    investigator.write_research_checkpoint(research_path, result.submission)
-    return result.submission
+    checkpoint = investigator.recover_rejected_research_checkpoint()
+    if checkpoint is None:
+        checkpoint = investigator.finalize_persisted_research().submission
+    investigator.write_research_checkpoint(research_path, checkpoint)
+    return checkpoint
 
 
 def _render_operational(investigation: Mapping[str, Any]) -> str:

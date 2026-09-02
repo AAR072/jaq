@@ -265,6 +265,15 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
             forged_attempt["coverage"]["deobfuscation_attempts"][0]["evidence_ids"] = ["obs-native"]
             with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
                 PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(forged_attempt)
+            omitted_important = coverage_checkpoint("obs-native")
+            omitted_important["important_evidence_ids"] = ["obs-native"]
+            reconciled = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(omitted_important)
+            self.assertTrue(
+                {"obs-native", "obs-coverage-1", "obs-coverage-2", "obs-coverage-3", "obs-coverage-4"}
+                .issubset(reconciled["important_evidence_ids"])
+            )
             legacy = coverage_checkpoint("obs-native")
             legacy["coverage"]["analysis_evidence_ids"] = ["obs-coverage-0"]
             accepted_legacy = PiToolBroker(
@@ -428,6 +437,45 @@ print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error
                 with self.assertRaisesRegex(PiHarnessError, "Insufficient Balance"):
                     investigator.run("Inspect the fixture.")
             self.assertFalse((output / "model-session" / "research-finalize").exists())
+
+    def test_saved_rejected_checkpoint_is_revalidated_without_a_model_call(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            session_dir = output / "model-session" / "research-old"
+            session_dir.mkdir(parents=True)
+            native = Observation(
+                id="obs-native", type="fixture", raw_value="fixture", normalized_value="fixture",
+                artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            )
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [native, *coverage_observations()]),
+                encoding="utf-8",
+            )
+            saved = {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall", "name": "finish_research",
+                        "arguments": coverage_checkpoint("obs-native"),
+                    }],
+                },
+            }
+            (session_dir / "session.jsonl").write_text(json.dumps(saved) + "\n", encoding="utf-8")
+            fake = root / "unused.py"
+            fake.write_text("raise AssertionError('model must not run')\n", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+            }, clear=False):
+                investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
+                checkpoint = investigator.recover_rejected_research_checkpoint()
+            self.assertIsNotNone(checkpoint)
+            self.assertTrue(checkpoint["research_complete"])
+            self.assertEqual(len(checkpoint["coverage"]["analyzed_functions"]), 3)
 
     def test_important_evidence_bundle_is_ordered_bounded_and_inert(self):
         observations = [

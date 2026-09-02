@@ -56,7 +56,7 @@ not merely enumerate PE metadata, imports, strings, or runtime libraries. A
 research checkpoint will be rejected unless the evidence shows substantive
 application-code analysis. At minimum:
 
-1. Run/deepen Radare analysis (`r2_analyze` or equivalent persisted `r2 -A`)
+1. Run/deepen Radare analysis or equivalent persisted language-aware analysis
    and identify the real application entrypoint(s).
 2. Disassemble or decompile multiple application functions, including the main
    entry path. Radare tools or persisted language-aware output such as CIL/IL,

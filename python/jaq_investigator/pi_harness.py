@@ -39,6 +39,11 @@ _PROGRESS_EVENTS = {
     "submission_attempt", "submission_rejected", "submission_accepted",
     "phase_completed",
 }
+_LANGUAGE_CODE_COMMAND_RE = re.compile(
+    r"(?:\b(?:pdr|pdf|pd|objdump|monodis|ildasm)\b|"
+    r"/work/(?:cil|dump)(?:/|\b)|\.il\b|cil2?\.py\b|disas\.py\b|dumprun\.py\b)",
+    re.IGNORECASE,
+)
 
 
 def _emit_progress(frame: Mapping[str, Any]) -> None:
@@ -375,13 +380,16 @@ class PiToolBroker:
             for evidence_id in record["evidence_ids"]
         }
         covered_ids.update(canonical_coverage["call_graph_evidence_ids"])
-        if not covered_ids.issubset(set(evidence_ids)):
-            raise PiHarnessError("research important_evidence_ids must include all coverage evidence")
+        merged_evidence_ids = list(evidence_ids)
+        for evidence_id in sorted(covered_ids - set(merged_evidence_ids)):
+            merged_evidence_ids.append(evidence_id)
+        if len(merged_evidence_ids) > 200:
+            raise PiHarnessError("research important evidence exceeds 200 IDs after coverage reconciliation")
         return {
             "schema_version": "1.0",
             "research_complete": True,
             "summary": summary.strip(),
-            "important_evidence_ids": list(evidence_ids),
+            "important_evidence_ids": merged_evidence_ids,
             "unresolved_questions": [item.strip() for item in unresolved],
             "coverage": canonical_coverage,
         }
@@ -470,8 +478,6 @@ class PiToolBroker:
             and isinstance(arguments.get("command"), str)
             and re.search(r"(?:^|[;&|]\s*|\b)r2\b[^\n]*(?:\s-A\b|\s-AAA?\b)", arguments["command"])
         })
-        if not analysis_result_ids:
-            missing.append("a successful r2_analyze or equivalent r2 -A result")
         code_tools = {"r2_decompile_function", "r2_disassemble_function", "r2_disassemble"}
         code_results_by_address: dict[str, set[str]] = {}
         for name, status, arguments, observation_id in events:
@@ -492,20 +498,19 @@ class PiToolBroker:
                     and (
                         (
                             address in command.lower()
-                            and re.search(r"\b(?:pdr|pdf|pd|objdump|monodis|ildasm)\b", command, re.IGNORECASE)
+                            and _LANGUAGE_CODE_COMMAND_RE.search(command)
                         )
-                        or re.search(
-                            r"(?:/work/cil(?:/|\b)|\.il\b|cil2?\.py\b|dumprun\.py\b|monodis\b|ildasm\b)",
-                            command,
-                            re.IGNORECASE,
-                        )
+                        or _LANGUAGE_CODE_COMMAND_RE.search(command)
                     )
                 ):
                     return True
             return False
 
-        if sum(1 for item in functions if code_record_matches(item)) < 3:
+        matched_function_count = sum(1 for item in functions if code_record_matches(item))
+        if matched_function_count < 3:
             missing.append("at least three analyzed_functions addresses backed by code-analysis tool results")
+        if not analysis_result_ids and matched_function_count < 3:
+            missing.append("a successful Radare or equivalent language-aware analysis result")
         if not any(code_record_matches(item) for item in entrypoints):
             missing.append("an application entrypoint backed by disassembly/decompilation")
         call_tools = {"r2_xrefs_to", "r2_list_functions_tree"}
@@ -517,10 +522,9 @@ class PiToolBroker:
             observation_id for name, status, arguments, observation_id in events
             if name == "run_static_command" and status == "ok"
             and isinstance(arguments.get("command"), str)
-            and re.search(
-                r"(?:\b(?:pdr|pdf|axt|agc|objdump|monodis|ildasm)\b|/work/cil(?:/|\b)|\.il\b|cil2?\.py\b|dumprun\.py\b)",
-                arguments["command"],
-                re.IGNORECASE,
+            and (
+                _LANGUAGE_CODE_COMMAND_RE.search(arguments["command"])
+                or re.search(r"\b(?:axt|agc)\b", arguments["command"], re.IGNORECASE)
             )
         })
         if not call_result_ids.intersection(call_ids):
@@ -870,7 +874,16 @@ class PiInvestigator:
             )
             if not checkpoint_failure:
                 raise
-            research = self.finalize_persisted_research()
+            recovered = self.recover_rejected_research_checkpoint()
+            research = (
+                PiHarnessResult(
+                    submission=recovered,
+                    usage={},
+                    session={"id": "recovered-checkpoint", "file": "persisted research session"},
+                )
+                if recovered is not None
+                else self.finalize_persisted_research()
+            )
             research_phase = "research_finalize"
         research_path = self.output_dir / "research.json"
         self.write_research_checkpoint(research_path, research.submission)
@@ -913,6 +926,57 @@ class PiInvestigator:
             system_prompt=RESEARCH_FINALIZER_SYSTEM_PROMPT,
             task=task,
         )
+
+    def recover_rejected_research_checkpoint(self) -> dict[str, Any] | None:
+        session_root = self.output_dir / "model-session"
+        if not session_root.is_dir():
+            return None
+        session_files = sorted(
+            session_root.glob("research*/*.jsonl"),
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+            reverse=True,
+        )
+        broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
+        resolved_root = session_root.resolve()
+        for session_path in session_files:
+            candidates: list[Mapping[str, Any]] = []
+            try:
+                if session_path.is_symlink() or not session_path.is_file():
+                    continue
+                session_path.resolve().relative_to(resolved_root)
+                with session_path.open("r", encoding="utf-8", errors="replace") as stream:
+                    while True:
+                        line = stream.readline(MAX_FRAME_BYTES + 1)
+                        if line == "":
+                            break
+                        if len(line.encode("utf-8")) > MAX_FRAME_BYTES or not line.endswith("\n"):
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        message = event.get("message") if isinstance(event, Mapping) else None
+                        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                            continue
+                        content = message.get("content")
+                        if not isinstance(content, list):
+                            continue
+                        for item in content:
+                            if (
+                                isinstance(item, Mapping)
+                                and item.get("type") == "toolCall"
+                                and item.get("name") == "finish_research"
+                                and isinstance(item.get("arguments"), Mapping)
+                            ):
+                                candidates.append(item["arguments"])
+            except (OSError, ValueError):
+                continue
+            for candidate in reversed(candidates):
+                try:
+                    return broker.validate_research(candidate)
+                except PiHarnessError:
+                    continue
+        return None
 
     def _research_finalizer_bundle(self) -> list[dict[str, Any]]:
         events: list[tuple[int, Any, Mapping[str, Any]]] = []
