@@ -6,6 +6,7 @@ import {
   compactToolResult,
   HarnessLimitError,
   parseModelSelector,
+  relaxedTerminalSchema,
   sanitizeError,
 } from "../protocol.mjs";
 
@@ -65,4 +66,24 @@ test("model selectors and diagnostics remain bounded", () => {
   });
   assert.throws(() => parseModelSelector("deepseek"));
   assert.equal(sanitizeError(new Error("Bearer sk-secret-value-123456")), "Bearer [redacted]");
+});
+
+test("terminal transport schema defers formatting limits to local canonicalization", () => {
+  const strict = {
+    type: "object", additionalProperties: false, maxProperties: 2,
+    properties: {
+      name: { type: "string", maxLength: 300 },
+      records: {
+        type: "array", maxItems: 10,
+        items: { type: "object", additionalProperties: false, properties: {} },
+      },
+    },
+  };
+  const relaxed = relaxedTerminalSchema(strict);
+  assert.equal(relaxed.additionalProperties, true);
+  assert.equal("maxProperties" in relaxed, false);
+  assert.equal("maxLength" in relaxed.properties.name, false);
+  assert.equal("maxItems" in relaxed.properties.records, false);
+  assert.equal(relaxed.properties.records.items.additionalProperties, true);
+  assert.equal(strict.additionalProperties, false);
 });

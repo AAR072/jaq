@@ -333,12 +333,174 @@ class PiToolBroker:
             return result
         return [value]
 
+    @staticmethod
+    def _dedupe_ids(value: Any) -> list[Any] | Any:
+        if not isinstance(value, list):
+            return value
+        result: list[Any] = []
+        seen: set[str] = set()
+        for item in value:
+            if isinstance(item, str) and item in seen:
+                continue
+            result.append(item)
+            if isinstance(item, str):
+                seen.add(item)
+        return result
+
+    @staticmethod
+    def _bounded_text(value: Any, maximum: int) -> Any:
+        if not isinstance(value, str) or len(value) <= maximum:
+            return value
+        marker = "...[truncated]"
+        return value[: maximum - len(marker)] + marker
+
+    def _canonicalize_research(self, payload: Any) -> Any:
+        if not isinstance(payload, Mapping):
+            return payload
+        value = {
+            key: payload[key]
+            for key in (
+                "schema_version", "research_complete", "summary",
+                "important_evidence_ids", "unresolved_questions", "coverage",
+            )
+            if key in payload
+        }
+        value.setdefault("schema_version", "1.0")
+        value["summary"] = self._bounded_text(value.get("summary"), 16_000)
+        value["important_evidence_ids"] = self._dedupe_ids(value.get("important_evidence_ids"))
+        unresolved = value.get("unresolved_questions")
+        if isinstance(unresolved, list):
+            value["unresolved_questions"] = [
+                self._bounded_text(item, 1000) if isinstance(item, str) else item
+                for item in unresolved
+            ]
+        coverage = value.get("coverage")
+        if not isinstance(coverage, Mapping):
+            return value
+        normalized_coverage: dict[str, Any] = {}
+        record_specs = {
+            "application_entrypoints": (
+                ("name", "address", "evidence_ids"),
+                {"name": 300},
+            ),
+            "analyzed_functions": (
+                ("name", "address", "purpose", "evidence_ids"),
+                {"name": 300, "purpose": 2000},
+            ),
+            "deobfuscation_attempts": (
+                ("technique", "status", "outcome", "evidence_ids"),
+                {"technique": 500, "outcome": 4000},
+            ),
+            "recovered_artifacts": (
+                ("description", "path", "evidence_ids"),
+                {"description": 2000},
+            ),
+        }
+        for name, (fields, text_limits) in record_specs.items():
+            records = coverage.get(name)
+            if not isinstance(records, list):
+                normalized_coverage[name] = records
+                continue
+            normalized_records: list[Any] = []
+            for raw in records:
+                if not isinstance(raw, Mapping):
+                    normalized_records.append(raw)
+                    continue
+                record = {field: raw[field] for field in fields if field in raw}
+                for field, limit in text_limits.items():
+                    if field in record:
+                        record[field] = self._bounded_text(record[field], limit)
+                if "evidence_ids" in record:
+                    record["evidence_ids"] = self._dedupe_ids(record["evidence_ids"])
+                normalized_records.append(record)
+            normalized_coverage[name] = normalized_records
+        normalized_coverage["call_graph_evidence_ids"] = self._dedupe_ids(
+            coverage.get("call_graph_evidence_ids")
+        )
+        value["coverage"] = normalized_coverage
+        return value
+
+    def _canonicalize_investigation(self, payload: Any) -> Any:
+        if not isinstance(payload, Mapping):
+            return payload
+        value: dict[str, Any] = {
+            key: payload[key]
+            for key in ("schema_version", "claims", "assets", "action_requests")
+            if key in payload
+        }
+        value.setdefault("schema_version", "1.0")
+        claims = value.get("claims")
+        if isinstance(claims, list):
+            normalized_claims: list[Any] = []
+            claim_fields = {
+                "schema_version", "id", "classification", "explanation", "confidence",
+                "evidence_ids", "asset_role", "reachability", "unresolved",
+            }
+            for raw in claims:
+                if not isinstance(raw, Mapping):
+                    normalized_claims.append(raw)
+                    continue
+                claim = {key: raw[key] for key in claim_fields if key in raw}
+                claim.setdefault("schema_version", "1.0")
+                for field, limit in (("id", 200), ("classification", 200), ("explanation", 12_000), ("asset_role", 200)):
+                    if field != "id" and claim.get(field) is not None:
+                        claim[field] = self._bounded_text(claim.get(field), limit)
+                claim["evidence_ids"] = self._dedupe_ids(claim.get("evidence_ids"))
+                reachability = claim.get("reachability")
+                if isinstance(reachability, Mapping):
+                    reach = {
+                        key: reachability[key]
+                        for key in ("schema_version", "status", "entrypoints", "path_evidence_ids")
+                        if key in reachability
+                    }
+                    reach.setdefault("schema_version", "1.0")
+                    entries = reach.get("entrypoints")
+                    if isinstance(entries, list):
+                        reach["entrypoints"] = self._dedupe_ids(entries)
+                    reach["path_evidence_ids"] = self._dedupe_ids(reach.get("path_evidence_ids"))
+                    claim["reachability"] = reach
+                normalized_claims.append(claim)
+            value["claims"] = normalized_claims
+
+        def normalize_records(name: str, fields: set[str]) -> None:
+            records = value.get(name)
+            if not isinstance(records, list):
+                return
+            normalized: list[Any] = []
+            for raw in records:
+                if not isinstance(raw, Mapping):
+                    normalized.append(raw)
+                    continue
+                record = {key: raw[key] for key in fields if key in raw}
+                record.setdefault("schema_version", "1.0")
+                record["evidence_ids"] = self._dedupe_ids(record.get("evidence_ids"))
+                if name == "assets":
+                    record["role"] = self._bounded_text(record.get("role"), 200)
+                else:
+                    record["reason"] = self._bounded_text(record.get("reason"), 12_000)
+                    requested = record.get("requested_observations")
+                    if isinstance(requested, list):
+                        record["requested_observations"] = [
+                            self._bounded_text(item, 200) if isinstance(item, str) else item
+                            for item in requested
+                        ]
+                normalized.append(record)
+            value[name] = normalized
+
+        normalize_records("assets", set(INVESTIGATION_SCHEMA["properties"]["assets"]["items"]["required"]))
+        normalize_records(
+            "action_requests",
+            set(INVESTIGATION_SCHEMA["properties"]["action_requests"]["items"]["required"]),
+        )
+        return value
+
     def execute(self, name: str, arguments: Any) -> Any:
         if not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise PiHarnessError("Pi supplied an invalid tool request")
         return self.legacy._execute_tool(name, dict(arguments))
 
     def validate_research(self, payload: Any) -> dict[str, Any]:
+        payload = self._canonicalize_research(payload)
         expected = {
             "schema_version", "research_complete", "summary",
             "important_evidence_ids", "unresolved_questions", "coverage",
@@ -542,6 +704,7 @@ class PiToolBroker:
         }
 
     def validate_claims(self, payload: Any) -> dict[str, Any]:
+        payload = self._canonicalize_investigation(payload)
         if not isinstance(payload, Mapping) or set(payload) != {"schema_version", "claims", "assets", "action_requests"}:
             raise PiHarnessError("investigation must contain schema_version, claims, assets, and action_requests")
         canonical_claims = validate_claims(
@@ -621,9 +784,9 @@ class PiToolBroker:
                 raise PiHarnessError(f"{label} has missing or unsupported fields")
             record_id = record.get("id")
             evidence_ids = record.get("evidence_ids")
-            if not isinstance(record_id, str) or not record_id or record_id in seen:
+            if not isinstance(record_id, str) or not record_id or len(record_id) > 200 or record_id in seen:
                 raise PiHarnessError(f"invalid or duplicate {label} id")
-            if not isinstance(evidence_ids, list) or not evidence_ids or any(
+            if not isinstance(evidence_ids, list) or not 1 <= len(evidence_ids) <= 100 or any(
                 not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids
             ):
                 raise PiHarnessError(f"{label} cites missing evidence")
@@ -632,7 +795,13 @@ class PiToolBroker:
             if requests:
                 if record.get("kind") not in item_schema["properties"]["kind"]["enum"] or not isinstance(record.get("target"), Mapping):
                     raise PiHarnessError("invalid action request kind or target")
-                if not isinstance(record.get("reason"), str) or not record["reason"].strip() or not isinstance(record.get("requested_observations"), list):
+                if (
+                    not isinstance(record.get("reason"), str) or not record["reason"].strip()
+                    or not isinstance(record.get("requested_observations"), list)
+                    or len(record["requested_observations"]) > 100
+                    or any(not isinstance(item, str) or not item or len(item) > 200 for item in record["requested_observations"])
+                    or len(record["target"]) > 20
+                ):
                     raise PiHarnessError("invalid action request details")
                 if record.get("kind") == "dynamic_analysis":
                     recovery_outputs = {

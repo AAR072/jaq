@@ -196,6 +196,18 @@ export function parseModelSelector(selector) {
   return { provider, model };
 }
 
+export function relaxedTerminalSchema(value) {
+  if (Array.isArray(value)) return value.map(relaxedTerminalSchema);
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (["maxLength", "maxItems", "maxProperties"].includes(key)) continue;
+    output[key] = relaxedTerminalSchema(item);
+  }
+  if (output.type === "object") output.additionalProperties = true;
+  return output;
+}
+
 export function sanitizeError(error) {
   let message = error instanceof Error ? error.message : String(error);
   message = message.replace(/bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]");

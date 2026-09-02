@@ -59,6 +59,8 @@ When `research.json` is missing, the wrapper first starts a bounded, thinking-of
 
 Normal analysis uses the same fallback automatically when exploratory research ends without a valid `finish_research` call. Provider authentication, balance, timeout, and cancellation failures remain explicit and recoverable; they are not disguised as terminal-call failures.
 
+Terminal submissions pass through a local formatting canonicalizer before strict semantic verification. Unknown fields are removed, descriptive text is bounded, schema versions are filled, and evidence IDs are deduplicated and reconciled without another model call. Factual asset values and evidence content are never rewritten. The original unnormalized submission remains in the private `model-session` JSONL for audit.
+
 Review and decide requests explicitly:
 
 ```sh

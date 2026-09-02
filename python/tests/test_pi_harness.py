@@ -193,6 +193,18 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             self.assertEqual(
                 [item["id"] for item in mixed_result["action_requests"]], ["request-1"]
             )
+            formatting = json.loads(json.dumps(result.claims))
+            formatting["ignored"] = "remove me"
+            formatting["claims"][0]["ignored"] = "remove me"
+            formatting["claims"][0]["classification"] = "c" * 300
+            formatting["assets"][0]["ignored"] = "remove me"
+            formatting["assets"][0]["role"] = "r" * 300
+            original_asset_value = formatting["assets"][0]["value"]
+            repaired = PiToolBroker(store, FakeRuntime()).validate_claims(formatting)
+            self.assertEqual(len(repaired["claims"][0]["classification"]), 200)
+            self.assertNotIn("ignored", repaired["claims"][0])
+            self.assertEqual(len(repaired["assets"][0]["role"]), 200)
+            self.assertEqual(repaired["assets"][0]["value"], original_asset_value)
             omitted = json.loads(json.dumps(result.claims))
             omitted["assets"] = []
             recovered = PiToolBroker(store, FakeRuntime()).validate_claims(omitted)
@@ -280,6 +292,24 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 EvidenceStore(evidence_path), FakeRuntime()
             ).validate_research(legacy)
             self.assertNotIn("analysis_evidence_ids", accepted_legacy["coverage"])
+            formatting = coverage_checkpoint("obs-native")
+            formatting["ignored"] = "remove me"
+            formatting["important_evidence_ids"].append("obs-native")
+            formatting["coverage"]["ignored"] = "remove me"
+            formatting["coverage"]["analyzed_functions"][0]["ignored"] = "remove me"
+            formatting["coverage"]["analyzed_functions"][0]["name"] = "n" * 500
+            repaired = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(formatting)
+            self.assertEqual(len(repaired["coverage"]["analyzed_functions"][0]["name"]), 300)
+            self.assertNotIn("ignored", repaired)
+            self.assertNotIn("ignored", repaired["coverage"])
+            self.assertNotIn("ignored", repaired["coverage"]["analyzed_functions"][0])
+            self.assertEqual(repaired["important_evidence_ids"].count("obs-native"), 1)
+            missing_evidence = coverage_checkpoint("obs-native")
+            missing_evidence["important_evidence_ids"].append("obs-missing")
+            with self.assertRaisesRegex(PiHarnessError, "missing evidence IDs"):
+                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(missing_evidence)
 
     def test_research_defaults_to_cost_only_without_call_tool_or_token_caps(self):
         with TemporaryDirectory() as directory:

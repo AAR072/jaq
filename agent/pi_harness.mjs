@@ -16,6 +16,7 @@ import {
   HarnessLimitError,
   LineChannel,
   parseModelSelector,
+  relaxedTerminalSchema,
   sanitizeError,
 } from "./protocol.mjs";
 
@@ -288,7 +289,9 @@ async function main() {
     description: researchMode
       ? "Validate and save a concise research checkpoint. This terminates the research phase."
       : "Validate and submit final claims, operational assets, and pending action requests. This terminates the harvest phase.",
-    parameters: Type.Unsafe(init.output_schema),
+    // Let formatting-only defects reach the controller-owned canonicalizer.
+    // The original strict schema is still enforced after local repair.
+    parameters: Type.Unsafe(relaxedTerminalSchema(init.output_schema)),
     prepareArguments(args) {
       const value = structuredClone(args ?? {});
       value.schema_version ??= "1.0";
