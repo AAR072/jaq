@@ -347,6 +347,88 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             self.assertTrue((output / "model-session" / "harvest-2").is_dir())
             self.assertEqual(investigator.last_run.usage["total_tokens"], 12)
 
+    def test_missing_research_terminal_uses_persisted_evidence_finalizer(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            native = Observation(
+                id="obs-native", type="artifact.hash.sha256", raw_value="c" * 64,
+                normalized_value="c" * 64, artifact_location={"artifact": "sample"},
+                analyzer={"name": "fixture", "version": "1"}, provenance={"source": "fixture"},
+            )
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [native, *coverage_observations()]),
+                encoding="utf-8",
+            )
+            fake = root / "fake_fallback.py"
+            fake.write_text(
+                """
+import json, sys
+init = json.loads(sys.stdin.readline())
+if init["mode"] == "research":
+    print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error","message":"Pi research phase ended without calling finish_research"}}), flush=True)
+    raise SystemExit(2)
+if init["mode"] == "research_finalize":
+    assert init["thinking_level"] == "off"
+    assert init["tool_definitions"] == []
+    assert "research-ledger" in init["task"] and "obs-coverage-1" in init["task"]
+    value = json.loads(r'''__CHECKPOINT__''')
+    operation, field = "validate_research", "research"
+else:
+    assert init["mode"] == "harvest" and init["tool_definitions"] == []
+    value = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"Recovered research was finalized from persisted evidence.","confidence":1.0,"evidence_ids":["obs-native"],"asset_role":None,"reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[],"action_requests":[]}
+    operation, field = "validate_claims", "claims"
+print(json.dumps({"type":"request","id":1,"operation":operation,"payload":{field:value}}), flush=True)
+reply = json.loads(sys.stdin.readline())
+assert reply["ok"] is True
+print(json.dumps({"type":"complete","submission":reply["result"],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":init["mode"],"file":init["mode"]+".jsonl"}}), flush=True)
+""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
+                encoding="utf-8",
+            )
+            environment = {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
+                dossier = investigator.run("Inspect the fixture.")
+            self.assertEqual(dossier["claims"][0]["id"], "claim-1")
+            self.assertTrue((output / "research.json").is_file())
+            self.assertTrue((output / "model-session" / "research-finalize").is_dir())
+            self.assertEqual(investigator.last_run.usage["research_finalize_total_tokens"], 12)
+
+    def test_provider_failure_does_not_trigger_checkpoint_fallback(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            observation = Observation(
+                id="obs-native", type="fixture", raw_value="fixture", normalized_value="fixture",
+                artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            )
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            fake = root / "fake_provider_error.py"
+            fake.write_text(
+                """
+import json, sys
+json.loads(sys.stdin.readline())
+print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error","message":"provider error: 402 Insufficient Balance"}}), flush=True)
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+            }, clear=False):
+                investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
+                with self.assertRaisesRegex(PiHarnessError, "Insufficient Balance"):
+                    investigator.run("Inspect the fixture.")
+            self.assertFalse((output / "model-session" / "research-finalize").exists())
+
     def test_important_evidence_bundle_is_ordered_bounded_and_inert(self):
         observations = [
             Observation(

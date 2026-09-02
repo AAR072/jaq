@@ -8,8 +8,8 @@ if [ "$#" -ne 1 ] || [[ "$1" != /* ]]; then
 fi
 
 run_path="$1"
-if [ ! -f "$run_path/observations.jsonl" ] || [ ! -f "$run_path/research.json" ]; then
-    echo "run must contain observations.jsonl and research.json" >&2
+if [ ! -f "$run_path/observations.jsonl" ]; then
+    echo "run must contain observations.jsonl" >&2
     exit 66
 fi
 
@@ -31,6 +31,13 @@ if [ -z "${JAQ_INVESTIGATOR_MODEL:-}" ]; then
 fi
 
 export PYTHONPATH="$project_root/python${PYTHONPATH:+:$PYTHONPATH}"
+if [ ! -f "$run_path/research.json" ]; then
+    echo "jaq: recovering research checkpoint from persisted evidence" >&2
+    python -m jaq_investigator \
+        --evidence "$run_path/observations.jsonl" \
+        --output "$run_path" \
+        --finalize-research-only
+fi
 exec python -m jaq_investigator \
     --evidence "$run_path/observations.jsonl" \
     --output "$run_path" \

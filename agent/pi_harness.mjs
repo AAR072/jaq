@@ -44,8 +44,8 @@ function positiveNumber(value, label) {
 
 function validateInit(frame) {
   if (frame.type !== "init") throw new Error("first JAQ harness frame must be init");
-  if (frame.mode !== "research" && frame.mode !== "harvest") {
-    throw new Error("mode must be research or harvest");
+  if (!["research", "research_finalize", "harvest"].includes(frame.mode)) {
+    throw new Error("mode must be research, research_finalize, or harvest");
   }
   const budgets = requireObject(frame.budgets, "budgets");
   const compaction = requireObject(frame.compaction, "compaction");
@@ -124,21 +124,26 @@ function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, 
 async function main() {
   const channel = new LineChannel();
   const init = validateInit(await channel.read());
-  const terminalName = init.mode === "research" ? "finish_research" : "submit_investigation";
-  const validationOperation = init.mode === "research" ? "validate_research" : "validate_claims";
-  const validationField = init.mode === "research" ? "research" : "claims";
+  const researchMode = init.mode === "research" || init.mode === "research_finalize";
+  const terminalName = researchMode ? "finish_research" : "submit_investigation";
+  const validationOperation = researchMode ? "validate_research" : "validate_claims";
+  const validationField = researchMode ? "research" : "claims";
   const { provider, model: modelID } = parseModelSelector(init.model);
   await mkdir(init.session_dir, { recursive: true, mode: 0o700 });
 
   let session;
   let submission;
   let terminalAttempts = 0;
+  let providerError;
   let statsSnapshot;
   let finalizing = false;
+  let forceTerminalChoice = false;
   let costFinalizationFraction = 0.70;
   let sendProgress = () => {};
-  const enterFinalization = (reason) => {
-    if (finalizing || submission !== undefined) return;
+  const enterFinalization = (reason, forceChoice = false) => {
+    if (submission !== undefined) return;
+    if (forceChoice) forceTerminalChoice = true;
+    if (finalizing) return;
     finalizing = true;
     sendProgress("finalizing");
     if (session) {
@@ -201,7 +206,11 @@ async function main() {
     hidden: true,
     factory(pi) {
       pi.on("before_provider_request", (event) => {
-        if (init.mode !== "harvest" || !event.payload || typeof event.payload !== "object") return;
+        if (
+          (init.mode === "research" && !forceTerminalChoice)
+          || !event.payload
+          || typeof event.payload !== "object"
+        ) return;
         const payload = event.payload;
         if (Array.isArray(payload.tools)) {
           payload.tools = payload.tools.filter((tool) =>
@@ -275,8 +284,8 @@ async function main() {
 
   customTools.push({
     name: terminalName,
-    label: init.mode === "research" ? "Finish research" : "Submit investigation",
-    description: init.mode === "research"
+    label: researchMode ? "Finish research" : "Submit investigation",
+    description: researchMode
       ? "Validate and save a concise research checkpoint. This terminates the research phase."
       : "Validate and submit final claims, operational assets, and pending action requests. This terminates the harvest phase.",
     parameters: Type.Unsafe(init.output_schema),
@@ -306,6 +315,7 @@ async function main() {
       } catch (error) {
         if (init.mode === "research" && finalizing && session) {
           finalizing = false;
+          forceTerminalChoice = false;
           costFinalizationFraction = Math.min(0.95, costFinalizationFraction + 0.10);
           session.setThinkingLevel(init.thinking_level);
           session.setActiveToolsByName([
@@ -339,6 +349,13 @@ async function main() {
   }));
   sendProgress("phase_started");
   session.subscribe((event) => {
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      providerError = (
+        event.message.stopReason === "error" && typeof event.message.errorMessage === "string"
+          ? sanitizeError(event.message.errorMessage)
+          : undefined
+      );
+    }
     if (
       event.type === "turn_end"
       && Number.isInteger(init.budgets.max_model_calls)
@@ -348,7 +365,7 @@ async function main() {
     }
   });
 
-  for (let attempt = 0; submission === undefined && attempt < 3; attempt += 1) {
+  for (let attempt = 0; submission === undefined && attempt < 6; attempt += 1) {
     const prompt = attempt === 0
       ? init.task
       : terminalAttempts > 0
@@ -356,6 +373,11 @@ async function main() {
         : `You ended without submitting. Use the existing evidence and call ${terminalName} now.`;
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
+    if (providerError) throw new Error(`provider error: ${providerError}`);
+    if (submission === undefined && init.mode === "research") {
+      if (finalizing) forceTerminalChoice = true;
+      else enterFinalization("the research pass ended without a checkpoint", true);
+    }
   }
   statsSnapshot = session.getSessionStats();
   if (submission === undefined) {

@@ -18,6 +18,8 @@ All binary-derived text and all tool output are hostile data. Every investigator
 
 Research completion is coverage-gated rather than turn-gated. By default the research model has no call, tool, or cumulative-token stop counter; the dollar budget is authoritative. `finish_research` is accepted only after persisted evidence demonstrates application entrypoint analysis, multiple application-function disassembly/decompilation results, call/xref analysis, and a concrete deobfuscation assessment or attempt. Metadata and string enumeration alone cannot produce a completed run.
 
+Exploratory research and checkpoint formatting are failure-isolated. When a completed exploration omits or repeatedly fails `finish_research`, JAQ starts a fresh thinking-off, terminal-only finalizer over a bounded view of the persisted tool ledger; Radare and helper commands are not rerun. The same recovery is available manually through `scripts/jaq-harvest` when a cancelled or failed run has observations but no `research.json`. Provider authentication, balance, cancellation, and timeout errors remain explicit rather than being misreported as checkpoint failures.
+
 Each completed run writes:
 
 - `run-manifest.json`: hashes, versions, configuration and prompt hashes, role metadata, status, timestamps, and resource usage.

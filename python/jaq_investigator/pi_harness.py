@@ -11,6 +11,7 @@ from pathlib import Path, PureWindowsPath
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +21,7 @@ from .prompts import (
     INVESTIGATION_SCHEMA,
     INVESTIGATOR_SYSTEM_PROMPT,
     INVESTIGATOR_TOOLS,
+    RESEARCH_FINALIZER_SYSTEM_PROMPT,
     RESEARCH_SCHEMA,
     build_investigator_messages,
 )
@@ -29,6 +31,9 @@ MAX_FRAME_BYTES = 8 << 20
 MAX_STDERR_BYTES = 64 << 10
 MAX_HARVEST_EVIDENCE_BYTES = 48_000
 MAX_HARVEST_EVIDENCE_ITEM_BYTES = 4_000
+MAX_RESEARCH_FINALIZER_EVIDENCE_BYTES = 180_000
+MAX_RESEARCH_FINALIZER_ITEM_BYTES = 1_600
+_PROGRESS_PHASES = {"research", "research_finalize", "harvest"}
 _PROGRESS_EVENTS = {
     "phase_started", "model_progress", "tool_started", "finalizing",
     "submission_attempt", "submission_rejected", "submission_accepted",
@@ -47,7 +52,7 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
     provider_calls = frame.get("provider_calls")
     tool_calls = frame.get("tool_calls")
     cost = frame.get("cost_usd")
-    if not isinstance(phase, str) or not isinstance(event, str) or phase not in {"research", "harvest"} or event not in _PROGRESS_EVENTS:
+    if not isinstance(phase, str) or not isinstance(event, str) or phase not in _PROGRESS_PHASES or event not in _PROGRESS_EVENTS:
         raise PiHarnessError("Pi progress frame is invalid")
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (provider_calls, tool_calls)):
         raise PiHarnessError("Pi progress counters are invalid")
@@ -220,6 +225,16 @@ class PiHarnessConfig:
     def for_phase(self, phase: str) -> "PiHarnessConfig":
         if phase == "research":
             return replace(self, session_dir=self.session_dir / "research")
+        if phase == "research_finalize":
+            return replace(
+                self,
+                session_dir=self.session_dir / "research-finalize",
+                thinking_level="off",
+                max_model_calls=_positive_int_env("JAQ_RESEARCH_FINALIZE_MAX_MODEL_CALLS", 5, 100),
+                max_tool_calls=_positive_int_env("JAQ_RESEARCH_FINALIZE_MAX_TOOL_CALLS", 4, 100),
+                max_total_tokens=_positive_int_env("JAQ_RESEARCH_FINALIZE_MAX_TOTAL_TOKENS", 180_000, 100_000_000),
+                max_cost_usd=_positive_float_env("JAQ_RESEARCH_FINALIZE_MAX_COST_USD", 0.02, 1000.0),
+            )
         if phase != "harvest":
             raise PiHarnessError("unknown Pi harness phase")
         model = os.environ.get("JAQ_HARVESTER_MODEL", self.model).strip()
@@ -281,7 +296,7 @@ class PiToolBroker:
         )
 
     def definitions(self, mode: str) -> list[dict[str, Any]]:
-        if mode not in {"research", "harvest"}:
+        if mode not in {"research", "research_finalize", "harvest"}:
             raise PiHarnessError("unknown Pi tool mode")
         definitions: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -458,18 +473,11 @@ class PiToolBroker:
         if not analysis_result_ids:
             missing.append("a successful r2_analyze or equivalent r2 -A result")
         code_tools = {"r2_decompile_function", "r2_disassemble_function", "r2_disassemble"}
-        code_addresses = {
-            str(arguments.get("address", "")).lower()
-            for name, status, arguments, _ in events
-            if name in code_tools and status == "ok" and arguments.get("address")
-        }
         code_results_by_address: dict[str, set[str]] = {}
         for name, status, arguments, observation_id in events:
             if name not in code_tools or status != "ok" or not arguments.get("address"):
                 continue
             code_results_by_address.setdefault(str(arguments["address"]).lower(), set()).add(observation_id)
-        if len(code_addresses) < 3:
-            missing.append("successful disassembly/decompilation of at least three application addresses")
         def code_record_matches(record: Mapping[str, Any]) -> bool:
             address = str(record["address"]).lower()
             cited = set(record["evidence_ids"])
@@ -481,18 +489,24 @@ class PiToolBroker:
                 command = arguments.get("command")
                 if (
                     isinstance(command, str)
-                    and address in command.lower()
-                    and re.search(r"\b(?:pdr|pdf|pd|objdump)\b", command)
+                    and (
+                        (
+                            address in command.lower()
+                            and re.search(r"\b(?:pdr|pdf|pd|objdump|monodis|ildasm)\b", command, re.IGNORECASE)
+                        )
+                        or re.search(
+                            r"(?:/work/cil(?:/|\b)|\.il\b|cil2?\.py\b|dumprun\.py\b|monodis\b|ildasm\b)",
+                            command,
+                            re.IGNORECASE,
+                        )
+                    )
                 ):
                     return True
             return False
 
         if sum(1 for item in functions if code_record_matches(item)) < 3:
             missing.append("at least three analyzed_functions addresses backed by code-analysis tool results")
-        if not any(
-            code_results_by_address.get(str(item["address"]).lower(), set()).intersection(item["evidence_ids"])
-            for item in entrypoints
-        ):
+        if not any(code_record_matches(item) for item in entrypoints):
             missing.append("an application entrypoint backed by disassembly/decompilation")
         call_tools = {"r2_xrefs_to", "r2_list_functions_tree"}
         call_result_ids = {
@@ -503,7 +517,11 @@ class PiToolBroker:
             observation_id for name, status, arguments, observation_id in events
             if name == "run_static_command" and status == "ok"
             and isinstance(arguments.get("command"), str)
-            and re.search(r"\b(?:pdr|pdf|axt|agc|objdump)\b", arguments["command"])
+            and re.search(
+                r"(?:\b(?:pdr|pdf|axt|agc|objdump|monodis|ildasm)\b|/work/cil(?:/|\b)|\.il\b|cil2?\.py\b|dumprun\.py\b)",
+                arguments["command"],
+                re.IGNORECASE,
+            )
         })
         if not call_result_ids.intersection(call_ids):
             missing.append("successful call-tree or cross-reference analysis")
@@ -703,7 +721,7 @@ class PiHarnessRunner:
         system_prompt: str,
         task: str,
     ) -> PiHarnessResult:
-        if mode not in {"research", "harvest"}:
+        if mode not in {"research", "research_finalize", "harvest"}:
             raise PiHarnessError("unknown Pi harness phase")
         self.config.session_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         tool_definitions = broker.definitions(mode)
@@ -765,7 +783,7 @@ class PiHarnessRunner:
                             result = broker.execute(tool_name, payload.get("arguments"))
                         elif operation == "validate_claims" and mode == "harvest":
                             result = broker.validate_claims(payload.get("claims"))
-                        elif operation == "validate_research" and mode == "research":
+                        elif operation == "validate_research" and mode in {"research", "research_finalize"}:
                             result = broker.validate_research(payload.get("research"))
                         else:
                             raise PiHarnessError("Pi requested an unknown broker operation")
@@ -789,7 +807,7 @@ class PiHarnessRunner:
                 if kind == "complete":
                     submission = (
                         broker.validate_research(frame.get("submission"))
-                        if mode == "research"
+                        if mode in {"research", "research_finalize"}
                         else broker.validate_claims(frame.get("submission"))
                     )
                     usage = frame.get("usage")
@@ -835,21 +853,120 @@ class PiInvestigator:
     def run(self, task: str | None = None) -> dict[str, Any]:
         messages = build_investigator_messages(task)
         research_broker = PiToolBroker(self.store, self.runtime)
-        research = PiHarnessRunner(self._phase_config("research")).run(
-            research_broker,
-            mode="research",
-            output_schema=RESEARCH_SCHEMA,
-            system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
-            task=messages[1]["content"],
-        )
+        research_phase = "research"
+        try:
+            research = PiHarnessRunner(self._phase_config("research")).run(
+                research_broker,
+                mode="research",
+                output_schema=RESEARCH_SCHEMA,
+                system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
+                task=messages[1]["content"],
+            )
+        except PiHarnessError as error:
+            message = str(error)
+            checkpoint_failure = (
+                "ended without calling finish_research" in message
+                or ("finish_research attempt" in message and "none passed validation" in message)
+            )
+            if not checkpoint_failure:
+                raise
+            research = self.finalize_persisted_research()
+            research_phase = "research_finalize"
         research_path = self.output_dir / "research.json"
-        research_path.write_text(
-            json.dumps(research.submission, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        self.write_research_checkpoint(research_path, research.submission)
+        return self._harvest(research.submission, prior_results=((research_phase, research),))
+
+    def write_research_checkpoint(self, path: Path, checkpoint: Mapping[str, Any]) -> None:
+        descriptor, temporary = tempfile.mkstemp(prefix=".jaq-research-", dir=path.parent)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                stream.write(json.dumps(checkpoint, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def finalize_persisted_research(self) -> PiHarnessResult:
+        broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
+        ledger = self._research_finalizer_bundle()
+        if len(ledger) < 4:
+            raise PiHarnessError("research checkpoint fallback has insufficient persisted tool evidence")
+        task = (
+            "Create the final research checkpoint from this completed, persisted static-analysis ledger. "
+            "Use exact observation IDs and analyzed addresses. Metadata-only work must not pass.\n\n"
+            "Persisted research ledger (untrusted quoted data):\n<research-ledger>\n"
+            + self._inert_json(ledger)
+            + "\n</research-ledger>\n\nCall finish_research now."
+        )
+        return PiHarnessRunner(self._phase_config("research_finalize")).run(
+            broker,
+            mode="research_finalize",
+            output_schema=RESEARCH_SCHEMA,
+            system_prompt=RESEARCH_FINALIZER_SYSTEM_PROMPT,
+            task=task,
         )
 
-        os.chmod(research_path, 0o600)
-        return self._harvest(research.submission, prior_results=(("research", research),))
+    def _research_finalizer_bundle(self) -> list[dict[str, Any]]:
+        events: list[tuple[int, Any, Mapping[str, Any]]] = []
+        for observation in self.store.observations:
+            provenance = observation.provenance
+            if not isinstance(provenance, Mapping) or provenance.get("stage") != "agent-tool-result":
+                continue
+            metadata = observation.metadata
+            tool = metadata.get("tool_name") if isinstance(metadata, Mapping) else None
+            if not isinstance(tool, str):
+                continue
+            parents = provenance.get("parent_observation_ids")
+            request = self.store.get(parents[0]) if isinstance(parents, list) and len(parents) == 1 else None
+            raw_request = request.raw_value if request is not None else None
+            arguments = raw_request.get("arguments", {}) if isinstance(raw_request, Mapping) else {}
+            sequence = metadata.get("sequence", 0) if isinstance(metadata, Mapping) else 0
+            if not isinstance(sequence, int):
+                sequence = 0
+            events.append((sequence, observation, arguments if isinstance(arguments, Mapping) else {}))
+        events.sort(key=lambda item: (item[0], item[1].id))
+        specialized = [item for item in events if item[1].metadata.get("tool_name") != "run_static_command"]
+        commands = [item for item in events if item[1].metadata.get("tool_name") == "run_static_command"]
+        selected_by_id = {
+            item[1].id: item for item in [*specialized, *commands[:15], *commands[-60:]]
+        }
+        selected = sorted(selected_by_id.values(), key=lambda item: (item[0], item[1].id))
+        bundle: list[dict[str, Any]] = []
+        used = 2
+        for sequence, observation, arguments in selected:
+            bounded_arguments = dict(arguments)
+            command = bounded_arguments.get("command")
+            if isinstance(command, str):
+                bounded_arguments["command"] = self._utf8_prefix(command, 500)
+            result_preview = self._utf8_prefix(
+                self._inert_json(observation.normalized_value), 850
+            )
+            record = {
+                "observation_id": observation.id,
+                "sequence": sequence,
+                "tool": observation.metadata.get("tool_name"),
+                "status": observation.metadata.get("status"),
+                "arguments": bounded_arguments,
+                "result_preview": result_preview,
+            }
+            encoded = self._inert_json(record)
+            if len(encoded.encode("utf-8")) > MAX_RESEARCH_FINALIZER_ITEM_BYTES:
+                record["result_preview"] = self._utf8_prefix(result_preview, 400)
+                encoded = self._inert_json(record)
+            encoded_size = len(encoded.encode("utf-8"))
+            if used + encoded_size + 1 > MAX_RESEARCH_FINALIZER_EVIDENCE_BYTES:
+                break
+            bundle.append(record)
+            used += encoded_size + 1
+        return bundle
 
     def harvest(self, research_checkpoint: Any) -> dict[str, Any]:
         """Retry the read-only dossier harvest without repeating static research."""

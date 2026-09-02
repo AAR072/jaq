@@ -104,9 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", required=True, help="observations.jsonl path or evidence directory")
     parser.add_argument("--output", required=True, help="controller-selected output directory")
     parser.add_argument("--task", default=None, help="optional operational investigation request")
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--harvest-only", action="store_true",
         help="reuse research.json and observations.jsonl without rerunning static research",
+    )
+    modes.add_argument(
+        "--finalize-research-only", action="store_true",
+        help="create research.json from a failed run's persisted observations without rerunning analysis",
     )
     return parser
 
@@ -222,6 +227,21 @@ def run_pipeline(
     return {"claims": claims, "judgments": judgments, "score": score.to_dict()}
 
 
+def finalize_research_only(evidence_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
+    evidence_path = _resolve_evidence_path(str(evidence_path))
+    output_dir = Path(output_dir)
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        raise ValueError("output must be an existing real run directory")
+    research_path = output_dir / "research.json"
+    if research_path.exists():
+        raise ValueError("research.json already exists; use --harvest-only")
+    store = CanonicalEvidenceStore(evidence_path)
+    investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
+    result = investigator.finalize_persisted_research()
+    investigator.write_research_checkpoint(research_path, result.submission)
+    return result.submission
+
+
 def _render_operational(investigation: Mapping[str, Any]) -> str:
     safe = lambda value: html.escape(str(value), quote=True).replace("\n", " ")
     sensitive = {"api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "encryption_key", "database_connection"}
@@ -268,7 +288,10 @@ def main(argv: list[str] | None = None) -> int:
         # Reuse the canonical immutable loader so malformed observations and
         # schema-version drift fail before any provider call. The investigator
         # itself still sees only typed in-memory operations.
-        run_pipeline(args.evidence, args.output, task=args.task, harvest_only=args.harvest_only)
+        if args.finalize_research_only:
+            finalize_research_only(args.evidence, args.output)
+        else:
+            run_pipeline(args.evidence, args.output, task=args.task, harvest_only=args.harvest_only)
         return 0
     except (ModelError, PiHarnessError, ValueError, OSError, RuntimeError) as error:
         # Keep provider/sample data and credentials out of CLI logs. ModelError
@@ -277,4 +300,4 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-__all__ = ["build_parser", "main", "run_pipeline"]
+__all__ = ["build_parser", "finalize_research_only", "main", "run_pipeline"]

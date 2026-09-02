@@ -19,7 +19,7 @@ import (
 const DefaultTimeout = 30 * time.Minute
 const progressPrefix = "JAQ_PROGRESS "
 
-var progressLinePattern = regexp.MustCompile(`^\[(research|harvest)\] (started|model calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5}|tool #[0-9]+: [A-Za-z][A-Za-z0-9_]{0,99}|preparing checkpoint at cost=\$[0-9]+\.[0-9]{5}|submission attempt #[0-9]+|submission rejected; correcting|submission accepted|completed calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5})$`)
+var progressLinePattern = regexp.MustCompile(`^\[(research|research_finalize|harvest)\] (started|model calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5}|tool #[0-9]+: [A-Za-z][A-Za-z0-9_]{0,99}|preparing checkpoint at cost=\$[0-9]+\.[0-9]{5}|submission attempt #[0-9]+|submission rejected; correcting|submission accepted|completed calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5})$`)
 
 type progressFilter struct {
 	mu          sync.Mutex
