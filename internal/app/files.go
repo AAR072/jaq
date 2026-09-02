@@ -14,6 +14,7 @@ import (
 var persistedOutputs = []string{
 	"run-manifest.json",
 	"observations.jsonl",
+	"findings.jsonl",
 	"research.json",
 	"claims.json",
 	"assets.json",

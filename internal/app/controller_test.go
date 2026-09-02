@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,8 +67,8 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	if manifest.Status != "completed" || manifest.Versions["radare2"] != "6.2.0" || manifest.Versions["radare2_mcp"] != "1.8.6" {
 		t.Fatalf("unexpected manifest: %#v", manifest)
 	}
-	if role, ok := manifest.ModelRoles["harvester"]; !ok || role.Model != "investigator" || role.Provider != "mock" {
-		t.Fatalf("missing harvester model role: %#v", manifest.ModelRoles)
+	if _, ok := manifest.ModelRoles["harvester"]; ok {
+		t.Fatalf("normal runs must not claim a separate harvester model role: %#v", manifest.ModelRoles)
 	}
 	if !session.closed {
 		t.Fatal("sandbox session was not closed")
@@ -75,6 +76,37 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	observations, err := evidence.ReadObservationsFile(filepath.Join(output, "observations.jsonl"))
 	if err != nil || len(observations) < 10 {
 		t.Fatalf("expected deterministic native evidence: count=%d err=%v", len(observations), err)
+	}
+}
+
+func TestValidateFindingsLedgerRejectsMalformedOrMissingEvidence(t *testing.T) {
+	dir := t.TempDir()
+	observation := evidence.NewObservation(
+		"fixture", "fixture", "fixture",
+		evidence.ArtifactLocation{Artifact: "sample"},
+		evidence.AnalyzerIdentity{Name: "fixture", Version: "1"},
+		evidence.Provenance{Source: "fixture", Stage: "test", InputSHA256: strings.Repeat("a", 64)},
+	)
+	path := filepath.Join(dir, "findings.jsonl")
+	valid := fmt.Sprintf("{\"schema_version\":\"1.0\",\"id\":\"finding-0123456789abcdef01234567\",\"sequence\":1,\"kind\":\"claim\",\"title\":\"Fixture\",\"description\":\"Fixture finding.\",\"confidence\":1,\"record\":{\"evidence_ids\":[%q]}}\n", observation.ID)
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFindingsLedger(path, []evidence.Observation{observation}); err != nil {
+		t.Fatalf("valid findings ledger rejected: %v", err)
+	}
+	missing := strings.ReplaceAll(valid, observation.ID, "obs-missing")
+	if err := os.WriteFile(path, []byte(missing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFindingsLedger(path, []evidence.Observation{observation}); err == nil {
+		t.Fatal("missing evidence reference was accepted")
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(valid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFindingsLedger(path, []evidence.Observation{observation}); err == nil {
+		t.Fatal("unterminated JSONL record was accepted")
 	}
 }
 
@@ -232,6 +264,10 @@ func writeMockDossier(_ context.Context, output string) error {
 		},
 	}
 	if err := writeJSONAtomic(filepath.Join(output, "research.json"), checkpoint); err != nil {
+		return err
+	}
+	finding := fmt.Sprintf("{\"schema_version\":\"1.0\",\"id\":\"finding-0123456789abcdef01234567\",\"sequence\":1,\"kind\":\"claim\",\"title\":\"Fixture\",\"description\":\"Fixture finding.\",\"confidence\":1,\"record\":{\"evidence_ids\":[%q]}}\n", evidenceID)
+	if err := os.WriteFile(filepath.Join(output, "findings.jsonl"), []byte(finding), 0o600); err != nil {
 		return err
 	}
 	claim := evidence.NewClaim("claim-1", "capability", "The fixture contains deterministic static evidence.", 0.8, []string{observations[0].ID})

@@ -1,11 +1,15 @@
 package app
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,7 +49,6 @@ type SandboxSession interface {
 type Config struct {
 	SandboxImage      string
 	InvestigatorModel string
-	HarvesterModel    string
 	JudgeModel        string
 	PromptHashes      map[string]string
 	PythonVersion     string
@@ -76,8 +79,17 @@ func NewController(projectRoot string) (*Controller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hash Pi broker: %w", err)
 	}
+	findingsHash, err := hashFile(filepath.Join(projectRoot, "python", "jaq_investigator", "findings.py"))
+	if err != nil {
+		return nil, fmt.Errorf("hash findings ledger implementation: %w", err)
+	}
+	researchBudgetHash, err := hashFile(filepath.Join(projectRoot, "agent", "research_budget.mjs"))
+	if err != nil {
+		return nil, fmt.Errorf("hash research budget implementation: %w", err)
+	}
 	promptHash, err := contentHash(map[string]string{
 		"prompts": basePromptHash, "pi_harness": piHarnessHash, "pi_broker": piBrokerHash,
+		"findings": findingsHash, "research_budget": researchBudgetHash,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("hash investigator harness configuration: %w", err)
@@ -88,10 +100,6 @@ func NewController(projectRoot string) (*Controller, error) {
 		return nil, err
 	}
 	sandbox := sandboxruntime.NewDocker()
-	harvesterModel := os.Getenv("JAQ_HARVESTER_MODEL")
-	if harvesterModel == "" {
-		harvesterModel = os.Getenv("JAQ_INVESTIGATOR_MODEL")
-	}
 	return &Controller{
 		Investigator:        process,
 		AnalyzePE:           peinfo.AnalyzeFile,
@@ -103,11 +111,9 @@ func NewController(projectRoot string) (*Controller, error) {
 		Config: Config{
 			SandboxImage:      sandbox.Image,
 			InvestigatorModel: os.Getenv("JAQ_INVESTIGATOR_MODEL"),
-			HarvesterModel:    harvesterModel,
 			JudgeModel:        os.Getenv("JAQ_JUDGE_MODEL"),
 			PromptHashes: map[string]string{
 				"investigator": promptHash,
-				"harvester":    promptHash,
 				"judge":        promptHash,
 			},
 			PythonVersion:  runtimeVersions.Python,
@@ -142,14 +148,6 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	if c.Investigator == nil || c.ResolveSandboxImage == nil || c.StartSandbox == nil {
 		return errors.New("static sandbox stages are not configured")
 	}
-	harvesterModel := c.Config.HarvesterModel
-	if strings.TrimSpace(harvesterModel) == "" {
-		harvesterModel = c.Config.InvestigatorModel
-	}
-	harvesterPromptHash := c.Config.PromptHashes["harvester"]
-	if harvesterPromptHash == "" {
-		harvesterPromptHash = c.Config.PromptHashes["investigator"]
-	}
 	sandboxImageID, err := c.ResolveSandboxImage(ctx)
 	if err != nil {
 		return err
@@ -181,7 +179,7 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"schema_version":     evidence.SchemaVersion,
 		"native_config_hash": nativeConfigHash, "sandbox_config_hash": sandboxConfigHash,
 		"investigator_model": c.Config.InvestigatorModel,
-		"harvester_model":    harvesterModel, "judge_model": c.Config.JudgeModel,
+		"judge_model":        c.Config.JudgeModel,
 	})
 	if err != nil {
 		return fmt.Errorf("hash pipeline configuration: %w", err)
@@ -211,7 +209,6 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		manifest.PromptHashes[role] = hash
 	}
 	manifest.ModelRoles["investigator"] = modelRole(c.Config.InvestigatorModel, c.Config.PromptHashes["investigator"])
-	manifest.ModelRoles["harvester"] = modelRole(harvesterModel, harvesterPromptHash)
 	if c.Config.JudgeModel != "" {
 		manifest.ModelRoles["judge"] = modelRole(c.Config.JudgeModel, c.Config.PromptHashes["judge"])
 	}
@@ -316,6 +313,9 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 }
 
 func validateInvestigatorOutputs(outputDir string, observations []evidence.Observation, judgeRequired bool) error {
+	if err := validateFindingsLedger(filepath.Join(outputDir, "findings.jsonl"), observations); err != nil {
+		return err
+	}
 	if err := validateResearchCheckpoint(filepath.Join(outputDir, "research.json"), observations); err != nil {
 		return err
 	}
@@ -348,6 +348,90 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
 		return errors.New("reject investigator report: report.md must be a nonempty bounded regular file")
+	}
+	return nil
+}
+
+type persistedFinding struct {
+	SchemaVersion string          `json:"schema_version"`
+	ID            string          `json:"id"`
+	Sequence      int             `json:"sequence"`
+	Kind          string          `json:"kind"`
+	Title         string          `json:"title"`
+	Description   string          `json:"description"`
+	Confidence    *float64        `json:"confidence"`
+	Record        json.RawMessage `json:"record"`
+}
+
+func validateFindingsLedger(path string, observations []evidence.Observation) error {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 64<<20 {
+		return errors.New("reject findings.jsonl: must be a bounded regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reject findings.jsonl: %w", err)
+	}
+	defer file.Close()
+	if info.Size() > 0 {
+		if _, err := file.Seek(-1, io.SeekEnd); err != nil {
+			return fmt.Errorf("reject findings.jsonl: inspect final byte: %w", err)
+		}
+		last := []byte{0}
+		if _, err := io.ReadFull(file, last); err != nil || last[0] != '\n' {
+			return errors.New("reject findings.jsonl: final record is unterminated")
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("reject findings.jsonl: rewind: %w", err)
+		}
+	}
+	knownEvidence := make(map[string]bool, len(observations))
+	for _, observation := range observations {
+		knownEvidence[observation.ID] = true
+	}
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	sequence := 0
+	for scanner.Scan() {
+		sequence++
+		if sequence > 1000 {
+			return errors.New("reject findings.jsonl: too many records")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(scanner.Bytes()))
+		decoder.DisallowUnknownFields()
+		var finding persistedFinding
+		if err := decoder.Decode(&finding); err != nil {
+			return fmt.Errorf("reject findings.jsonl: invalid line %d", sequence)
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return fmt.Errorf("reject findings.jsonl: trailing JSON at line %d", sequence)
+		}
+		findingDigest := strings.TrimPrefix(finding.ID, "finding-")
+		_, digestErr := hex.DecodeString(findingDigest)
+		if finding.SchemaVersion != evidence.SchemaVersion || len(findingDigest) != 24 || digestErr != nil ||
+			seen[finding.ID] || finding.Sequence != sequence ||
+			(finding.Kind != "claim" && finding.Kind != "asset" && finding.Kind != "action_request") ||
+			strings.TrimSpace(finding.Title) == "" || len(finding.Title) > 200 ||
+			strings.TrimSpace(finding.Description) == "" || len(finding.Description) > 12000 ||
+			finding.Confidence == nil || *finding.Confidence < 0 || *finding.Confidence > 1 {
+			return fmt.Errorf("reject findings.jsonl: invalid envelope at line %d", sequence)
+		}
+		seen[finding.ID] = true
+		var record struct {
+			EvidenceIDs []string `json:"evidence_ids"`
+		}
+		if err := json.Unmarshal(finding.Record, &record); err != nil || len(record.EvidenceIDs) == 0 {
+			return fmt.Errorf("reject findings.jsonl: invalid record at line %d", sequence)
+		}
+		for _, id := range record.EvidenceIDs {
+			if !knownEvidence[id] {
+				return fmt.Errorf("reject findings.jsonl: missing evidence reference at line %d", sequence)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reject findings.jsonl: invalid or oversized line")
 	}
 	return nil
 }
@@ -545,7 +629,7 @@ func fileSize(path string) int64 {
 
 func outputSize(directory string) int64 {
 	var total int64
-	for _, name := range []string{"research.json", "claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
+	for _, name := range []string{"findings.jsonl", "research.json", "claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
 		total += fileSize(filepath.Join(directory, name))
 	}
 	return total

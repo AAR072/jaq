@@ -19,6 +19,7 @@ import {
   relaxedTerminalSchema,
   sanitizeError,
 } from "./protocol.mjs";
+import { budgetedModelRuntime, budgetReason } from "./research_budget.mjs";
 
 function requireObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -83,6 +84,7 @@ function validateInit(frame) {
       max_total_tokens: optionalPositiveInteger(budgets.max_total_tokens, "max_total_tokens"),
       max_cost_usd: positiveNumber(budgets.max_cost_usd, "max_cost_usd"),
       max_output_tokens: positiveInteger(budgets.max_output_tokens, "max_output_tokens"),
+      summary_max_output_tokens: positiveInteger(budgets.summary_max_output_tokens, "summary_max_output_tokens"),
       tool_preview_chars: positiveInteger(budgets.tool_preview_chars, "tool_preview_chars"),
     },
     compaction: {
@@ -101,34 +103,11 @@ function toolResult(text, details = undefined, isError = false, terminate = fals
   };
 }
 
-function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, shouldFinalizeForCost, onProviderCall) {
-  for (const method of ["stream", "streamSimple"]) {
-    const original = runtime[method].bind(runtime);
-    runtime[method] = (...args) => {
-      // A single Pi prompt can perform many provider/tool turns before it emits
-      // session turn_end. Reserve two provider calls for a forced terminal
-      // submission here, at the actual provider-call boundary.
-      if (Number.isInteger(maxModelCalls) && guard.providerCalls >= Math.max(1, maxModelCalls - 2)) {
-        enterFinalization("the model-call budget is nearly exhausted");
-      }
-      if (shouldFinalizeForCost()) {
-        enterFinalization("the cost budget is nearly exhausted");
-      }
-      guard.beforeProviderCall();
-      onProviderCall();
-      return original(...args);
-    };
-  }
-  return runtime;
-}
-
 async function main() {
   const channel = new LineChannel();
   const init = validateInit(await channel.read());
   const researchMode = init.mode === "research";
-  const terminalName = researchMode ? "finish_research" : "submit_investigation";
-  const validationOperation = researchMode ? "validate_research" : "validate_claims";
-  const validationField = researchMode ? "research" : "claims";
+  const terminalName = "submit_investigation";
   const { provider, model: modelID } = parseModelSelector(init.model);
   await mkdir(init.session_dir, { recursive: true, mode: 0o700 });
 
@@ -138,21 +117,22 @@ async function main() {
   let providerError;
   let statsSnapshot;
   let finalizing = false;
-  let forceTerminalChoice = false;
-  let costFinalizationFraction = 0.70;
   let sendProgress = () => {};
-  const enterFinalization = (reason, forceChoice = false) => {
+  const enterFinalization = (reason) => {
     if (submission !== undefined) return;
-    if (forceChoice) forceTerminalChoice = true;
     if (finalizing) return;
     finalizing = true;
     sendProgress("finalizing");
     if (session) {
       session.setThinkingLevel("off");
-      session.setActiveToolsByName([terminalName]);
-      void session.steer(
-        `Controller budget notice: ${reason}. Stop working and call ${terminalName} now using the strongest evidence already collected.`,
-      ).catch(() => {});
+      if (researchMode) {
+        session.setActiveToolsByName([]);
+      } else {
+        session.setActiveToolsByName([terminalName]);
+        void session.steer(
+          `Controller budget notice: ${reason}. Stop working and call ${terminalName} now using the strongest evidence already collected.`,
+        ).catch(() => {});
+      }
     }
   };
   const guard = new BudgetGuard(init.budgets, () => session?.getSessionStats());
@@ -178,9 +158,11 @@ async function main() {
       modelsPath: null,
     }),
     guard,
-    init.budgets.max_model_calls,
+    researchMode,
+    () => finalizing,
     enterFinalization,
-    () => guard.nearCost(costFinalizationFraction),
+    () => guard.nearCost(0.70),
+    init.budgets.summary_max_output_tokens,
     () => {
       if (guard.providerCalls === 1 || guard.providerCalls % 5 === 0) {
         sendProgress("model_progress");
@@ -208,8 +190,9 @@ async function main() {
     factory(pi) {
       pi.on("before_provider_request", (event) => {
         if (
-          (init.mode === "research" && !forceTerminalChoice)
-          || !event.payload
+          researchMode
+          ||
+          !event.payload
           || typeof event.payload !== "object"
         ) return;
         const payload = event.payload;
@@ -240,7 +223,9 @@ async function main() {
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPrompt: `${init.system_prompt}\n\nWhen finished, you MUST call ${terminalName} exactly once. Do not print final JSON as assistant text.`,
+    systemPrompt: researchMode
+      ? `${init.system_prompt}\n\nWhen research is complete, end with a concise assistant summary. Do not format or submit a checkpoint; the controller compiles it locally from persisted evidence.`
+      : `${init.system_prompt}\n\nWhen finished, you MUST call ${terminalName} exactly once. Do not print final JSON as assistant text.`,
   });
   await loader.reload();
 
@@ -255,7 +240,13 @@ async function main() {
         return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
       }
       if (finalizing) {
-        return toolResult(`Evidence collection is closed. Call ${terminalName} now.`, undefined, true);
+        return toolResult(
+          researchMode
+            ? "Investigation tools are closed. Return the concise final research summary now."
+            : `Evidence collection is closed. Call ${terminalName} now.`,
+          undefined,
+          true,
+        );
       }
       try {
         guard.beforeToolCall();
@@ -265,15 +256,18 @@ async function main() {
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
         if (
           Number.isInteger(init.budgets.max_tool_calls)
-          && guard.toolCalls >= Math.max(1, Math.floor(init.budgets.max_tool_calls * 0.75))
+          && guard.toolCalls >= init.budgets.max_tool_calls
         ) {
-          enterFinalization("the tool-call budget is nearly exhausted");
+          enterFinalization("the tool-call investigation budget is exhausted");
         }
         return toolResult(
           compactToolResult(definition.name, result, init.budgets.tool_preview_chars),
           { tool: definition.name },
         );
       } catch (error) {
+        if (researchMode && error instanceof HarnessLimitError) {
+          enterFinalization(budgetReason(error));
+        }
         return toolResult(
           JSON.stringify({ status: "rejected", error_type: error?.name ?? "ToolError", message: sanitizeError(error) }),
           { tool: definition.name },
@@ -283,12 +277,10 @@ async function main() {
     },
   }));
 
-  customTools.push({
+  if (!researchMode) customTools.push({
     name: terminalName,
-    label: researchMode ? "Finish research" : "Submit investigation",
-    description: researchMode
-      ? "Validate and save a concise research checkpoint. This terminates the research phase."
-      : "Validate and submit final claims, operational assets, and pending action requests. This terminates the harvest phase.",
+    label: "Submit investigation",
+    description: "Validate and submit final claims, operational assets, and pending action requests. This terminates the legacy harvest phase.",
     // Let formatting-only defects reach the controller-owned canonicalizer.
     // The original strict schema is still enforced after local repair.
     parameters: Type.Unsafe(relaxedTerminalSchema(init.output_schema)),
@@ -311,21 +303,11 @@ async function main() {
         return toolResult("This phase was already submitted.", undefined, true);
       }
       try {
-        const canonical = await channel.request(validationOperation, { [validationField]: params });
+        const canonical = await channel.request("validate_claims", { claims: params });
         submission = canonical;
         sendProgress("submission_accepted", { attempt: terminalAttempts });
         return toolResult(`${init.mode} submission validated and accepted.`, undefined, false, true);
       } catch (error) {
-        if (init.mode === "research" && finalizing && session) {
-          finalizing = false;
-          forceTerminalChoice = false;
-          costFinalizationFraction = Math.min(0.95, costFinalizationFraction + 0.10);
-          session.setThinkingLevel(init.thinking_level);
-          session.setActiveToolsByName([
-            ...init.tool_definitions.map((definition) => definition.name),
-            terminalName,
-          ]);
-        }
         sendProgress("submission_rejected", { attempt: terminalAttempts });
         return toolResult(
           JSON.stringify({ status: "rejected", error_type: error?.name ?? "ClaimsError", message: sanitizeError(error) }),
@@ -361,12 +343,36 @@ async function main() {
     }
     if (
       event.type === "turn_end"
+      && !researchMode
       && Number.isInteger(init.budgets.max_model_calls)
       && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 3)
     ) {
       enterFinalization("the model-call budget is nearly exhausted");
     }
   });
+
+  if (researchMode) {
+    await session.prompt(init.task, { expandPromptTemplates: false });
+    await session.waitForIdle();
+    if (providerError) throw new Error(`provider error: ${providerError}`);
+    statsSnapshot = session.getSessionStats();
+    sendProgress("phase_completed");
+    channel.send({
+      type: "complete",
+      submission: null,
+      usage: {
+        input_tokens: statsSnapshot.tokens.input,
+        output_tokens: statsSnapshot.tokens.output,
+        cache_read_tokens: statsSnapshot.tokens.cacheRead,
+        cache_write_tokens: statsSnapshot.tokens.cacheWrite,
+        total_tokens: statsSnapshot.tokens.total,
+        cost_usd: statsSnapshot.cost,
+        ...guard.snapshot(),
+      },
+      session: { id: session.sessionId, file: session.sessionFile },
+    });
+    return;
+  }
 
   for (let attempt = 0; submission === undefined && attempt < 6; attempt += 1) {
     const prompt = attempt === 0
@@ -377,10 +383,6 @@ async function main() {
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
     if (providerError) throw new Error(`provider error: ${providerError}`);
-    if (submission === undefined && init.mode === "research") {
-      if (finalizing) forceTerminalChoice = true;
-      else enterFinalization("the research pass ended without a checkpoint", true);
-    }
   }
   statsSnapshot = session.getSessionStats();
   if (submission === undefined) {

@@ -145,6 +145,8 @@ export class BudgetGuard {
     this.limits = limits;
     this.stats = stats;
     this.providerCalls = 0;
+    this.summaryProviderCalls = 0;
+    this.reportingAuxiliaryProviderCalls = 0;
     this.toolCalls = 0;
   }
 
@@ -159,6 +161,26 @@ export class BudgetGuard {
     if (current && current.cost >= this.limits.max_cost_usd) {
       throw new HarnessLimitError("COST_BUDGET", "investigator cost budget exhausted");
     }
+    this.providerCalls += 1;
+  }
+
+  beforeSummaryProviderCall() {
+    if (this.summaryProviderCalls >= 1) {
+      throw new HarnessLimitError("SUMMARY_CALL_BUDGET", "investigator final-summary call budget exhausted");
+    }
+    // Evidence-gathering owns the configured model/token/cost caps. One
+    // tool-free provider call remains available to report what it found.
+    this.summaryProviderCalls += 1;
+    this.providerCalls += 1;
+  }
+
+  beforeReportingAuxiliaryProviderCall() {
+    if (this.reportingAuxiliaryProviderCalls >= 2) {
+      throw new HarnessLimitError("SUMMARY_CALL_BUDGET", "investigator reporting-compaction call budget exhausted");
+    }
+    // Pi can compact a split turn immediately before the final summary. Keep
+    // that bounded reporting work outside the evidence-gathering cap too.
+    this.reportingAuxiliaryProviderCalls += 1;
     this.providerCalls += 1;
   }
 
@@ -180,7 +202,12 @@ export class BudgetGuard {
   }
 
   snapshot() {
-    return { provider_calls: this.providerCalls, tool_calls: this.toolCalls };
+    return {
+      provider_calls: this.providerCalls,
+      summary_provider_calls: this.summaryProviderCalls,
+      reporting_auxiliary_provider_calls: this.reportingAuxiliaryProviderCalls,
+      tool_calls: this.toolCalls,
+    };
   }
 }
 

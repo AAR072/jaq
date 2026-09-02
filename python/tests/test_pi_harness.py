@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from jaq_investigator.cli import finalize_research_only, run_pipeline
 from jaq_investigator.evidence import EvidenceStore
 from jaq_investigator.pi_harness import (
     PiHarnessConfig, PiHarnessError, PiHarnessRunner, PiInvestigator, PiToolBroker,
@@ -32,6 +33,9 @@ class FakeRuntime:
 
     def execute(self, name, arguments):
         raise AssertionError(f"unexpected runtime call {name} {arguments}")
+
+    def close(self):
+        return None
 
 
 def coverage_observations() -> list[Observation]:
@@ -98,6 +102,110 @@ def coverage_checkpoint(important_id: str) -> dict:
 
 
 class PiHarnessProtocolTest(unittest.TestCase):
+    def test_recovery_cli_compiles_research_without_removed_checkpoint_api(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in coverage_observations()),
+                encoding="utf-8",
+            )
+            fake = root / "unused.py"
+            fake.write_text("raise AssertionError('model must not run')\n", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+            }, clear=False):
+                checkpoint = finalize_research_only(evidence_path, output)
+            self.assertTrue(checkpoint["research_complete"])
+            self.assertTrue((output / "research.json").is_file())
+
+    def test_research_recovery_prioritizes_coverage_over_many_finding_evidence_ids(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            native = [
+                Observation(
+                    id=f"obs-finding-{index}", type="fixture", raw_value=f"value-{index}",
+                    normalized_value=f"value-{index}", artifact_location={"artifact": "sample"},
+                    analyzer={"name": "fixture", "version": "1"}, provenance={"source": "fixture"},
+                )
+                for index in range(210)
+            ]
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [*native, *coverage_observations()]),
+                encoding="utf-8",
+            )
+            fake = root / "unused.py"
+            fake.write_text("raise AssertionError('model must not run')\n", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+            }, clear=False):
+                investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
+                for index in range(210):
+                    investigator.finding_ledger.append("asset", {
+                        "schema_version": "1.0", "id": f"asset-{index}", "type": "other",
+                        "value": f"value-{index}", "normalized_value": f"value-{index}",
+                        "role": "fixture", "confidence": 1.0,
+                        "evidence_ids": [f"obs-finding-{index}"], "unresolved": False,
+                    })
+                checkpoint = investigator.finalize_persisted_research().submission
+            self.assertLessEqual(len(checkpoint["important_evidence_ids"]), 200)
+            self.assertTrue(set(checkpoint["coverage"]["call_graph_evidence_ids"]).issubset(
+                checkpoint["important_evidence_ids"]
+            ))
+
+    def test_complete_pipeline_writes_dossier_from_incremental_findings(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.abcdef.abcdefghijklmnopqrstuvwxyz123456"
+            observation = Observation(
+                id="obs-token", type="fixture.decoded_config",
+                raw_value={"discord_token": token}, normalized_value={"discord_token": token},
+                artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            )
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            fake = root / "fake_pipeline.py"
+            fake.write_text(
+                f'''\
+import json, sys
+init = json.loads(sys.stdin.readline())
+records = [
+  {{"kind":"behavior","title":"Discord command and control","description":"The decoded configuration contains a Discord command-and-control credential.","confidence":0.95,"evidence_ids":["obs-token"]}},
+  {{"kind":"asset","title":"Discord bot token","description":"Exact embedded Discord credential.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"bearer_token","value":{json.dumps(token)},"role":"Discord C2 authentication"}}
+]
+for index, finding in enumerate(records, 1):
+    print(json.dumps({{"type":"request","id":index,"operation":"execute_tool","payload":{{"name":"record_finding","arguments":finding}}}}), flush=True)
+    assert json.loads(sys.stdin.readline())["ok"] is True
+print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":20,"output_tokens":5,"total_tokens":25,"cost_usd":0.002,"provider_calls":2,"tool_calls":2}},"session":{{"id":"research","file":"research.jsonl"}}}}), flush=True)
+''',
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+                "JAQ_JUDGE_MODEL": "",
+            }, clear=False):
+                result = run_pipeline(evidence_path, output, tool_runtime=FakeRuntime())
+            self.assertEqual(result["claims"]["assets"][0]["value"], token)
+            self.assertIn(token, (output / "assets.json").read_text(encoding="utf-8"))
+            self.assertIn(token, (output / "report.md").read_text(encoding="utf-8"))
+            for name in (
+                "findings.jsonl", "research.json", "claims.json", "assets.json",
+                "requests.json", "score.json", "report.md",
+            ):
+                self.assertTrue((output / name).is_file(), name)
+            self.assertFalse((output / "model-session" / "harvest").exists())
+
     def test_progress_frames_render_only_bounded_controller_fields(self):
         output = io.StringIO()
         with patch.dict(os.environ, {"JAQ_PROGRESS_TRANSPORT": "1"}), redirect_stderr(output):
@@ -109,6 +217,16 @@ class PiHarnessProtocolTest(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "JAQ_PROGRESS [research] tool #7: r2_decompile_function\n",
+        )
+        summary_output = io.StringIO()
+        with patch.dict(os.environ, {"JAQ_PROGRESS_TRANSPORT": "1"}), redirect_stderr(summary_output):
+            _emit_progress({
+                "type": "progress", "phase": "research", "event": "finalizing",
+                "provider_calls": 70, "tool_calls": 72, "cost_usd": 0.1,
+            })
+        self.assertEqual(
+            summary_output.getvalue(),
+            "JAQ_PROGRESS [research] preparing final summary at cost=$0.10000\n",
         )
         with self.assertRaises(PiHarnessError):
             _emit_progress({
@@ -164,7 +282,8 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 model="deepseek/deepseek-v4-flash", node=sys.executable, script=fake,
                 session_dir=root / "session", thinking_level="off",
                 max_model_calls=4, max_tool_calls=4, max_total_tokens=1000,
-                max_cost_usd=0.1, max_output_tokens=1000, tool_preview_chars=1000,
+                max_cost_usd=0.1, max_output_tokens=1000, summary_max_output_tokens=256,
+                tool_preview_chars=1000,
                 max_context_tokens=1000, keep_recent_tokens=100,
             )
             store = EvidenceStore(evidence_path)
@@ -252,7 +371,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 model="deepseek/deepseek-v4-flash", node=sys.executable, script=fake,
                 session_dir=root / "session", thinking_level="off", max_model_calls=2,
                 max_tool_calls=2, max_total_tokens=1000, max_cost_usd=0.1,
-                max_output_tokens=1000, tool_preview_chars=1000,
+                max_output_tokens=1000, summary_max_output_tokens=256, tool_preview_chars=1000,
                 max_context_tokens=1000, keep_recent_tokens=100,
             )
             result = PiHarnessRunner(config).run(
@@ -332,7 +451,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
             self.assertIsNone(config.max_total_tokens)
             self.assertEqual(config.max_cost_usd, 0.10)
 
-    def test_pi_investigator_runs_fresh_research_and_harvest_sessions(self):
+    def test_pi_investigator_compiles_incremental_findings_without_harvest_session(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
@@ -353,23 +472,15 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 """
 import json, sys
 init = json.loads(sys.stdin.readline())
-if init["mode"] == "research":
-    assert init["session_dir"].endswith("/model-session/research")
-    assert "candidate-inventory" not in init["task"]
-    value = json.loads(r'''__CHECKPOINT__''')
-    operation, field = "validate_research", "research"
-else:
-    assert "/model-session/harvest" in init["session_dir"]
-    assert "candidate-inventory" not in init["task"]
-    assert "important-evidence" in init["task"] and "obs-native" in init["task"]
-    assert init["tool_definitions"] == []
-    value = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The sample has a persisted hash.","confidence":1.0,"evidence_ids":["obs-native"],"asset_role":"sample","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[],"action_requests":[]}
-    operation, field = "validate_claims", "claims"
-print(json.dumps({"type":"request","id":1,"operation":operation,"payload":{field:value}}), flush=True)
+assert init["mode"] == "research"
+assert init["session_dir"].endswith("/model-session/research")
+assert "record_finding" in {item["name"] for item in init["tool_definitions"]}
+finding = {"kind":"behavior","title":"fixture","description":"The sample has a persisted hash.","confidence":1.0,"evidence_ids":["obs-native"],"role":"sample"}
+print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"record_finding","arguments":finding}}), flush=True)
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
-print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":init["mode"],"file":init["mode"]+".jsonl"}}), flush=True)
-""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
+print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":1},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+""",
                 encoding="utf-8",
             )
             environment = {
@@ -381,16 +492,17 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             with patch.dict(os.environ, environment, clear=False):
                 investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
                 dossier = investigator.run("Inspect the fixture.")
-            self.assertEqual(dossier["claims"][0]["id"], "claim-1")
+            self.assertEqual(dossier["claims"][0]["classification"], "fixture")
             self.assertEqual(dossier["assets"], [])
+            self.assertEqual(len((output / "findings.jsonl").read_text(encoding="utf-8").splitlines()), 1)
             self.assertTrue((output / "research.json").is_file())
-            self.assertEqual(investigator.last_run.usage["total_tokens"], 24)
-            self.assertEqual(investigator.last_run.usage["cost_microusd"], 2000)
+            self.assertFalse((output / "model-session" / "harvest").exists())
+            self.assertEqual(investigator.last_run.usage["total_tokens"], 12)
+            self.assertEqual(investigator.last_run.usage["cost_microusd"], 1000)
             checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
             retried = investigator.harvest(checkpoint)
-            self.assertEqual(retried["claims"][0]["id"], "claim-1")
-            self.assertTrue((output / "model-session" / "harvest-2").is_dir())
-            self.assertEqual(investigator.last_run.usage["total_tokens"], 12)
+            self.assertEqual(retried["claims"][0]["classification"], "fixture")
+            self.assertFalse((output / "model-session" / "harvest-2").exists())
 
     def test_missing_research_terminal_compiles_checkpoint_locally(self):
         with TemporaryDirectory() as directory:
@@ -412,24 +524,9 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 """
 import json, sys
 init = json.loads(sys.stdin.readline())
-if init["mode"] == "research":
-    print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error","message":"Pi research phase ended without calling finish_research"}}), flush=True)
-    raise SystemExit(2)
-if init["mode"] == "research_finalize":
-    assert init["thinking_level"] == "off"
-    assert init["tool_definitions"] == []
-    assert "research-ledger" in init["task"] and "obs-coverage-1" in init["task"]
-    value = json.loads(r'''__CHECKPOINT__''')
-    operation, field = "validate_research", "research"
-else:
-    assert init["mode"] == "harvest" and init["tool_definitions"] == []
-    value = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"Recovered research was finalized from persisted evidence.","confidence":1.0,"evidence_ids":["obs-native"],"asset_role":None,"reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[],"action_requests":[]}
-    operation, field = "validate_claims", "claims"
-print(json.dumps({"type":"request","id":1,"operation":operation,"payload":{field:value}}), flush=True)
-reply = json.loads(sys.stdin.readline())
-assert reply["ok"] is True
-print(json.dumps({"type":"complete","submission":reply["result"],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":init["mode"],"file":init["mode"]+".jsonl"}}), flush=True)
-""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
+assert init["mode"] == "research"
+print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+""",
                 encoding="utf-8",
             )
             environment = {
@@ -439,7 +536,7 @@ print(json.dumps({"type":"complete","submission":reply["result"],"usage":{"input
             with patch.dict(os.environ, environment, clear=False):
                 investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
                 dossier = investigator.run("Inspect the fixture.")
-            self.assertEqual(dossier["claims"][0]["id"], "claim-1")
+            self.assertEqual(dossier["claims"], [])
             self.assertTrue((output / "research.json").is_file())
             self.assertFalse((output / "model-session" / "research-finalize").exists())
             self.assertNotIn("research_recovered_total_tokens", investigator.last_run.usage)
@@ -474,44 +571,45 @@ print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error
                     investigator.run("Inspect the fixture.")
             self.assertFalse((output / "model-session" / "research-finalize").exists())
 
-    def test_saved_rejected_checkpoint_is_revalidated_without_a_model_call(self):
+    def test_cost_cap_preserves_incremental_findings_and_completes_locally(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
-            session_dir = output / "model-session" / "research-old"
-            session_dir.mkdir(parents=True)
-            native = Observation(
-                id="obs-native", type="fixture", raw_value="fixture", normalized_value="fixture",
-                artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
-                provenance={"source": "fixture"},
+            output.mkdir()
+            observation = Observation(
+                id="obs-native", type="fixture", raw_value="embedded capability",
+                normalized_value="embedded capability", artifact_location={"artifact": "sample"},
+                analyzer={"name": "fixture", "version": "1"}, provenance={"source": "fixture"},
             )
             evidence_path = output / "observations.jsonl"
-            evidence_path.write_text(
-                "".join(json.dumps(item.to_dict()) + "\n" for item in [native, *coverage_observations()]),
+            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            fake = root / "fake_cost_cap.py"
+            fake.write_text(
+                """
+import json, sys
+init = json.loads(sys.stdin.readline())
+assert init["mode"] == "research"
+finding = {"kind":"behavior","title":"embedded capability","description":"The sample contains an embedded capability.","confidence":0.9,"evidence_ids":["obs-native"]}
+print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"record_finding","arguments":finding}}), flush=True)
+reply = json.loads(sys.stdin.readline())
+assert reply["ok"] is True
+print(json.dumps({"type":"error","error":{"code":"COST_BUDGET","type":"HarnessLimitError","message":"investigator cost budget exhausted"}}), flush=True)
+raise SystemExit(2)
+""",
                 encoding="utf-8",
             )
-            saved = {
-                "type": "message",
-                "message": {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "toolCall", "name": "finish_research",
-                        "arguments": coverage_checkpoint("obs-native"),
-                    }],
-                },
-            }
-            (session_dir / "session.jsonl").write_text(json.dumps(saved) + "\n", encoding="utf-8")
-            fake = root / "unused.py"
-            fake.write_text("raise AssertionError('model must not run')\n", encoding="utf-8")
             with patch.dict(os.environ, {
                 "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
                 "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
             }, clear=False):
                 investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
-                checkpoint = investigator.recover_rejected_research_checkpoint()
-            self.assertIsNotNone(checkpoint)
-            self.assertTrue(checkpoint["research_complete"])
-            self.assertEqual(len(checkpoint["coverage"]["analyzed_functions"]), 3)
+                dossier = investigator.run("Inspect the fixture.")
+            self.assertEqual(dossier["claims"][0]["classification"], "embedded capability")
+            self.assertTrue((output / "research.json").is_file())
+            checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
+            self.assertIn("cost budget exhausted", checkpoint["unresolved_questions"][0])
+            self.assertEqual(len((output / "findings.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+            self.assertFalse((output / "model-session" / "harvest").exists())
 
     def test_important_evidence_bundle_is_ordered_bounded_and_inert(self):
         observations = [

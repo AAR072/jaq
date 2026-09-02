@@ -180,6 +180,10 @@ def run_pipeline(
     if investigator is None:  # pragma: no cover - construction failures re-raise
         raise RuntimeError("investigator was not initialized")
 
+    findings_path = output_dir / "findings.jsonl"
+    if not findings_path.exists():
+        _write_private(findings_path, "")
+
     claims_only = {"schema_version": claims["schema_version"], "claims": claims["claims"]}
     judge = Judge(
         store,
@@ -237,9 +241,7 @@ def finalize_research_only(evidence_path: str | Path, output_dir: str | Path) ->
         raise ValueError("research.json already exists; use --harvest-only")
     store = CanonicalEvidenceStore(evidence_path)
     investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
-    checkpoint = investigator.recover_rejected_research_checkpoint()
-    if checkpoint is None:
-        checkpoint = investigator.finalize_persisted_research().submission
+    checkpoint = investigator.finalize_persisted_research().submission
     investigator.write_research_checkpoint(research_path, checkpoint)
     return checkpoint
 

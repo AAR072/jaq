@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import math
 import os
@@ -16,11 +17,13 @@ import threading
 from typing import Any, Mapping, Sequence
 
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
+from .findings import FindingError, FindingLedger
 from .prompts import (
     HARVESTER_SYSTEM_PROMPT,
     INVESTIGATION_SCHEMA,
     INVESTIGATOR_SYSTEM_PROMPT,
     INVESTIGATOR_TOOLS,
+    RECORD_FINDING_TOOL,
     RESEARCH_SCHEMA,
     build_investigator_messages,
 )
@@ -36,7 +39,7 @@ _PROGRESS_PHASES = {"research", "harvest"}
 _PROGRESS_EVENTS = {
     "phase_started", "model_progress", "tool_started", "finalizing",
     "submission_attempt", "submission_rejected", "submission_accepted",
-    "phase_completed",
+    "phase_completed", "local_checkpoint", "local_dossier",
 }
 _LANGUAGE_CODE_COMMAND_RE = re.compile(
     r"(?:\b(?:pdr|pdf|pd|objdump|monodis|ildasm)\b|"
@@ -48,7 +51,7 @@ _LANGUAGE_CODE_COMMAND_RE = re.compile(
 def _emit_progress(frame: Mapping[str, Any]) -> None:
     if not set(frame).issubset({
         "type", "phase", "event", "provider_calls", "tool_calls",
-        "cost_usd", "tool", "attempt",
+        "cost_usd", "tool", "attempt", "findings",
     }):
         raise PiHarnessError("Pi progress frame has unsupported fields")
     phase = frame.get("phase")
@@ -77,7 +80,11 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
             raise PiHarnessError("Pi progress tool name is invalid")
         message = f"{prefix} tool #{tool_calls}: {tool}"
     elif event == "finalizing":
-        message = f"{prefix} preparing checkpoint at cost=${float(cost):.5f}"
+        message = (
+            f"{prefix} preparing final summary at cost=${float(cost):.5f}"
+            if phase == "research"
+            else f"{prefix} preparing checkpoint at cost=${float(cost):.5f}"
+        )
     elif event == "submission_attempt":
         attempt = frame.get("attempt")
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -87,6 +94,13 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
         message = f"{prefix} submission rejected; correcting"
     elif event == "submission_accepted":
         message = f"{prefix} submission accepted"
+    elif event == "local_checkpoint":
+        message = f"{prefix} checkpoint compiled locally from persisted evidence"
+    elif event == "local_dossier":
+        findings = frame.get("findings")
+        if not isinstance(findings, int) or isinstance(findings, bool) or findings < 0:
+            raise PiHarnessError("Pi progress finding count is invalid")
+        message = f"{prefix} dossier compiled locally from {findings} recorded findings"
     else:
         message = f"{prefix} completed calls={provider_calls} tools={tool_calls} cost=${float(cost):.5f}"
     transport_prefix = "JAQ_PROGRESS " if os.environ.get("JAQ_PROGRESS_TRANSPORT") == "1" else "jaq: "
@@ -161,6 +175,7 @@ class PiHarnessConfig:
     max_total_tokens: int | None
     max_cost_usd: float
     max_output_tokens: int
+    summary_max_output_tokens: int
     tool_preview_chars: int
     max_context_tokens: int
     keep_recent_tokens: int
@@ -188,6 +203,7 @@ class PiHarnessConfig:
             max_total_tokens=_optional_positive_int_env("JAQ_MAX_TOTAL_TOKENS", 100_000_000),
             max_cost_usd=_positive_float_env("JAQ_MAX_COST_USD", 0.10, 1000.0),
             max_output_tokens=_positive_int_env("JAQ_MAX_OUTPUT_TOKENS", 32_768, 100_000),
+            summary_max_output_tokens=_positive_int_env("JAQ_SUMMARY_MAX_OUTPUT_TOKENS", 4_096, 32_768),
             tool_preview_chars=_positive_int_env("JAQ_TOOL_PREVIEW_CHARS", 2_400, 64_000),
             max_context_tokens=_positive_int_env("JAQ_MAX_CONTEXT_TOKENS", 64_000, 2_000_000),
             keep_recent_tokens=_positive_int_env("JAQ_KEEP_RECENT_TOKENS", 12_000, 500_000),
@@ -218,6 +234,7 @@ class PiHarnessConfig:
                 "max_total_tokens": self.max_total_tokens,
                 "max_cost_usd": self.max_cost_usd,
                 "max_output_tokens": self.max_output_tokens,
+                "summary_max_output_tokens": self.summary_max_output_tokens,
                 "tool_preview_chars": self.tool_preview_chars,
             },
             "compaction": {
@@ -279,9 +296,10 @@ class _BoundedStderr:
 class PiToolBroker:
     """Expose the existing validated evidence/runtime operations to Pi."""
 
-    def __init__(self, store: Any, runtime: Any) -> None:
+    def __init__(self, store: Any, runtime: Any, finding_ledger: FindingLedger | None = None) -> None:
         self.store = store
         self.runtime = runtime
+        self.finding_ledger = finding_ledger
         self.legacy = Investigator(
             store,
             model_client=object(),
@@ -294,7 +312,11 @@ class PiToolBroker:
             raise PiHarnessError("unknown Pi tool mode")
         definitions: list[dict[str, Any]] = []
         seen: set[str] = set()
-        source_tools = [*INVESTIGATOR_TOOLS, *self.runtime.model_tools()] if mode == "research" else []
+        source_tools: list[Mapping[str, Any]] = []
+        if mode == "research":
+            if self.finding_ledger is not None:
+                source_tools.append(RECORD_FINDING_TOOL)
+            source_tools.extend((*INVESTIGATOR_TOOLS, *self.runtime.model_tools()))
         for item in source_tools:
             function = item.get("function") if isinstance(item, Mapping) else None
             if not isinstance(function, Mapping):
@@ -486,7 +508,189 @@ class PiToolBroker:
     def execute(self, name: str, arguments: Any) -> Any:
         if not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise PiHarnessError("Pi supplied an invalid tool request")
+        if name == "record_finding":
+            return self._record_finding(arguments)
         return self.legacy._execute_tool(name, dict(arguments))
+
+    @staticmethod
+    def _semantic_id(prefix: str, value: Mapping[str, Any]) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return f"{prefix}-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:24]}"
+
+    def _record_finding(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if self.finding_ledger is None:
+            raise PiHarnessError("record_finding is unavailable without a findings ledger")
+        allowed = {
+            "kind", "title", "description", "confidence", "evidence_ids",
+            "asset_type", "value", "role",
+            "request_kind", "target", "requested_observations",
+            "reachability_status", "entrypoints", "path_evidence_ids",
+        }
+        if not set(arguments).issubset(allowed):
+            raise PiHarnessError("record_finding has unsupported fields")
+        kind = arguments.get("kind")
+        title = arguments.get("title")
+        description = arguments.get("description")
+        confidence = arguments.get("confidence")
+        raw_evidence_ids = arguments.get("evidence_ids")
+        if (
+            kind not in {"behavior", "asset", "action_request", "unresolved"}
+            or not isinstance(title, str) or not title.strip() or len(title) > 200
+            or not isinstance(description, str) or not description.strip() or len(description) > 12_000
+            or not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
+            or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1
+            or not isinstance(raw_evidence_ids, list)
+        ):
+            raise PiHarnessError("record_finding common fields are invalid")
+        evidence_ids = list(dict.fromkeys(raw_evidence_ids))
+        if not 1 <= len(evidence_ids) <= 100 or any(
+            not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids
+        ):
+            raise PiHarnessError("record_finding cites missing or invalid evidence")
+
+        candidate: dict[str, Any] = {
+            "schema_version": "1.0", "claims": [], "assets": [], "action_requests": [],
+        }
+        if kind in {"behavior", "unresolved"}:
+            reachability_status = arguments.get("reachability_status", "unknown")
+            entrypoints = self._dedupe_ids(arguments.get("entrypoints", []))
+            path_ids = self._dedupe_ids(arguments.get("path_evidence_ids", []))
+            if reachability_status not in {"reachable", "not_reachable", "unknown"}:
+                raise PiHarnessError("record_finding has invalid reachability")
+            if not isinstance(entrypoints, list) or not isinstance(path_ids, list):
+                raise PiHarnessError("record_finding reachability IDs must be arrays")
+            if any(
+                not isinstance(item, str) or self.store.get(item) is None
+                for item in [*entrypoints, *path_ids]
+            ):
+                raise PiHarnessError("record_finding reachability cites missing evidence")
+            seed = {
+                "kind": kind, "title": title.strip(), "description": description.strip(),
+                "confidence": float(confidence), "evidence_ids": evidence_ids,
+                "role": arguments.get("role") if isinstance(arguments.get("role"), str) else None,
+                "reachability_status": reachability_status,
+                "entrypoints": entrypoints,
+                "path_evidence_ids": path_ids,
+            }
+            candidate["claims"] = [{
+                "schema_version": "1.0",
+                "id": self._semantic_id("claim", seed),
+                "classification": title.strip(),
+                "explanation": description.strip(),
+                "confidence": float(confidence),
+                "evidence_ids": evidence_ids,
+                "asset_role": arguments.get("role") if isinstance(arguments.get("role"), str) else None,
+                "reachability": {
+                    "schema_version": "1.0", "status": reachability_status,
+                    "entrypoints": entrypoints, "path_evidence_ids": path_ids,
+                },
+                "unresolved": kind == "unresolved",
+            }]
+            canonical = self.validate_claims(candidate)
+            record_kind, record = "claim", canonical["claims"][0]
+        elif kind == "asset":
+            asset_type = arguments.get("asset_type")
+            role = arguments.get("role")
+            if "value" not in arguments or not isinstance(role, str) or not role.strip():
+                raise PiHarnessError("asset findings require value and role")
+            seed = {
+                "asset_type": asset_type, "value": arguments["value"],
+                "role": role.strip(), "evidence_ids": evidence_ids,
+            }
+            candidate["assets"] = [{
+                "schema_version": "1.0",
+                "id": self._semantic_id("asset", seed),
+                "type": asset_type,
+                "value": arguments["value"],
+                "normalized_value": arguments["value"],
+                "role": role.strip(),
+                "confidence": float(confidence),
+                "evidence_ids": evidence_ids,
+                "unresolved": False,
+            }]
+            canonical = self.validate_claims(candidate)
+            if not canonical["assets"]:
+                raise PiHarnessError("asset value is not present exactly in the cited evidence")
+            record_kind, record = "asset", canonical["assets"][0]
+        else:
+            request_kind = arguments.get("request_kind")
+            target = arguments.get("target")
+            requested = arguments.get("requested_observations")
+            if not isinstance(target, Mapping) or not isinstance(requested, list) or not requested:
+                raise PiHarnessError("action-request findings require target and requested_observations")
+            evidence_leaves: list[Any] = []
+            for evidence_id in evidence_ids:
+                observation = self.store.get(evidence_id)
+                evidence_leaves.extend(self._leaf_values(observation.raw_value))
+                evidence_leaves.extend(self._leaf_values(observation.normalized_value))
+            target_leaves = self._leaf_values(target)
+            if target_leaves and any(item not in evidence_leaves for item in target_leaves):
+                raise PiHarnessError("action-request target is not present exactly in the cited evidence")
+            if request_kind == "fetch_remote_payload" and (
+                not isinstance(target.get("url"), str) or not target["url"].strip()
+            ):
+                raise PiHarnessError("fetch_remote_payload requires an exact cited target.url")
+            seed = {
+                "request_kind": request_kind, "target": target,
+                "description": description.strip(), "evidence_ids": evidence_ids,
+            }
+            candidate["action_requests"] = [{
+                "schema_version": "1.0",
+                "id": self._semantic_id("request", seed),
+                "kind": request_kind,
+                "status": "pending_authorization",
+                "reason": description.strip(),
+                "evidence_ids": evidence_ids,
+                "target": dict(target),
+                "requested_observations": requested,
+            }]
+            canonical = self.validate_claims(candidate)
+            if not canonical["action_requests"]:
+                raise PiHarnessError("action request does not meet JAQ's recovery-request policy")
+            record_kind, record = "action_request", canonical["action_requests"][0]
+        existing = self.finding_ledger.compile()
+        if record_kind == "claim":
+            if len(existing["claims"]) >= 100 and not any(item["id"] == record["id"] for item in existing["claims"]):
+                raise PiHarnessError("claim finding limit reached; consolidate related behavior")
+        elif record_kind == "asset":
+            normalized_key = json.dumps(record["normalized_value"], ensure_ascii=False, sort_keys=True)
+            duplicate = next((
+                item for item in existing["assets"]
+                if item["type"] == record["type"]
+                and json.dumps(item["normalized_value"], ensure_ascii=False, sort_keys=True) == normalized_key
+            ), None)
+            if duplicate is None and len(existing["assets"]) >= 500:
+                raise PiHarnessError("asset finding limit reached")
+            if duplicate is not None and len(set([*duplicate["evidence_ids"], *record["evidence_ids"]])) > 100:
+                raise PiHarnessError("asset finding evidence limit reached")
+        else:
+            target_key = json.dumps(record["target"], ensure_ascii=False, sort_keys=True)
+            duplicate = next((
+                item for item in existing["action_requests"]
+                if item["kind"] == record["kind"]
+                and json.dumps(item["target"], ensure_ascii=False, sort_keys=True) == target_key
+            ), None)
+            if duplicate is None and len(existing["action_requests"]) >= 100:
+                raise PiHarnessError("action-request finding limit reached")
+            if duplicate is not None and (
+                len(set([*duplicate["evidence_ids"], *record["evidence_ids"]])) > 100
+                or len(set([*duplicate["requested_observations"], *record["requested_observations"]])) > 100
+            ):
+                raise PiHarnessError("action-request finding merge limit reached")
+        try:
+            envelope = self.finding_ledger.append(
+                record_kind, record, title=title.strip(), description=description.strip(),
+                confidence=float(confidence),
+            )
+        except FindingError as error:
+            raise PiHarnessError(str(error)) from error
+        return {
+            "status": "recorded",
+            "finding_id": envelope["id"],
+            "record_kind": envelope["kind"],
+            "record_id": envelope["record"]["id"],
+            "evidence_ids": envelope["record"]["evidence_ids"],
+        }
 
     def validate_research(self, payload: Any) -> dict[str, Any]:
         payload = self._canonicalize_research(payload)
@@ -973,11 +1177,14 @@ class PiHarnessRunner:
                         raise PiHarnessBudgetError(message)
                     raise PiHarnessError(message)
                 if kind == "complete":
-                    submission = (
-                        broker.validate_research(frame.get("submission"))
-                        if mode == "research"
-                        else broker.validate_claims(frame.get("submission"))
-                    )
+                    if mode == "research" and frame.get("submission") is None:
+                        submission = {}
+                    else:
+                        submission = (
+                            broker.validate_research(frame.get("submission"))
+                            if mode == "research"
+                            else broker.validate_claims(frame.get("submission"))
+                        )
                     usage = frame.get("usage")
                     session = frame.get("session")
                     if not isinstance(usage, dict) or not isinstance(session, dict):
@@ -1005,6 +1212,7 @@ class PiInvestigator:
         self.store = store
         self.runtime = runtime
         self.output_dir = output_dir
+        self.finding_ledger = FindingLedger(output_dir / "findings.jsonl")
         self.config = PiHarnessConfig.from_env(output_dir)
         self.last_run: InvestigatorRun | None = None
 
@@ -1020,7 +1228,7 @@ class PiInvestigator:
 
     def run(self, task: str | None = None) -> dict[str, Any]:
         messages = build_investigator_messages(task)
-        research_broker = PiToolBroker(self.store, self.runtime)
+        research_broker = PiToolBroker(self.store, self.runtime, self.finding_ledger)
         research_phase = "research"
         try:
             research = PiHarnessRunner(self._phase_config("research")).run(
@@ -1030,30 +1238,64 @@ class PiInvestigator:
                 system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
                 task=messages[1]["content"],
             )
-        except PiHarnessError as error:
-            message = str(error)
-            checkpoint_failure = (
-                "ended without calling finish_research" in message
-                or ("finish_research attempt" in message and "none passed validation" in message)
-            )
-            recovered = self.recover_rejected_research_checkpoint()
-            if recovered is not None:
+            if not research.submission:
                 research = PiHarnessResult(
-                    submission=recovered,
-                    usage={},
-                    session={"id": "recovered-checkpoint", "file": "persisted research session"},
+                    submission=self.finalize_persisted_research().submission,
+                    usage=research.usage,
+                    session=research.session,
                 )
-            else:
-                try:
-                    research = self.finalize_persisted_research()
-                except PiHarnessError:
-                    if not checkpoint_failure:
-                        raise error
-                    raise
+                _emit_progress({
+                    "type": "progress", "phase": "research", "event": "local_checkpoint",
+                    "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
+                })
+        except PiHarnessError as error:
+            try:
+                research = self.finalize_persisted_research(termination_reason=str(error))
+            except PiHarnessError:
+                raise error
             research_phase = "research_recovered"
+            _emit_progress({
+                "type": "progress", "phase": "research", "event": "local_checkpoint",
+                "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
+            })
         research_path = self.output_dir / "research.json"
         self.write_research_checkpoint(research_path, research.submission)
-        return self._harvest(research.submission, prior_results=((research_phase, research),))
+        return self._compile_recorded_findings(prior_results=((research_phase, research),))
+
+    def _compile_recorded_findings(
+        self,
+        *,
+        prior_results: Sequence[tuple[str, PiHarnessResult]] = (),
+    ) -> dict[str, Any]:
+        compiled = self.finding_ledger.compile()
+        canonical = PiToolBroker(self.store, EvidenceOnlyRuntime()).validate_claims(compiled)
+        usage: dict[str, int] = {}
+        total_cost = 0.0
+        for phase, result in prior_results:
+            for key, value in result.usage.items():
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    usage[key] = usage.get(key, 0) + value
+                    usage[f"{phase}_{key}"] = value
+            cost = result.usage.get("cost_usd")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+                phase_cost = int(round(float(cost) * 1_000_000))
+                usage[f"{phase}_cost_microusd"] = phase_cost
+                total_cost += float(cost)
+        usage["cost_microusd"] = int(round(total_cost * 1_000_000))
+        self.last_run = InvestigatorRun(
+            claims=canonical,
+            rounds=usage.get("provider_calls", 0),
+            tool_calls=usage.get("tool_calls", 0),
+            usage=usage,
+            model=self.config.model,
+            provider=self.config.model.split("/", 1)[0],
+        )
+        _emit_progress({
+            "type": "progress", "phase": "research", "event": "local_dossier",
+            "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
+            "findings": len(self.finding_ledger.records),
+        })
+        return canonical
 
     def write_research_checkpoint(self, path: Path, checkpoint: Mapping[str, Any]) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=".jaq-research-", dir=path.parent)
@@ -1073,10 +1315,16 @@ class PiInvestigator:
             except FileNotFoundError:
                 pass
 
-    def finalize_persisted_research(self) -> PiHarnessResult:
+    def finalize_persisted_research(self, termination_reason: str | None = None) -> PiHarnessResult:
         broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
         ledger = self._research_recovery_bundle()
-        if not ledger:
+        finding_evidence_ids = list(dict.fromkeys(
+            evidence_id
+            for envelope in self.finding_ledger.records
+            for evidence_id in envelope["record"].get("evidence_ids", [])
+            if isinstance(evidence_id, str) and self.store.get(evidence_id) is not None
+        ))
+        if not ledger and not finding_evidence_ids:
             raise PiHarnessError("research checkpoint fallback has insufficient persisted tool evidence")
         code_records: list[dict[str, Any]] = []
         call_ids: list[str] = []
@@ -1120,9 +1368,13 @@ class PiInvestigator:
             item["observation_id"] for item in ledger
             if isinstance(item.get("observation_id"), str)
         ]
-        important = list(dict.fromkeys([
+        coverage_evidence_ids = list(dict.fromkeys([
             *(record["evidence_ids"][0] for record in deduplicated_functions),
             *call_ids,
+        ]))
+        important = list(dict.fromkeys([
+            *coverage_evidence_ids,
+            *finding_evidence_ids,
             *result_ids[-100:],
         ]))[:200]
         attempts = []
@@ -1133,14 +1385,24 @@ class PiInvestigator:
                 "outcome": "The exploratory model did not produce a usable checkpoint; JAQ preserved its analysis ledger without re-running or reinterpreting factual values.",
                 "evidence_ids": [deduplicated_functions[0]["evidence_ids"][0]],
             })
+        summary = self._latest_research_summary() or (
+            "Research ended without a model summary. JAQ compiled this partial checkpoint locally from "
+            "persisted static-analysis evidence; consult observations.jsonl and model-session for the complete work."
+        )
+        unresolved_questions = [
+            "The research narrative was unavailable or incomplete; coverage was compiled locally without another model call."
+        ]
+        if isinstance(termination_reason, str) and termination_reason.strip():
+            unresolved_questions.insert(
+                0,
+                "Research terminated early: " + self._utf8_prefix(" ".join(termination_reason.split()), 500),
+            )
         checkpoint = {
             "schema_version": "1.0",
             "research_complete": True,
-            "summary": "Research ended without a usable model-formatted checkpoint. JAQ compiled this partial checkpoint locally from persisted static-analysis evidence; consult observations.jsonl and model-session for the complete original work.",
+            "summary": PiToolBroker._bounded_text(summary, 16_000),
             "important_evidence_ids": important,
-            "unresolved_questions": [
-                "The research narrative was unavailable or structurally invalid; coverage was compiled locally without another model call."
-            ],
+            "unresolved_questions": unresolved_questions,
             "coverage": {
                 "application_entrypoints": [
                     {key: record[key] for key in ("name", "address", "evidence_ids")}
@@ -1159,24 +1421,23 @@ class PiInvestigator:
             session={"id": "local-checkpoint", "file": "persisted observations.jsonl"},
         )
 
-    def recover_rejected_research_checkpoint(self) -> dict[str, Any] | None:
+    def _latest_research_summary(self) -> str | None:
         session_root = self.output_dir / "model-session"
         if not session_root.is_dir():
             return None
-        session_files = sorted(
+        files = sorted(
             session_root.glob("research*/*.jsonl"),
             key=lambda path: (path.stat().st_mtime_ns, str(path)),
             reverse=True,
         )
-        broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
         resolved_root = session_root.resolve()
-        for session_path in session_files:
-            candidates: list[Mapping[str, Any]] = []
+        for path in files:
+            summaries: list[str] = []
             try:
-                if session_path.is_symlink() or not session_path.is_file():
+                if path.is_symlink() or not path.is_file():
                     continue
-                session_path.resolve().relative_to(resolved_root)
-                with session_path.open("r", encoding="utf-8", errors="replace") as stream:
+                path.resolve().relative_to(resolved_root)
+                with path.open("r", encoding="utf-8", errors="replace") as stream:
                     while True:
                         line = stream.readline(MAX_FRAME_BYTES + 1)
                         if line == "":
@@ -1193,21 +1454,17 @@ class PiInvestigator:
                         content = message.get("content")
                         if not isinstance(content, list):
                             continue
-                        for item in content:
-                            if (
-                                isinstance(item, Mapping)
-                                and item.get("type") == "toolCall"
-                                and item.get("name") == "finish_research"
-                                and isinstance(item.get("arguments"), Mapping)
-                            ):
-                                candidates.append(item["arguments"])
+                        text = "\n".join(
+                            str(item.get("text"))
+                            for item in content
+                            if isinstance(item, Mapping) and item.get("type") == "text" and item.get("text")
+                        ).strip()
+                        if text:
+                            summaries.append(text)
             except (OSError, ValueError):
                 continue
-            for candidate in reversed(candidates):
-                try:
-                    return broker.validate_research(candidate)
-                except PiHarnessError:
-                    continue
+            if summaries:
+                return summaries[-1]
         return None
 
     def _research_recovery_bundle(self) -> list[dict[str, Any]]:
@@ -1269,6 +1526,8 @@ class PiInvestigator:
 
         broker = PiToolBroker(self.store, self.runtime)
         canonical = broker.validate_research(research_checkpoint)
+        if self.finding_ledger.records:
+            return self._compile_recorded_findings()
         return self._harvest(canonical)
 
     def _harvest(

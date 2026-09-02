@@ -58,6 +58,9 @@ test("BudgetGuard permits unlimited calls when only cost is configured", () => {
   assert.equal(guard.nearCost(0.70), true);
   stats = { tokens: { total: 10_000_000 }, cost: 0.1 };
   assert.throws(() => guard.beforeProviderCall(), /cost budget/);
+  guard.beforeSummaryProviderCall();
+  assert.equal(guard.snapshot().summary_provider_calls, 1);
+  assert.throws(() => guard.beforeSummaryProviderCall(), /final-summary call budget/);
 });
 
 test("model selectors and diagnostics remain bounded", () => {

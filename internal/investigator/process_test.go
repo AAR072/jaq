@@ -13,7 +13,7 @@ func TestProgressFilterDisplaysOnlyValidatedProgressLines(t *testing.T) {
 	filter := newProgressFilter(&display)
 	chunks := []string{
 		"provider warning\nJAQ_PROG",
-		"RESS [research] started\nJAQ_PROGRESS sample-derived text\n",
+		"RESS [research] started\nJAQ_PROGRESS [research] preparing final summary at cost=$0.10000\nJAQ_PROGRESS [research] dossier compiled locally from 3 recorded findings\nJAQ_PROGRESS sample-derived text\n",
 		"JAQ_PROGRESS [research] tool #5: r2_decompile_function\npartial diagnostic",
 	}
 	for _, chunk := range chunks {
@@ -24,6 +24,8 @@ func TestProgressFilterDisplaysOnlyValidatedProgressLines(t *testing.T) {
 	filter.Flush()
 	shown := display.String()
 	if !strings.Contains(shown, "jaq: [research] started") ||
+		!strings.Contains(shown, "jaq: [research] preparing final summary at cost=$0.10000") ||
+		!strings.Contains(shown, "jaq: [research] dossier compiled locally from 3 recorded findings") ||
 		!strings.Contains(shown, "jaq: [research] tool #5: r2_decompile_function") ||
 		strings.Contains(shown, "sample-derived") || strings.Contains(shown, "provider warning") {
 		t.Fatalf("unexpected displayed progress: %q", shown)
