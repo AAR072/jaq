@@ -31,6 +31,10 @@ function positiveInteger(value, label) {
   return value;
 }
 
+function optionalPositiveInteger(value, label) {
+  return value === null || value === undefined ? null : positiveInteger(value, label);
+}
+
 function positiveNumber(value, label) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     throw new Error(`${label} must be positive`);
@@ -73,9 +77,9 @@ function validateInit(frame) {
   return {
     ...frame,
     budgets: {
-      max_model_calls: positiveInteger(budgets.max_model_calls, "max_model_calls"),
-      max_tool_calls: positiveInteger(budgets.max_tool_calls, "max_tool_calls"),
-      max_total_tokens: positiveInteger(budgets.max_total_tokens, "max_total_tokens"),
+      max_model_calls: optionalPositiveInteger(budgets.max_model_calls, "max_model_calls"),
+      max_tool_calls: optionalPositiveInteger(budgets.max_tool_calls, "max_tool_calls"),
+      max_total_tokens: optionalPositiveInteger(budgets.max_total_tokens, "max_total_tokens"),
       max_cost_usd: positiveNumber(budgets.max_cost_usd, "max_cost_usd"),
       max_output_tokens: positiveInteger(budgets.max_output_tokens, "max_output_tokens"),
       tool_preview_chars: positiveInteger(budgets.tool_preview_chars, "tool_preview_chars"),
@@ -96,15 +100,18 @@ function toolResult(text, details = undefined, isError = false, terminate = fals
   };
 }
 
-function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization) {
+function budgetedModelRuntime(runtime, guard, maxModelCalls, enterFinalization, shouldFinalizeForCost) {
   for (const method of ["stream", "streamSimple"]) {
     const original = runtime[method].bind(runtime);
     runtime[method] = (...args) => {
       // A single Pi prompt can perform many provider/tool turns before it emits
       // session turn_end. Reserve two provider calls for a forced terminal
       // submission here, at the actual provider-call boundary.
-      if (guard.providerCalls >= Math.max(1, maxModelCalls - 2)) {
+      if (Number.isInteger(maxModelCalls) && guard.providerCalls >= Math.max(1, maxModelCalls - 2)) {
         enterFinalization("the model-call budget is nearly exhausted");
+      }
+      if (shouldFinalizeForCost()) {
+        enterFinalization("the cost budget is nearly exhausted");
       }
       guard.beforeProviderCall();
       return original(...args);
@@ -127,6 +134,7 @@ async function main() {
   let terminalAttempts = 0;
   let statsSnapshot;
   let finalizing = false;
+  let costFinalizationFraction = 0.70;
   const enterFinalization = (reason) => {
     if (finalizing || submission !== undefined) return;
     finalizing = true;
@@ -149,6 +157,7 @@ async function main() {
     guard,
     init.budgets.max_model_calls,
     enterFinalization,
+    () => guard.nearCost(costFinalizationFraction),
   );
   const catalogModel = runtime.getModel(provider, modelID);
   if (!catalogModel) throw new Error(`Pi model catalog does not contain ${init.model}`);
@@ -170,7 +179,7 @@ async function main() {
     hidden: true,
     factory(pi) {
       pi.on("before_provider_request", (event) => {
-        if ((init.mode !== "harvest" && !finalizing) || !event.payload || typeof event.payload !== "object") return;
+        if (init.mode !== "harvest" || !event.payload || typeof event.payload !== "object") return;
         const payload = event.payload;
         if (Array.isArray(payload.tools)) {
           payload.tools = payload.tools.filter((tool) =>
@@ -210,7 +219,6 @@ async function main() {
     parameters: Type.Unsafe(definition.parameters),
     executionMode: "sequential",
     async execute(_callID, params) {
-      terminalAttempts += 1;
       if (submission !== undefined) {
         return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
       }
@@ -220,7 +228,10 @@ async function main() {
       try {
         guard.beforeToolCall();
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
-        if (guard.toolCalls >= Math.max(1, Math.floor(init.budgets.max_tool_calls * 0.75))) {
+        if (
+          Number.isInteger(init.budgets.max_tool_calls)
+          && guard.toolCalls >= Math.max(1, Math.floor(init.budgets.max_tool_calls * 0.75))
+        ) {
           enterFinalization("the tool-call budget is nearly exhausted");
         }
         return toolResult(
@@ -257,6 +268,7 @@ async function main() {
     },
     executionMode: "sequential",
     async execute(_callID, params) {
+      terminalAttempts += 1;
       if (submission !== undefined) {
         return toolResult("This phase was already submitted.", undefined, true);
       }
@@ -265,6 +277,15 @@ async function main() {
         submission = canonical;
         return toolResult(`${init.mode} submission validated and accepted.`, undefined, false, true);
       } catch (error) {
+        if (init.mode === "research" && finalizing && session) {
+          finalizing = false;
+          costFinalizationFraction = Math.min(0.95, costFinalizationFraction + 0.10);
+          session.setThinkingLevel(init.thinking_level);
+          session.setActiveToolsByName([
+            ...init.tool_definitions.map((definition) => definition.name),
+            terminalName,
+          ]);
+        }
         return toolResult(
           JSON.stringify({ status: "rejected", error_type: error?.name ?? "ClaimsError", message: sanitizeError(error) }),
           undefined,
@@ -291,6 +312,7 @@ async function main() {
   session.subscribe((event) => {
     if (
       event.type === "turn_end"
+      && Number.isInteger(init.budgets.max_model_calls)
       && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 3)
     ) {
       enterFinalization("the model-call budget is nearly exhausted");

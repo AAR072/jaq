@@ -61,6 +61,19 @@ def _positive_int_env(name: str, default: int, maximum: int) -> int:
     return value
 
 
+def _optional_positive_int_env(name: str, maximum: int) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise PiHarnessError(f"{name} must be an integer") from exc
+    if not 1 <= value <= maximum:
+        raise PiHarnessError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
 def _positive_float_env(name: str, default: float, maximum: float) -> float:
     raw = os.environ.get(name)
     try:
@@ -79,9 +92,9 @@ class PiHarnessConfig:
     script: Path
     session_dir: Path
     thinking_level: str
-    max_model_calls: int
-    max_tool_calls: int
-    max_total_tokens: int
+    max_model_calls: int | None
+    max_tool_calls: int | None
+    max_total_tokens: int | None
     max_cost_usd: float
     max_output_tokens: int
     tool_preview_chars: int
@@ -106,9 +119,9 @@ class PiHarnessConfig:
             script=script,
             session_dir=output_dir / "model-session",
             thinking_level=thinking,
-            max_model_calls=_positive_int_env("JAQ_MAX_MODEL_CALLS", 12, 100),
-            max_tool_calls=_positive_int_env("JAQ_MAX_TOOL_CALLS", 40, 1000),
-            max_total_tokens=_positive_int_env("JAQ_MAX_TOTAL_TOKENS", 500_000, 100_000_000),
+            max_model_calls=_optional_positive_int_env("JAQ_MAX_MODEL_CALLS", 100_000),
+            max_tool_calls=_optional_positive_int_env("JAQ_MAX_TOOL_CALLS", 1_000_000),
+            max_total_tokens=_optional_positive_int_env("JAQ_MAX_TOTAL_TOKENS", 100_000_000),
             max_cost_usd=_positive_float_env("JAQ_MAX_COST_USD", 0.10, 1000.0),
             max_output_tokens=_positive_int_env("JAQ_MAX_OUTPUT_TOKENS", 32_768, 100_000),
             tool_preview_chars=_positive_int_env("JAQ_TOOL_PREVIEW_CHARS", 2_400, 64_000),
@@ -253,7 +266,7 @@ class PiToolBroker:
     def validate_research(self, payload: Any) -> dict[str, Any]:
         expected = {
             "schema_version", "research_complete", "summary",
-            "important_evidence_ids", "unresolved_questions",
+            "important_evidence_ids", "unresolved_questions", "coverage",
         }
         if not isinstance(payload, Mapping) or set(payload) != expected:
             raise PiHarnessError("research checkpoint has missing or unsupported fields")
@@ -262,22 +275,193 @@ class PiToolBroker:
         summary = payload.get("summary")
         evidence_ids = payload.get("important_evidence_ids")
         unresolved = payload.get("unresolved_questions")
+        coverage = payload.get("coverage")
         if not isinstance(summary, str) or not summary.strip() or len(summary) > 16_000:
             raise PiHarnessError("research summary must be nonempty and at most 16000 characters")
         if not isinstance(evidence_ids, list) or len(evidence_ids) > 200 or len(set(evidence_ids)) != len(evidence_ids):
             raise PiHarnessError("research evidence IDs must be a bounded unique array")
-        if any(not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids):
-            raise PiHarnessError("research checkpoint cites missing evidence")
+        missing_evidence = [
+            str(item) for item in evidence_ids
+            if not isinstance(item, str) or self.store.get(item) is None
+        ]
+        if missing_evidence:
+            raise PiHarnessError(
+                "research checkpoint cites missing evidence IDs: " + ", ".join(missing_evidence[:10])
+            )
         if not isinstance(unresolved, list) or len(unresolved) > 100 or any(
             not isinstance(item, str) or not item.strip() or len(item) > 1000 for item in unresolved
         ):
             raise PiHarnessError("research unresolved questions must be a bounded string array")
+        canonical_coverage = self._validate_research_coverage(coverage)
+        covered_ids = {
+            evidence_id
+            for section in (
+                canonical_coverage["application_entrypoints"],
+                canonical_coverage["analyzed_functions"],
+                canonical_coverage["deobfuscation_attempts"],
+                canonical_coverage["recovered_artifacts"],
+            )
+            for record in section
+            for evidence_id in record["evidence_ids"]
+        }
+        covered_ids.update(canonical_coverage["call_graph_evidence_ids"])
+        if not covered_ids.issubset(set(evidence_ids)):
+            raise PiHarnessError("research important_evidence_ids must include all coverage evidence")
         return {
             "schema_version": "1.0",
             "research_complete": True,
             "summary": summary.strip(),
             "important_evidence_ids": list(evidence_ids),
             "unresolved_questions": [item.strip() for item in unresolved],
+            "coverage": canonical_coverage,
+        }
+
+    def _validate_research_coverage(self, coverage: Any) -> dict[str, Any]:
+        expected = {
+            "application_entrypoints", "analyzed_functions",
+            "call_graph_evidence_ids", "deobfuscation_attempts",
+            "recovered_artifacts",
+        }
+        allowed = expected | {"analysis_evidence_ids"}
+        if not isinstance(coverage, Mapping) or not expected.issubset(coverage) or not set(coverage).issubset(allowed):
+            raise PiHarnessError("research coverage has missing or unsupported fields")
+
+        def records(name: str, fields: set[str], minimum: int, maximum: int) -> list[dict[str, Any]]:
+            value = coverage.get(name)
+            if not isinstance(value, list) or not minimum <= len(value) <= maximum:
+                raise PiHarnessError(f"research coverage {name} must contain {minimum}..{maximum} records")
+            result: list[dict[str, Any]] = []
+            for record in value:
+                if not isinstance(record, Mapping) or set(record) != fields:
+                    raise PiHarnessError(f"research coverage {name} record is malformed")
+                evidence_ids = record.get("evidence_ids")
+                if not isinstance(evidence_ids, list) or not evidence_ids or any(
+                    not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids
+                ):
+                    raise PiHarnessError(f"research coverage {name} cites missing evidence")
+                if any(
+                    not isinstance(record.get(field), str) or not record[field].strip()
+                    for field in fields - {"evidence_ids"}
+                ):
+                    raise PiHarnessError(f"research coverage {name} has an empty field")
+                result.append(dict(record))
+            return result
+
+        entrypoints = records("application_entrypoints", {"name", "address", "evidence_ids"}, 1, 20)
+        functions = records("analyzed_functions", {"name", "address", "purpose", "evidence_ids"}, 3, 100)
+        attempts = records(
+            "deobfuscation_attempts", {"technique", "status", "outcome", "evidence_ids"}, 1, 50
+        )
+        if any(item["status"] not in {"recovered", "partial", "failed", "not_needed"} for item in attempts):
+            raise PiHarnessError("research coverage has an invalid deobfuscation status")
+        artifacts = records("recovered_artifacts", {"description", "path", "evidence_ids"}, 0, 50)
+        call_ids = coverage.get("call_graph_evidence_ids")
+        if not isinstance(call_ids, list) or not 1 <= len(call_ids) <= 100 or any(
+            not isinstance(item, str) or self.store.get(item) is None for item in call_ids
+        ):
+            raise PiHarnessError("research coverage call_graph_evidence_ids are invalid")
+
+        events: list[tuple[str, str, Mapping[str, Any], str]] = []
+        result_ids: set[str] = set()
+        for observation in self.store.observations:
+            provenance = observation.provenance
+            metadata = observation.metadata
+            if not isinstance(provenance, Mapping) or provenance.get("stage") != "agent-tool-result":
+                continue
+            tool_name = metadata.get("tool_name") if isinstance(metadata, Mapping) else None
+            status = metadata.get("status") if isinstance(metadata, Mapping) else None
+            parents = provenance.get("parent_observation_ids")
+            if not isinstance(tool_name, str) or not isinstance(status, str) or not isinstance(parents, list) or len(parents) != 1:
+                continue
+            request = self.store.get(parents[0])
+            raw_request = request.raw_value if request is not None else None
+            request_provenance = request.provenance if request is not None else None
+            if (
+                not isinstance(request_provenance, Mapping)
+                or request_provenance.get("stage") != "agent-tool-request"
+                or not isinstance(raw_request, Mapping)
+                or raw_request.get("tool") != tool_name
+            ):
+                continue
+            arguments = raw_request.get("arguments") if isinstance(raw_request, Mapping) else None
+            if not isinstance(arguments, Mapping):
+                arguments = {}
+            events.append((tool_name, status, arguments, observation.id))
+            result_ids.add(observation.id)
+
+        missing: list[str] = []
+        analysis_result_ids = {
+            observation_id for name, status, _, observation_id in events
+            if name == "r2_analyze" and status == "ok"
+        }
+        analysis_result_ids.update({
+            observation_id for name, status, arguments, observation_id in events
+            if name == "run_static_command" and status == "ok"
+            and isinstance(arguments.get("command"), str)
+            and re.search(r"(?:^|[;&|]\s*|\b)r2\b[^\n]*(?:\s-A\b|\s-AAA?\b)", arguments["command"])
+        })
+        if not analysis_result_ids:
+            missing.append("a successful r2_analyze or equivalent r2 -A result")
+        code_tools = {"r2_decompile_function", "r2_disassemble_function", "r2_disassemble"}
+        code_addresses = {
+            str(arguments.get("address", "")).lower()
+            for name, status, arguments, _ in events
+            if name in code_tools and status == "ok" and arguments.get("address")
+        }
+        code_results_by_address: dict[str, set[str]] = {}
+        for name, status, arguments, observation_id in events:
+            if name not in code_tools or status != "ok" or not arguments.get("address"):
+                continue
+            code_results_by_address.setdefault(str(arguments["address"]).lower(), set()).add(observation_id)
+        if len(code_addresses) < 3:
+            missing.append("successful disassembly/decompilation of at least three application addresses")
+        def code_record_matches(record: Mapping[str, Any]) -> bool:
+            address = str(record["address"]).lower()
+            cited = set(record["evidence_ids"])
+            if code_results_by_address.get(address, set()).intersection(cited):
+                return True
+            for name, status, arguments, observation_id in events:
+                if name != "run_static_command" or status != "ok" or observation_id not in cited:
+                    continue
+                command = arguments.get("command")
+                if (
+                    isinstance(command, str)
+                    and address in command.lower()
+                    and re.search(r"\b(?:pdr|pdf|pd|objdump)\b", command)
+                ):
+                    return True
+            return False
+
+        if sum(1 for item in functions if code_record_matches(item)) < 3:
+            missing.append("at least three analyzed_functions addresses backed by code-analysis tool results")
+        if not any(
+            code_results_by_address.get(str(item["address"]).lower(), set()).intersection(item["evidence_ids"])
+            for item in entrypoints
+        ):
+            missing.append("an application entrypoint backed by disassembly/decompilation")
+        call_tools = {"r2_xrefs_to", "r2_list_functions_tree"}
+        call_result_ids = {
+            observation_id for name, status, _, observation_id in events
+            if name in call_tools and status == "ok"
+        }
+        call_result_ids.update({
+            observation_id for name, status, arguments, observation_id in events
+            if name == "run_static_command" and status == "ok"
+            and isinstance(arguments.get("command"), str)
+            and re.search(r"\b(?:pdr|pdf|axt|agc|objdump)\b", arguments["command"])
+        })
+        if not call_result_ids.intersection(call_ids):
+            missing.append("successful call-tree or cross-reference analysis")
+        if any(not set(record["evidence_ids"]).intersection(result_ids) for record in attempts):
+            missing.append("a deobfuscation assessment backed by a persisted tool result")
+        if missing:
+            raise PiHarnessError("research is incomplete: " + "; ".join(missing))
+        return {
+            "application_entrypoints": entrypoints,
+            "analyzed_functions": functions,
+            "call_graph_evidence_ids": list(call_ids),
+            "deobfuscation_attempts": attempts,
+            "recovered_artifacts": artifacts,
         }
 
     def validate_claims(self, payload: Any) -> dict[str, Any]:

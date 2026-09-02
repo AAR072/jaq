@@ -31,6 +31,69 @@ class FakeRuntime:
         raise AssertionError(f"unexpected runtime call {name} {arguments}")
 
 
+def coverage_observations() -> list[Observation]:
+    observations: list[Observation] = []
+    tools = [
+        ("r2_analyze", {}),
+        ("r2_decompile_function", {"address": "0x1000"}),
+        ("r2_disassemble_function", {"address": "0x1100"}),
+        ("r2_disassemble", {"address": "0x1200"}),
+        ("r2_xrefs_to", {"address": "0x1000"}),
+    ]
+    for index, (tool, arguments) in enumerate(tools):
+        request_id = f"req-coverage-{index}"
+        result_id = f"obs-coverage-{index}"
+        observations.append(Observation(
+            id=request_id, type="radare2-mcp.tool_request",
+            raw_value={"tool": tool, "arguments": arguments},
+            normalized_value={"tool": tool, "sequence": index},
+            artifact_location={"artifact": "sample"},
+            analyzer={"name": "fixture", "version": "1"},
+            provenance={"source": "fixture", "stage": "agent-tool-request"},
+            metadata={"tool_name": tool, "sequence": index},
+        ))
+        observations.append(Observation(
+            id=result_id, type="radare2-mcp.tool_result",
+            raw_value={"tool": tool, "result": {"ok": True}},
+            normalized_value={"tool": tool, "status": "ok", "result": {"ok": True}},
+            artifact_location={"artifact": "sample"},
+            analyzer={"name": "fixture", "version": "1"},
+            provenance={
+                "source": "fixture", "stage": "agent-tool-result",
+                "parent_observation_ids": [request_id],
+            },
+            metadata={"tool_name": tool, "status": "ok", "sequence": index},
+        ))
+    return observations
+
+
+def coverage_checkpoint(important_id: str) -> dict:
+    coverage_ids = [f"obs-coverage-{index}" for index in range(5)]
+    return {
+        "schema_version": "1.0", "research_complete": True,
+        "summary": "Application entrypoint and three functions were analyzed.",
+        "important_evidence_ids": [important_id, *coverage_ids],
+        "unresolved_questions": [],
+        "coverage": {
+            "application_entrypoints": [{
+                "name": "main", "address": "0x1000", "evidence_ids": ["obs-coverage-1"],
+            }],
+            "analyzed_functions": [
+                {"name": "main", "address": "0x1000", "purpose": "entry", "evidence_ids": ["obs-coverage-1"]},
+                {"name": "worker", "address": "0x1100", "purpose": "worker", "evidence_ids": ["obs-coverage-2"]},
+                {"name": "decode", "address": "0x1200", "purpose": "decoder", "evidence_ids": ["obs-coverage-3"]},
+            ],
+            "call_graph_evidence_ids": ["obs-coverage-4"],
+            "deobfuscation_attempts": [{
+                "technique": "semantic function recovery", "status": "partial",
+                "outcome": "Three application functions classified.",
+                "evidence_ids": ["obs-coverage-1", "obs-coverage-2", "obs-coverage-3"],
+            }],
+            "recovered_artifacts": [],
+        },
+    }
+
+
 class PiHarnessProtocolTest(unittest.TestCase):
     def test_fake_pi_process_completes_through_broker_and_submit_claims(self):
         with TemporaryDirectory() as directory:
@@ -41,7 +104,11 @@ class PiHarnessProtocolTest(unittest.TestCase):
                 normalized_value="a" * 64, artifact_location={"artifact": "sample"},
                 analyzer={"name": "jaq-pe", "version": "0.1.0"}, provenance={"source": "fixture"},
             )
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            all_observations = [observation, *coverage_observations()]
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in all_observations),
+                encoding="utf-8",
+            )
             fake = root / "fake_harness.py"
             fake.write_text(
                 """
@@ -119,7 +186,11 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 analyzer={"name": "jaq-pe", "version": "0.1.0"}, provenance={"source": "fixture"},
             )
             evidence_path = root / "observations.jsonl"
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            all_observations = [observation, *coverage_observations()]
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in all_observations),
+                encoding="utf-8",
+            )
             fake = root / "fake_research.py"
             fake.write_text(
                 """
@@ -127,12 +198,12 @@ import json, sys
 init = json.loads(sys.stdin.readline())
 assert init["mode"] == "research"
 assert "static_fixture" in {item["name"] for item in init["tool_definitions"]}
-checkpoint = {"schema_version":"1.0","research_complete":True,"summary":"Static research completed.","important_evidence_ids":["obs-native"],"unresolved_questions":[]}
+checkpoint = json.loads(r'''__CHECKPOINT__''')
 print(json.dumps({"type":"request","id":1,"operation":"validate_research","payload":{"research":checkpoint}}), flush=True)
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
 print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"total_tokens":3,"cost_usd":0.0,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
-""",
+""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
                 encoding="utf-8",
             )
             config = PiHarnessConfig(
@@ -147,7 +218,44 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 output_schema=RESEARCH_SCHEMA, system_prompt="Research only.", task="Inspect it.",
             )
             self.assertTrue(result.submission["research_complete"])
-            self.assertEqual(result.submission["important_evidence_ids"], ["obs-native"])
+            self.assertEqual(
+                result.submission["important_evidence_ids"],
+                coverage_checkpoint("obs-native")["important_evidence_ids"],
+            )
+            incomplete = coverage_checkpoint("obs-native")
+            incomplete["coverage"]["analyzed_functions"][2]["address"] = "0x9999"
+            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
+                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(incomplete)
+            mismatched = coverage_checkpoint("obs-native")
+            for function in mismatched["coverage"]["analyzed_functions"]:
+                function["evidence_ids"] = ["obs-coverage-0"]
+            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
+                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(mismatched)
+            forged_attempt = coverage_checkpoint("obs-native")
+            forged_attempt["coverage"]["deobfuscation_attempts"][0]["evidence_ids"] = ["obs-native"]
+            with self.assertRaisesRegex(PiHarnessError, "research is incomplete"):
+                PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(forged_attempt)
+            legacy = coverage_checkpoint("obs-native")
+            legacy["coverage"]["analysis_evidence_ids"] = ["obs-coverage-0"]
+            accepted_legacy = PiToolBroker(
+                EvidenceStore(evidence_path), FakeRuntime()
+            ).validate_research(legacy)
+            self.assertNotIn("analysis_evidence_ids", accepted_legacy["coverage"])
+
+    def test_research_defaults_to_cost_only_without_call_tool_or_token_caps(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "fake.py"
+            fake.write_text("", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake),
+            }, clear=True):
+                config = PiHarnessConfig.from_env(root)
+            self.assertIsNone(config.max_model_calls)
+            self.assertIsNone(config.max_tool_calls)
+            self.assertIsNone(config.max_total_tokens)
+            self.assertEqual(config.max_cost_usd, 0.10)
 
     def test_pi_investigator_runs_fresh_research_and_harvest_sessions(self):
         with TemporaryDirectory() as directory:
@@ -160,7 +268,11 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 analyzer={"name": "jaq-pe", "version": "0.1.0"}, provenance={"source": "fixture"},
             )
             evidence_path = output / "observations.jsonl"
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            all_observations = [observation, *coverage_observations()]
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in all_observations),
+                encoding="utf-8",
+            )
             fake = root / "fake_two_phase.py"
             fake.write_text(
                 """
@@ -169,7 +281,7 @@ init = json.loads(sys.stdin.readline())
 if init["mode"] == "research":
     assert init["session_dir"].endswith("/model-session/research")
     assert "candidate-inventory" not in init["task"]
-    value = {"schema_version":"1.0","research_complete":True,"summary":"Found the sample hash.","important_evidence_ids":["obs-native"],"unresolved_questions":[]}
+    value = json.loads(r'''__CHECKPOINT__''')
     operation, field = "validate_research", "research"
 else:
     assert "/model-session/harvest" in init["session_dir"]
@@ -182,7 +294,7 @@ print(json.dumps({"type":"request","id":1,"operation":operation,"payload":{field
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
 print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":init["mode"],"file":init["mode"]+".jsonl"}}), flush=True)
-""",
+""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
                 encoding="utf-8",
             )
             environment = {

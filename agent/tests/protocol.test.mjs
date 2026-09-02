@@ -40,6 +40,25 @@ test("BudgetGuard blocks before excess provider and tool calls", () => {
   assert.throws(() => tokenGuard.beforeProviderCall(), /token budget/);
 });
 
+test("BudgetGuard permits unlimited calls when only cost is configured", () => {
+  let stats = { tokens: { total: 10_000_000 }, cost: 0.01 };
+  const guard = new BudgetGuard({
+    max_model_calls: null,
+    max_tool_calls: null,
+    max_total_tokens: null,
+    max_cost_usd: 0.1,
+  }, () => stats);
+  for (let index = 0; index < 1000; index += 1) {
+    guard.beforeProviderCall();
+    guard.beforeToolCall();
+  }
+  assert.equal(guard.nearCost(0.70), false);
+  stats = { tokens: { total: 10_000_000 }, cost: 0.071 };
+  assert.equal(guard.nearCost(0.70), true);
+  stats = { tokens: { total: 10_000_000 }, cost: 0.1 };
+  assert.throws(() => guard.beforeProviderCall(), /cost budget/);
+});
+
 test("model selectors and diagnostics remain bounded", () => {
   assert.deepEqual(parseModelSelector("deepseek/deepseek-v4-flash"), {
     provider: "deepseek", model: "deepseek-v4-flash",

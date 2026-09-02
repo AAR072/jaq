@@ -16,6 +16,8 @@ Pi SDK is the host-side investigator harness. It owns provider compatibility, bo
 
 All binary-derived text and all tool output are hostile data. Every investigator-selected Radare MCP or shell request is persisted before execution, and its bounded result is persisted before it is returned to the model. MCP initialization and tool discovery are bounded control traffic, not sample evidence. Claims may cite only observation IDs. Deterministic verification checks schemas, evidence existence, structured relationships, reachability where available, and judge consistency. The optional judge remains tool-free and sees only cited static evidence.
 
+Research completion is coverage-gated rather than turn-gated. By default the research model has no call, tool, or cumulative-token stop counter; the dollar budget is authoritative. `finish_research` is accepted only after persisted evidence demonstrates application entrypoint analysis, multiple application-function disassembly/decompilation results, call/xref analysis, and a concrete deobfuscation assessment or attempt. Metadata and string enumeration alone cannot produce a completed run.
+
 Each completed run writes:
 
 - `run-manifest.json`: hashes, versions, configuration and prompt hashes, role metadata, status, timestamps, and resource usage.

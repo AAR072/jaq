@@ -150,10 +150,10 @@ export class BudgetGuard {
 
   beforeProviderCall() {
     const current = this.stats();
-    if (this.providerCalls >= this.limits.max_model_calls) {
+    if (Number.isInteger(this.limits.max_model_calls) && this.providerCalls >= this.limits.max_model_calls) {
       throw new HarnessLimitError("MODEL_CALL_BUDGET", "investigator model-call budget exhausted");
     }
-    if (current && current.tokens.total >= this.limits.max_total_tokens) {
+    if (current && Number.isInteger(this.limits.max_total_tokens) && current.tokens.total >= this.limits.max_total_tokens) {
       throw new HarnessLimitError("TOKEN_BUDGET", "investigator cumulative token budget exhausted");
     }
     if (current && current.cost >= this.limits.max_cost_usd) {
@@ -163,10 +163,20 @@ export class BudgetGuard {
   }
 
   beforeToolCall() {
-    if (this.toolCalls >= this.limits.max_tool_calls) {
+    if (Number.isInteger(this.limits.max_tool_calls) && this.toolCalls >= this.limits.max_tool_calls) {
       throw new HarnessLimitError("TOOL_CALL_BUDGET", "investigator tool-call budget exhausted");
     }
     this.toolCalls += 1;
+  }
+
+  nearCost(fraction = 0.85) {
+    const current = this.stats();
+    return Boolean(
+      current
+      && typeof current.cost === "number"
+      && Number.isFinite(current.cost)
+      && current.cost >= this.limits.max_cost_usd * fraction
+    );
   }
 
   snapshot() {

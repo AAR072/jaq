@@ -353,11 +353,46 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 }
 
 type researchCheckpoint struct {
-	SchemaVersion        string   `json:"schema_version"`
-	ResearchComplete     bool     `json:"research_complete"`
-	Summary              string   `json:"summary"`
-	ImportantEvidenceIDs []string `json:"important_evidence_ids"`
-	UnresolvedQuestions  []string `json:"unresolved_questions"`
+	SchemaVersion        string           `json:"schema_version"`
+	ResearchComplete     bool             `json:"research_complete"`
+	Summary              string           `json:"summary"`
+	ImportantEvidenceIDs []string         `json:"important_evidence_ids"`
+	UnresolvedQuestions  []string         `json:"unresolved_questions"`
+	Coverage             researchCoverage `json:"coverage"`
+}
+
+type researchFunctionCoverage struct {
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	Purpose     string   `json:"purpose,omitempty"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type researchEntrypointCoverage struct {
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type researchDeobfuscationCoverage struct {
+	Technique   string   `json:"technique"`
+	Status      string   `json:"status"`
+	Outcome     string   `json:"outcome"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type researchArtifactCoverage struct {
+	Description string   `json:"description"`
+	Path        string   `json:"path"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type researchCoverage struct {
+	ApplicationEntrypoints []researchEntrypointCoverage    `json:"application_entrypoints"`
+	AnalyzedFunctions      []researchFunctionCoverage      `json:"analyzed_functions"`
+	CallGraphEvidenceIDs   []string                        `json:"call_graph_evidence_ids"`
+	DeobfuscationAttempts  []researchDeobfuscationCoverage `json:"deobfuscation_attempts"`
+	RecoveredArtifacts     []researchArtifactCoverage      `json:"recovered_artifacts"`
 }
 
 func validateResearchCheckpoint(path string, observations []evidence.Observation) error {
@@ -374,6 +409,13 @@ func validateResearchCheckpoint(path string, observations []evidence.Observation
 		len(checkpoint.ImportantEvidenceIDs) > 200 || len(checkpoint.UnresolvedQuestions) > 100 {
 		return errors.New("reject research.json: invalid research checkpoint")
 	}
+	if len(checkpoint.Coverage.ApplicationEntrypoints) < 1 || len(checkpoint.Coverage.ApplicationEntrypoints) > 20 ||
+		len(checkpoint.Coverage.AnalyzedFunctions) < 3 || len(checkpoint.Coverage.AnalyzedFunctions) > 100 ||
+		len(checkpoint.Coverage.CallGraphEvidenceIDs) < 1 || len(checkpoint.Coverage.CallGraphEvidenceIDs) > 100 ||
+		len(checkpoint.Coverage.DeobfuscationAttempts) < 1 || len(checkpoint.Coverage.DeobfuscationAttempts) > 50 ||
+		len(checkpoint.Coverage.RecoveredArtifacts) > 50 {
+		return errors.New("reject research.json: incomplete reverse-engineering coverage")
+	}
 	known := make(map[string]bool, len(observations))
 	for _, observation := range observations {
 		known[observation.ID] = true
@@ -388,6 +430,44 @@ func validateResearchCheckpoint(path string, observations []evidence.Observation
 	for _, question := range checkpoint.UnresolvedQuestions {
 		if strings.TrimSpace(question) == "" || len(question) > 1000 {
 			return errors.New("reject research.json: invalid unresolved question")
+		}
+	}
+	coverageIDs := make([]string, 0)
+	for _, item := range checkpoint.Coverage.ApplicationEntrypoints {
+		if strings.TrimSpace(item.Name) == "" || strings.TrimSpace(item.Address) == "" || len(item.EvidenceIDs) == 0 {
+			return errors.New("reject research.json: invalid function coverage")
+		}
+		coverageIDs = append(coverageIDs, item.EvidenceIDs...)
+	}
+	for _, item := range checkpoint.Coverage.AnalyzedFunctions {
+		if strings.TrimSpace(item.Name) == "" || strings.TrimSpace(item.Address) == "" ||
+			strings.TrimSpace(item.Purpose) == "" || len(item.EvidenceIDs) == 0 {
+			return errors.New("reject research.json: invalid function coverage")
+		}
+		coverageIDs = append(coverageIDs, item.EvidenceIDs...)
+	}
+	coverageIDs = append(coverageIDs, checkpoint.Coverage.CallGraphEvidenceIDs...)
+	validStatuses := map[string]bool{"recovered": true, "partial": true, "failed": true, "not_needed": true}
+	for _, item := range checkpoint.Coverage.DeobfuscationAttempts {
+		if strings.TrimSpace(item.Technique) == "" || strings.TrimSpace(item.Outcome) == "" ||
+			!validStatuses[item.Status] || len(item.EvidenceIDs) == 0 {
+			return errors.New("reject research.json: invalid deobfuscation coverage")
+		}
+		coverageIDs = append(coverageIDs, item.EvidenceIDs...)
+	}
+	for _, item := range checkpoint.Coverage.RecoveredArtifacts {
+		if strings.TrimSpace(item.Description) == "" || strings.TrimSpace(item.Path) == "" || len(item.EvidenceIDs) == 0 {
+			return errors.New("reject research.json: invalid recovered artifact coverage")
+		}
+		coverageIDs = append(coverageIDs, item.EvidenceIDs...)
+	}
+	important := make(map[string]bool, len(checkpoint.ImportantEvidenceIDs))
+	for _, id := range checkpoint.ImportantEvidenceIDs {
+		important[id] = true
+	}
+	for _, id := range coverageIDs {
+		if !known[id] || !important[id] {
+			return errors.New("reject research.json: coverage evidence is missing or not important")
 		}
 	}
 	return nil

@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,8 +211,27 @@ func writeMockDossier(_ context.Context, output string) error {
 	if err != nil {
 		return err
 	}
-	checkpoint := fmt.Sprintf("{\"schema_version\":\"1.0\",\"research_complete\":true,\"summary\":\"Fixture research complete.\",\"important_evidence_ids\":[%q],\"unresolved_questions\":[]}\n", observations[0].ID)
-	if err := os.WriteFile(filepath.Join(output, "research.json"), []byte(checkpoint), 0o600); err != nil {
+	evidenceID := observations[0].ID
+	checkpoint := researchCheckpoint{
+		SchemaVersion: evidence.SchemaVersion, ResearchComplete: true,
+		Summary: "Fixture research complete.", ImportantEvidenceIDs: []string{evidenceID},
+		UnresolvedQuestions: []string{},
+		Coverage: researchCoverage{
+			ApplicationEntrypoints: []researchEntrypointCoverage{{Name: "fixture", Address: "0x1000", EvidenceIDs: []string{evidenceID}}},
+			AnalyzedFunctions: []researchFunctionCoverage{
+				{Name: "fixture", Address: "0x1000", Purpose: "entry", EvidenceIDs: []string{evidenceID}},
+				{Name: "worker", Address: "0x1100", Purpose: "worker", EvidenceIDs: []string{evidenceID}},
+				{Name: "decoder", Address: "0x1200", Purpose: "decoder", EvidenceIDs: []string{evidenceID}},
+			},
+			CallGraphEvidenceIDs: []string{evidenceID},
+			DeobfuscationAttempts: []researchDeobfuscationCoverage{{
+				Technique: "fixture assessment", Status: "not_needed",
+				Outcome: "fixture is unobfuscated", EvidenceIDs: []string{evidenceID},
+			}},
+			RecoveredArtifacts: []researchArtifactCoverage{},
+		},
+	}
+	if err := writeJSONAtomic(filepath.Join(output, "research.json"), checkpoint); err != nil {
 		return err
 	}
 	claim := evidence.NewClaim("claim-1", "capability", "The fixture contains deterministic static evidence.", 0.8, []string{observations[0].ID})
