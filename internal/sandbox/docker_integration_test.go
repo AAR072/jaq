@@ -117,7 +117,7 @@ func TestPersistentSandboxRuntimeContract(t *testing.T) {
 	}
 
 	for _, binary := range []string{
-		"python3", "pyc-disasm", "pyinstxtractor-ng", "pydisasm",
+		"python3", "pyc-disasm", "pyinstxtractor-ng", "pydisasm", "go-profile",
 		"capa", "binwalk", "bsdtar", "readpe", "peres", "yara",
 		"upx", "llvm-objdump", "llvm-pdbutil", "jaq-tools",
 		"objdump", "r2", "r2mcp",
@@ -128,6 +128,28 @@ func TestPersistentSandboxRuntimeContract(t *testing.T) {
 	}
 	if output, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "jaq-tools | grep -q pyc-disasm"); err != nil {
 		t.Fatalf("static tool inventory is unavailable: %v: %s", err, output)
+	}
+	capaOutput, err := dockerExec(ctx, session.ContainerName(), "capa", "--quiet", "--json", "/input/sample.exe")
+	if err != nil {
+		t.Fatalf("capa could not scan the harmless PE fixture with the vendored rules: %v: %s", err, capaOutput)
+	}
+	var capaReport map[string]any
+	if err := json.Unmarshal(capaOutput, &capaReport); err != nil {
+		t.Fatalf("capa did not return valid JSON: %v: %s", err, capaOutput)
+	}
+	if len(capaReport) == 0 || strings.Contains(strings.ToLower(string(capaOutput)), "missing rules") {
+		t.Fatalf("capa returned an empty or missing-rules result: %s", capaOutput)
+	}
+	goProfileOutput, err := dockerExec(ctx, session.ContainerName(), "go-profile", "/input/sample.exe")
+	if err != nil {
+		t.Fatalf("Go profiler could not inspect the harmless PE fixture: %v: %s", err, goProfileOutput)
+	}
+	var goProfile map[string]any
+	if err := json.Unmarshal(goProfileOutput, &goProfile); err != nil || goProfile["schema_version"] != "1.0" || goProfile["detected"] != false {
+		t.Fatalf("Go profiler returned an invalid non-Go profile: %v: %s", err, goProfileOutput)
+	}
+	if output, err := dockerExec(ctx, session.ContainerName(), "bash", "-lc", "capa --quiet --json /work/not-a-sample.bin | true"); err == nil {
+		t.Fatalf("capa failure was masked by a shell pipeline: %s", output)
 	}
 	pythonFixture := `import importlib.util,marshal; c=compile("answer=42", "fixture.py", "exec"); open("/work/fixture.pyc","wb").write(importlib.util.MAGIC_NUMBER + b"\0"*12 + marshal.dumps(c))`
 	if output, err := dockerExec(ctx, session.ContainerName(), "/opt/python314/bin/python3.14", "-c", pythonFixture); err != nil {
@@ -218,8 +240,8 @@ finally:
 	}
 	if observations, err := evidence.ReadObservationsFile(evidencePath); err != nil {
 		t.Fatalf("Go rejected live Python tool evidence: %v", err)
-	} else if len(observations) != 11 { // base + request/result for version, open, analyze, info, command
-		t.Fatalf("live tool ledger contains %d observations, want 11", len(observations))
+	} else if len(observations) != 15 { // base + request/result for version, capa, Go profile, open, analyze, info, command
+		t.Fatalf("live tool ledger contains %d observations, want 15", len(observations))
 	}
 
 	if err := session.Close(ctx); err != nil {

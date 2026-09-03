@@ -138,6 +138,11 @@ _COMMAND_TOOL = _tool(
     },
 )
 
+_STATIC_FATAL_DIAGNOSTICS = (
+    "capa: default embedded rules not found",
+    "capa: provide your own rule set",
+)
+
 
 class StaticToolRuntime:
     """Persist-before-return facade over one r2mcp session and shell sandbox."""
@@ -206,6 +211,34 @@ class StaticToolRuntime:
             f"radare2 {self.radare_version}"
         ):
             raise RuntimeError(f"radare2 version mismatch: expected {self.radare_version!r}")
+        # Verify the immutable image's pinned capa assets before any provider
+        # call. Per-sample scans remain investigator-directed because very
+        # large obfuscated binaries can take minutes; scan failures are still
+        # recorded and cannot become negative evidence.
+        capa_health = self._execute_recorded(
+            "static-sandbox",
+            "capa_health_check",
+            {
+                "command": (
+                    "test $(find /opt/jaq/capa-rules -type f -name '*.yml' | wc -l) -ge 1000 "
+                    "&& test $(find /opt/jaq/capa-signatures -type f -name '*.sig' | wc -l) -eq 3 "
+                    "&& capa --version"
+                ),
+                "timeout_seconds": 30,
+                "max_output_bytes": 4096,
+            },
+        )
+        if capa_health.get("status") != "ok":
+            raise RuntimeError("capa health check failed before model analysis")
+        self._execute_recorded(
+            "static-sandbox",
+            "go_profile_static_scan",
+            {
+                "command": "go-profile /input/sample.exe",
+                "timeout_seconds": 120,
+                "max_output_bytes": 2_097_152,
+            },
+        )
         opened = self._execute_recorded(
             "radare2-mcp", "open_file", {"file_path": "/input/sample.exe"}
         )
@@ -317,6 +350,9 @@ class StaticToolRuntime:
                 truncated = result.truncated
                 exit_code = result.returncode
                 status = "timeout" if result.timed_out else ("ok" if result.ok else "error")
+                diagnostic = (result.stdout + "\n" + result.stderr).casefold()
+                if any(marker in diagnostic for marker in _STATIC_FATAL_DIAGNOSTICS):
+                    status = "error"
         except Exception as exc:
             raw = {"error": exc.__class__.__name__, "message": str(exc)[:500]}
             status = "error"

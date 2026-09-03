@@ -30,6 +30,9 @@ const (
 	r2MCPVersion         = "1.8.6"
 	r2MCPCommit          = "d74b6b9855622c9a7070165b1961262afd686a3f"
 	sandboxBaseDigest    = "sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
+	capaVersion          = "9.4.0"
+	capaRulesCommit      = "2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80"
+	goProfileVersion     = "0.1.0"
 )
 
 type Investigator interface {
@@ -185,7 +188,9 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"base_digest": sandboxBaseDigest,
 		"radare2":     radare2Version, "radare2_archive_sha256": radare2ArchiveSHA256,
 		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
-		"network": "none", "sample": "read-only", "scratch": "tmpfs",
+		"capa": capaVersion, "capa_rules_commit": capaRulesCommit,
+		"go_profile": goProfileVersion,
+		"network":    "none", "sample": "read-only", "scratch": "tmpfs",
 	})
 	if err != nil {
 		return fmt.Errorf("hash static sandbox configuration: %w", err)
@@ -212,6 +217,8 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"native_pe_analyzer": nativeAnalyzerVersion,
 		"radare2":            radare2Version, "radare2_archive_sha256": radare2ArchiveSHA256,
 		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
+		"capa": capaVersion, "capa_rules_commit": capaRulesCommit,
+		"go_profile":          goProfileVersion,
 		"sandbox_base_digest": sandboxBaseDigest,
 		"sandbox_image":       c.Config.SandboxImage, "sandbox_image_id": sandboxImageID,
 		"python": c.Config.PythonVersion, "python_package": "jaq-investigator/" + Version,
@@ -312,12 +319,18 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	closed = true
 
 	manifest.Status = "completed"
-	if !findingsContainApplicationBehavior(filepath.Join(outputDir, "findings.jsonl")) {
+	acceptedClaims := acceptedClaimIDs(outputDir, observations)
+	hasApplicationBehavior, hasAnalysisBlocker := findingsCoverage(
+		filepath.Join(outputDir, "findings.jsonl"), acceptedClaims,
+	)
+	if !hasApplicationBehavior || hasAnalysisBlocker ||
+		!researchQualityComplete(filepath.Join(outputDir, "research.json")) ||
+		!analyzerHealthComplete(observations) {
 		manifest.Status = "partial"
 	}
 	var requestDocument map[string]any
 	if readErr := readJSONStrict(filepath.Join(outputDir, "requests.json"), &requestDocument); readErr == nil {
-		if requests, ok := requestDocument["action_requests"].([]any); ok && len(requests) > 0 {
+		if requests, ok := requestDocument["action_requests"].([]any); ok && len(requests) > 0 && manifest.Status == "completed" {
 			manifest.Status = "awaiting_authorization"
 		}
 	}
@@ -332,10 +345,10 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	return nil
 }
 
-func findingsContainApplicationBehavior(path string) bool {
+func findingsCoverage(path string, acceptedClaims map[string]bool) (hasApplicationBehavior, hasAnalysisBlocker bool) {
 	file, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer file.Close()
 	applicationScopes := map[string]bool{
@@ -349,13 +362,85 @@ func findingsContainApplicationBehavior(path string) bool {
 	for scanner.Scan() {
 		var finding persistedFinding
 		if json.Unmarshal(scanner.Bytes(), &finding) != nil {
-			return false
+			return false, false
 		}
 		if applicationScopes[finding.Scope] || (finding.Scope == "" && finding.Kind == "claim") {
-			return true
+			var record struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(finding.Record, &record) == nil && acceptedClaims[record.ID] {
+				hasApplicationBehavior = true
+			}
+		}
+		if finding.Scope == "analysis_blocker" {
+			hasAnalysisBlocker = true
 		}
 	}
-	return false
+	return hasApplicationBehavior, hasAnalysisBlocker
+}
+
+func acceptedClaimIDs(outputDir string, observations []evidence.Observation) map[string]bool {
+	accepted := map[string]bool{}
+	claims, err := evidence.ReadClaims(filepath.Join(outputDir, "claims.json"))
+	if err != nil {
+		return accepted
+	}
+	score, err := evidence.ReadScore(filepath.Join(outputDir, "score.json"), claims, observations)
+	if err != nil {
+		return accepted
+	}
+	for _, result := range score.VerificationResults {
+		if result.Accepted && result.Status == "accepted" {
+			accepted[result.ClaimID] = true
+		}
+	}
+	return accepted
+}
+
+func researchQualityComplete(path string) bool {
+	var checkpoint researchCheckpoint
+	if err := readJSONStrict(path, &checkpoint); err != nil || !checkpoint.ResearchComplete || len(checkpoint.UnresolvedQuestions) > 0 {
+		return false
+	}
+	if len(checkpoint.Coverage.ApplicationEntrypoints) == 0 ||
+		len(checkpoint.Coverage.AnalyzedFunctions) < 3 ||
+		len(checkpoint.Coverage.CallGraphEvidenceIDs) == 0 ||
+		len(checkpoint.Coverage.DeobfuscationAttempts) == 0 {
+		return false
+	}
+	for _, attempt := range checkpoint.Coverage.DeobfuscationAttempts {
+		if attempt.Status == "partial" || attempt.Status == "failed" {
+			return false
+		}
+	}
+	return true
+}
+
+func analyzerHealthComplete(observations []evidence.Observation) bool {
+	requested := map[string]bool{}
+	succeeded := map[string]bool{}
+	required := map[string]bool{"capa_health_check": true, "go_profile_static_scan": true}
+	for _, observation := range observations {
+		toolName, _ := observation.Metadata["tool_name"].(string)
+		if !required[toolName] {
+			continue
+		}
+		if observation.Type == "static-sandbox.tool_request" {
+			requested[toolName] = true
+		}
+		if observation.Type == "static-sandbox.tool_result" && observation.Metadata["status"] == "ok" {
+			succeeded[toolName] = true
+		}
+		if observation.Type == "static-sandbox.tool_result" && observation.Metadata["status"] != "ok" {
+			return false
+		}
+	}
+	for toolName := range requested {
+		if !succeeded[toolName] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateInvestigatorOutputs(outputDir string, observations []evidence.Observation, judgeRequired bool) error {

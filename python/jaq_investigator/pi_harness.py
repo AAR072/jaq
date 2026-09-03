@@ -405,6 +405,38 @@ class PiToolBroker:
                 seen.add(item)
         return result
 
+    def _canonicalize_sample_hash_references(self, summary: str) -> tuple[str, bool]:
+        canonical = next((
+            str(item.normalized_value).casefold()
+            for item in self.store.list_observations("artifact.hash.sha256")
+            if isinstance(item.normalized_value, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", item.normalized_value)
+        ), None)
+        if canonical is None:
+            return summary, False
+        pattern = re.compile(
+            r"(?P<context>\b(?:sample(?:\.exe)?|binary|pe)\b[^\n]{0,96}?\bsha-?256\s*[:=]?\s*`?)"
+            r"(?P<digest>[0-9a-fA-F]{64}|[0-9a-fA-F]{8,63}(?:…|\.\.\.)[0-9a-fA-F]{4,63})(?P<tick>`?)",
+            re.IGNORECASE,
+        )
+        changed = False
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal changed
+            supplied = match.group("digest").casefold()
+            if "…" in supplied or "..." in supplied:
+                separator = "…" if "…" in supplied else "..."
+                prefix, suffix = supplied.split(separator, 1)
+                valid = canonical.startswith(prefix) and canonical.endswith(suffix)
+            else:
+                valid = supplied == canonical
+            if valid:
+                return match.group(0)
+            changed = True
+            return match.group("context") + canonical + match.group("tick")
+
+        return pattern.sub(replace, summary), changed
+
     @staticmethod
     def _bounded_text(value: Any, maximum: int) -> Any:
         if not isinstance(value, str) or len(value) <= maximum:
@@ -831,6 +863,13 @@ class PiToolBroker:
         ):
             raise PiHarnessError("research unresolved questions must be a bounded string array")
         canonical_coverage, coverage_gaps = self._validate_research_coverage(coverage)
+        summary, repaired_sample_hash = self._canonicalize_sample_hash_references(summary)
+        if repaired_sample_hash:
+            warning = "Model supplied an incorrect sample SHA-256; JAQ replaced it with the controller-verified artifact hash."
+            if warning not in unresolved:
+                unresolved.append(warning)
+            if len(unresolved) > 100:
+                raise PiHarnessError("research unresolved questions exceed 100 after sample hash repair")
         if coverage_gaps:
             warning = self._bounded_text(
                 "Coverage incomplete: " + "; ".join(coverage_gaps), 1000

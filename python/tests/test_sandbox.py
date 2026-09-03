@@ -66,7 +66,7 @@ class SandboxTests(unittest.TestCase):
                 "3.0",
                 "/bin/bash",
                 "-lc",
-                "python3 -c 'print(1)' && objdump -x sample.exe",
+                "set -o pipefail\npython3 -c 'print(1)' && objdump -x sample.exe",
             ],
         )
         self.assertFalse(popen.call_args.kwargs["shell"])
@@ -74,6 +74,11 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(result.stderr, "err")
         self.assertTrue(result.ok)
         self.assertNotIn("DEEPSEEK_API_KEY", popen.call_args.kwargs["env"])
+
+    def test_pipefail_prevents_analyzer_errors_from_being_masked(self):
+        sandbox = DockerStaticSandbox("jaq-static")
+        argv = sandbox._command_argv("analyzer sample.exe 2>&1 | head -100", 30.0)
+        self.assertEqual(argv[-1], "set -o pipefail\nanalyzer sample.exe 2>&1 | head -100")
 
     def test_output_is_bounded_across_concurrent_stdout_and_stderr(self):
         process = FakeProcess(stdout=b"1234567890", stderr=b"abcdefghij")

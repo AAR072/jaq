@@ -233,7 +233,12 @@ def run_pipeline(
         }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        "report.md": render_report(claims["claims"], score, store) + _render_communications(claims) + _render_operational(claims),
+        "report.md": (
+            render_report(claims["claims"], score, store)
+            + _render_analysis_quality(score.to_dict(), store)
+            + _render_communications(claims)
+            + _render_operational(claims)
+        ),
     }
     targets = [output_dir / name for name in contents]
     if any(path.exists() for path in targets):
@@ -299,6 +304,51 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
     )
     if not requests:
         lines.append("- None.")
+    return "\n".join(lines) + "\n"
+
+
+def _render_analysis_quality(score: Mapping[str, Any], store: CanonicalEvidenceStore) -> str:
+    lines = ["\n## Analysis quality\n"]
+    failed_tools = sorted({
+        str(item.metadata.get("tool_name"))
+        for item in store.observations
+        if item.type.endswith("tool_result")
+        and item.metadata.get("status") in {"error", "timeout"}
+        and item.metadata.get("tool_name")
+    })
+    if failed_tools:
+        lines.append("- Failed or timed-out analyzers: " + ", ".join(f"`{name}`" for name in failed_tools) + ".")
+        lines.append("- Their failures are not treated as negative evidence.")
+    else:
+        lines.append("- Required analyzer health checks completed successfully.")
+
+    clone_dominated = False
+    negative_blocked = False
+    for observation in store.observations:
+        if observation.metadata.get("tool_name") != "go_profile_static_scan" or observation.metadata.get("status") != "ok":
+            continue
+        value = observation.normalized_value
+        result = value.get("result") if isinstance(value, Mapping) else None
+        stdout = result.get("stdout") if isinstance(result, Mapping) else None
+        if not isinstance(stdout, str):
+            continue
+        try:
+            profile = json.loads(stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(profile, Mapping):
+            clone_dominated = profile.get("clone_dominated") is True
+            dynamic = profile.get("dynamic_resolution")
+            negative_blocked = isinstance(dynamic, Mapping) and dynamic.get("negative_capability_claims_blocked") is True
+        break
+    if clone_dominated:
+        lines.append("- Go profile: clone-dominated; repeated blocks are prioritization evidence, not program purpose.")
+    if negative_blocked:
+        lines.append("- Unresolved dynamic/indirect calls block conclusive negative capability claims.")
+    rejected = int(score.get("rejected", 0)) if isinstance(score.get("rejected", 0), int) else 0
+    unclear = int(score.get("unclear", 0)) if isinstance(score.get("unclear", 0), int) else 0
+    if rejected or unclear:
+        lines.append(f"- Verification retained {rejected} rejected and {unclear} unclear claim(s); see their reasons above.")
     return "\n".join(lines) + "\n"
 
 

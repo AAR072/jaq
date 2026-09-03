@@ -14,7 +14,7 @@ from jaq_investigator import (
     render_report,
     verify_claim,
 )
-from jaq_investigator.cli import _group_assets, _render_communications, _render_operational
+from jaq_investigator.cli import _group_assets, _render_analysis_quality, _render_communications, _render_operational
 
 
 class CoreTest(unittest.TestCase):
@@ -70,6 +70,134 @@ class CoreTest(unittest.TestCase):
         result = verify_claim(claim, store)
         self.assertEqual(result.status, "rejected")
         self.assertIn("exact value absent", result.reasons[0])
+
+    def test_wrong_abbreviated_hash_is_rejected(self):
+        actual = "49cc5d0979917fec4d0ca9010948c2a0f021d3fecab82fb7c162b13319f19de3"
+        store = self.store([self.observation("hash", actual, type="artifact.hash.sha256")])
+        claim = Claim(
+            id="claim-abbreviated-hash", classification="behavior",
+            explanation="Sample SHA256 d8c7fff5…a74e75 performs work.",
+            confidence=0.9, evidence_ids=("hash",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(claim, store)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("abbreviated hash absent", result.reasons[0])
+
+        supported = Claim(
+            id="claim-supported-abbreviated-hash", classification="behavior",
+            explanation="Sample SHA256 49cc5d09…9f19de3 performs work.",
+            confidence=0.9, evidence_ids=("hash",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        self.assertEqual(verify_claim(supported, store).status, "accepted")
+
+        payload_hash = "b" * 64
+        payload_store = self.store([self.observation("payload", payload_hash, type="payload.hash.sha256")])
+        payload_claim = Claim(
+            id="claim-payload-abbreviated-hash", classification="Recovered payload",
+            explanation="Payload SHA256 bbbbbbbb…bbbbbbbb was recovered.",
+            confidence=0.9, evidence_ids=("payload",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        self.assertEqual(verify_claim(payload_claim, payload_store).status, "accepted")
+
+    def test_static_benign_certification_is_never_accepted(self):
+        store = self.store([self.observation("behavior", "observed sensor output")])
+        claim = Claim(
+            id="claim-benign", classification="Benign sensor application",
+            explanation="The observed code appears harmless.", confidence=0.8,
+            evidence_ids=("behavior",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(claim, store)
+        self.assertEqual(result.status, "unclear")
+        self.assertIn("cannot certify", result.reasons[0])
+
+    def test_negative_crypto_claim_conflicting_with_app_call_is_unclear(self):
+        store = self.store([
+            self.observation("summary", "main.vzbOS calls: crypto/sha1.Sum"),
+        ])
+        claim = Claim(
+            id="claim-no-crypto", classification="No encryption",
+            explanation="No cryptographic routine was found.", confidence=0.8,
+            evidence_ids=("summary",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(claim, store)
+        self.assertEqual(result.status, "unclear")
+        self.assertIn("conflicts", result.reasons[0])
+
+    def test_negative_network_claim_with_unresolved_dynamic_calls_is_unclear(self):
+        store = self.store([
+            self.observation("dynamic", "main.worker calls: syscall.(*LazyProc).Call"),
+        ])
+        claim = Claim(
+            id="claim-no-network", classification="No network activity",
+            explanation="No phone-home or C2 behavior was found.", confidence=0.8,
+            evidence_ids=("dynamic",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(claim, store)
+        self.assertEqual(result.status, "unclear")
+        self.assertIn("analyzed paths", result.reasons[0])
+
+        qualified = Claim(
+            id="claim-qualified-negative", classification="Network assessment",
+            explanation="No phone-home path was recovered in the analyzed paths.",
+            confidence=0.7, evidence_ids=("dynamic",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        qualified_result = verify_claim(qualified, store)
+        self.assertEqual(qualified_result.status, "unclear")
+        self.assertIn("not conclusive", qualified_result.reasons[0])
+
+        clean_store = self.store([self.observation("clean", "direct application call graph")])
+        clean_claim = Claim(
+            id="claim-clean-qualified-negative", classification="Network assessment",
+            explanation="No phone-home path was recovered in the analyzed paths.",
+            confidence=0.7, evidence_ids=("clean",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        self.assertEqual(verify_claim(clean_claim, clean_store).status, "accepted")
+
+    def test_clone_dominated_go_claim_requires_profile_and_unique_residue(self):
+        profile_value = {
+            "result": {
+                "stdout": json.dumps({
+                    "schema_version": "1.0", "detected": True,
+                    "clone_dominated": True, "coverage_status": "partial",
+                }),
+            },
+            "status": "ok",
+        }
+        profile = Observation(
+            id="go-profile", type="static-sandbox.tool_result",
+            raw_value=profile_value, normalized_value=profile_value,
+            artifact_location={"artifact": "sample"},
+            analyzer={"name": "jaq", "version": "1"},
+            provenance={"source": "fixture"},
+            metadata={"tool_name": "go_profile_static_scan", "status": "ok"},
+        )
+        code = self.observation("code", "repeated sensor printing")
+        store = self.store([profile, code])
+        clone_only = Claim(
+            id="claim-clone-only", classification="Dominant application workload",
+            explanation="The program's purpose is sensor printing.", confidence=0.8,
+            evidence_ids=("code",), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        result = verify_claim(clone_only, store)
+        self.assertEqual(result.status, "unclear")
+        self.assertIn("clone-dominated", result.reasons[0])
+
+        residue_backed = Claim(
+            id="claim-residue", classification="Primary behavior from unique residue",
+            explanation="Unique residue analysis establishes a file-writing behavior.",
+            confidence=0.8, evidence_ids=("go-profile", "code"), asset_role=None,
+            reachability=Reachability("unknown", (), ()), unresolved=False,
+        )
+        self.assertEqual(verify_claim(residue_backed, store).status, "accepted")
 
     def test_reachable_without_relationship_downgrades_only_reachability(self):
         store = self.store([self.observation("main", "main"), self.observation("asset", "secret")])
@@ -261,6 +389,20 @@ class CoreTest(unittest.TestCase):
         self.assertIn("## Network communication", report)
         self.assertIn("### Exfiltration / phone-home", report)
         self.assertIn("HTTPS POST", report)
+
+    def test_analysis_quality_surfaces_analyzer_failure(self):
+        failed = Observation(
+            id="failed", type="static-sandbox.tool_result",
+            raw_value={"error": "missing rules"}, normalized_value={"status": "error"},
+            artifact_location={"artifact": "sample"},
+            analyzer={"name": "jaq", "version": "1"}, provenance={"source": "fixture"},
+            metadata={"tool_name": "capa_health_check", "status": "error"},
+        )
+        report = _render_analysis_quality(
+            {"rejected": 0, "unclear": 1}, self.store([failed]),
+        )
+        self.assertIn("capa_health_check", report)
+        self.assertIn("not treated as negative evidence", report)
 
 
 if __name__ == "__main__":

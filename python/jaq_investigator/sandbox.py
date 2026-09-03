@@ -176,7 +176,7 @@ class DockerStaticSandbox:
             str(timeout),
             "/bin/bash",
             "-lc",
-            command,
+            "set -o pipefail\n" + command,
         )
 
     def run(

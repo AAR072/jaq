@@ -22,9 +22,20 @@ func TestSandboxImagePinsStaticToolchainAndExcludesDynamicRuntimes(t *testing.T)
 		"binutils binwalk build-essential",
 		"Python-${PYTHON314_VERSION}.tar.xz",
 		"3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81",
+		"CAPA_RULES_VERSION=9.4.0",
+		"CAPA_RULES_COMMIT=2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80",
+		"d18c5d57c3ab2089a54ca95da2b54d83ccb7dbc6c9db071f47d3f6c4afe703de",
+		"https://github.com/mandiant/capa-rules/archive/${CAPA_RULES_COMMIT}.tar.gz",
+		"/opt/jaq/capa-rules",
+		"CAPA_SOURCE_COMMIT=7a79f799a70f052e8382cdbeaec8115daba14a5b",
+		"89a4ef8d6c11c822c4cfff5d2d42171dde1ebac5d563a1d7ff49adbcd4f22a0a",
+		"/opt/jaq/capa-signatures",
 		"requirements-static.txt",
-		"pyinstxtractor-ng pydisasm readpe upx yara",
+		"COPY --chmod=0555 capa /usr/local/bin/capa",
+		"go-profile pyinstxtractor-ng pydisasm readpe upx yara",
 		"JAQ_TOOLS_MANIFEST=/opt/jaq/TOOLS.md",
+		"BASH_ENV=/etc/jaq/bash-env",
+		"set -o pipefail",
 		"--disable-debugger --without-ptrace-wrap --disable-loadlibs",
 		"--without-qjs",
 	} {
@@ -47,7 +58,7 @@ func TestStaticToolInventoryAndPythonDisassemblerAreNonExecuting(t *testing.T) {
 	text := string(manifest)
 	for _, required := range []string{
 		"pyinstxtractor-ng", "pyc-disasm", "Python 3.14", "dnfile", "dncil",
-		"capa", "binwalk", "readpe", "llvm-pdbutil", "pycryptodome",
+		"capa", "9.4.0 rules", "/opt/jaq/capa-rules", "go-profile", "clone candidate", "binwalk", "readpe", "llvm-pdbutil", "pycryptodome",
 		"never execute, import, load as a native library, emulate, or",
 	} {
 		if !strings.Contains(text, required) {

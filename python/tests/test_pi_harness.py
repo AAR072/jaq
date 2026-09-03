@@ -103,6 +103,27 @@ def coverage_checkpoint(important_id: str) -> dict:
 
 
 class PiHarnessProtocolTest(unittest.TestCase):
+    def test_research_summary_repairs_wrong_sample_hash_and_marks_unresolved(self):
+        sample_hash = "a" * 64
+        observations = [
+            Observation(
+                id="obs-native", type="artifact.hash.sha256",
+                raw_value=sample_hash, normalized_value=sample_hash,
+                artifact_location={"artifact": "sample"},
+                analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            ),
+            *coverage_observations(),
+        ]
+        checkpoint = coverage_checkpoint("obs-native")
+        checkpoint["summary"] = "Sample PE SHA256 deadbeef…cafebabe was analyzed."
+        repaired = PiToolBroker(
+            EvidenceStore.from_observations(observations), FakeRuntime(),
+        ).validate_research(checkpoint)
+        self.assertIn(sample_hash, repaired["summary"])
+        self.assertNotIn("deadbeef", repaired["summary"])
+        self.assertTrue(any("incorrect sample SHA-256" in item for item in repaired["unresolved_questions"]))
+
     def test_researcher_discovers_real_static_tool_inventory(self):
         self.assertIn("/opt/jaq/TOOLS.md", INVESTIGATOR_SYSTEM_PROMPT)
         self.assertIn("jaq-tools", INVESTIGATOR_SYSTEM_PROMPT)
@@ -111,6 +132,9 @@ class PiHarnessProtocolTest(unittest.TestCase):
         self.assertNotIn("go version -m", INVESTIGATOR_SYSTEM_PROMPT)
         self.assertIn("phones home", INVESTIGATOR_SYSTEM_PROMPT)
         self.assertIn("legitimate third-party", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("suspected injected junk", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("unique residual instructions", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("Never certify a sample as benign", INVESTIGATOR_SYSTEM_PROMPT)
 
     def test_recovery_cli_compiles_research_without_removed_checkpoint_api(self):
         with TemporaryDirectory() as directory:

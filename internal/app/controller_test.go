@@ -64,7 +64,9 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Status != "completed" || manifest.Versions["radare2"] != "6.2.0" || manifest.Versions["radare2_mcp"] != "1.8.6" {
+	if manifest.Status != "completed" || manifest.Versions["radare2"] != "6.2.0" ||
+		manifest.Versions["radare2_mcp"] != "1.8.6" || manifest.Versions["capa"] != "9.4.0" ||
+		manifest.Versions["go_profile"] != "0.1.0" {
 		t.Fatalf("unexpected manifest: %#v", manifest)
 	}
 	if _, ok := manifest.ModelRoles["harvester"]; ok {
@@ -107,6 +109,56 @@ func TestControllerMarksBlockerOnlyDossierPartial(t *testing.T) {
 	}
 	if manifest.Status != "partial" {
 		t.Fatalf("blocker-only dossier status = %q, want partial", manifest.Status)
+	}
+}
+
+func TestFindingsCoverageKeepsMixedBehaviorAndCoreBlockerPartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "findings.jsonl")
+	contents := strings.Join([]string{
+		`{"kind":"claim","scope":"application_logic","record":{"id":"claim-app"}}`,
+		`{"kind":"claim","scope":"analysis_blocker"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hasBehavior, hasBlocker := findingsCoverage(path, map[string]bool{"claim-app": true})
+	if !hasBehavior || !hasBlocker {
+		t.Fatalf("mixed findings coverage = behavior:%t blocker:%t", hasBehavior, hasBlocker)
+	}
+	acceptedBehavior, _ := findingsCoverage(path, map[string]bool{})
+	if acceptedBehavior {
+		t.Fatal("an unclear/rejected application finding was treated as accepted behavior")
+	}
+}
+
+func TestAnalyzerHealthRequiresSuccessfulCapaResultWhenRequested(t *testing.T) {
+	request := evidence.NewObservation(
+		"static-sandbox.tool_request", "capa", "capa",
+		evidence.ArtifactLocation{Artifact: "sample"},
+		evidence.AnalyzerIdentity{Name: "fixture", Version: "1"},
+		evidence.Provenance{Source: "fixture"},
+	)
+	request.Metadata = map[string]any{"tool_name": "capa_health_check"}
+	if analyzerHealthComplete([]evidence.Observation{request}) {
+		t.Fatal("missing capa result was treated as healthy")
+	}
+	result := request
+	result.ID = "obs-capa-result"
+	result.Type = "static-sandbox.tool_result"
+	result.Metadata = map[string]any{"tool_name": "capa_health_check", "status": "ok"}
+	goRequest := request
+	goRequest.ID = "obs-go-request"
+	goRequest.Metadata = map[string]any{"tool_name": "go_profile_static_scan"}
+	goResult := result
+	goResult.ID = "obs-go-result"
+	goResult.Metadata = map[string]any{"tool_name": "go_profile_static_scan", "status": "ok"}
+	if !analyzerHealthComplete([]evidence.Observation{request, result, goRequest, goResult}) {
+		t.Fatal("successful capa result was treated as unhealthy")
+	}
+	result.Metadata["status"] = "error"
+	if analyzerHealthComplete([]evidence.Observation{request, result, goRequest, goResult}) {
+		t.Fatal("failed capa result was treated as healthy")
 	}
 }
 
@@ -297,7 +349,7 @@ func writeMockDossier(_ context.Context, output string) error {
 	if err := writeJSONAtomic(filepath.Join(output, "research.json"), checkpoint); err != nil {
 		return err
 	}
-	finding := fmt.Sprintf("{\"schema_version\":\"1.0\",\"id\":\"finding-0123456789abcdef01234567\",\"sequence\":1,\"kind\":\"claim\",\"title\":\"Fixture\",\"description\":\"Fixture finding.\",\"confidence\":1,\"record\":{\"evidence_ids\":[%q]}}\n", evidenceID)
+	finding := fmt.Sprintf("{\"schema_version\":\"1.0\",\"id\":\"finding-0123456789abcdef01234567\",\"sequence\":1,\"kind\":\"claim\",\"title\":\"Fixture\",\"description\":\"Fixture finding.\",\"confidence\":1,\"record\":{\"id\":\"claim-1\",\"evidence_ids\":[%q]}}\n", evidenceID)
 	if err := os.WriteFile(filepath.Join(output, "findings.jsonl"), []byte(finding), 0o600); err != nil {
 		return err
 	}

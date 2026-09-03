@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Bounded, static Go application-code profiler for JAQ.
+
+This helper reads a PE as inert bytes.  It does not load the image, resolve a
+DLL, invoke a recovered entry point, or emulate instructions.  Go binaries
+often retain a COFF symbol table even when their names are randomized.  The
+profiler uses that table and Capstone to make a compact, deterministic view of
+``main.*`` functions:
+
+* repeated normalized instruction shingles are reported as clone candidates;
+* instruction/call residue outside those candidates is retained and ranked;
+* direct calls between symbols provide a conservative reachability view; and
+* dynamic/sensitive call sites prevent an unwarranted negative conclusion.
+
+The output is deliberately a triage aid, not a semantic decompiler.  A clone
+cluster is never called junk automatically: a cluster containing a sensitive
+or dynamic call remains high-priority for human/model review.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+import argparse
+import hashlib
+import json
+import re
+import stat
+import struct
+import sys
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+
+SCHEMA_VERSION = "1.0"
+TOOL_NAME = "jaq-go-profile"
+TOOL_VERSION = "0.1.0"
+
+MAX_INPUT_BYTES = 512 << 20
+MAX_FUNCTIONS = 256
+MAX_FUNCTION_BYTES = 512 << 10
+MAX_TOTAL_INSTRUCTIONS = 1_000_000
+MAX_SHINGLE_INSTRUCTIONS = 12
+MIN_REPEAT_OCCURRENCES = 3
+MIN_REPEAT_FUNCTIONS = 2
+MAX_CLONE_CLUSTERS = 64
+MAX_CLUSTER_MEMBERS = 64
+MAX_CALLS_PER_FUNCTION = 64
+MAX_STRINGS_PER_FUNCTION = 32
+MAX_OUTPUT_BYTES = 2 << 20
+MAX_NAME_CHARS = 300
+
+
+_SENSITIVE_TERMS: tuple[tuple[str, str], ...] = (
+    ("network", "connect"),
+    ("network", "send"),
+    ("network", "recv"),
+    ("network", "socket"),
+    ("network", "getaddrinfo"),
+    ("network", "winhttp"),
+    ("network", "wininet"),
+    ("network", "urlmon"),
+    ("process", "createprocess"),
+    ("process", "openprocess"),
+    ("process", "writeprocessmemory"),
+    ("process", "virtualalloc"),
+    ("process", "createremotethread"),
+    ("persistence", "regcreate"),
+    ("persistence", "regsetvalue"),
+    ("persistence", "createservice"),
+    ("file", "createfile"),
+    ("file", "writefile"),
+    ("file", "deletefile"),
+    ("crypto", "aes"),
+    ("crypto", "sha"),
+    ("crypto", "crypt"),
+    ("credential", "username"),
+    ("credential", "password"),
+    ("credential", "token"),
+    ("loader", "loadlibrary"),
+    ("loader", "getprocaddress"),
+)
+_DYNAMIC_TERMS: tuple[str, ...] = (
+    "lazyproc",
+    "syscalln",
+    "newcallback",
+    "getprocaddress",
+    "loadlibrary",
+    "loadlibraryw",
+    "loadlibrarya",
+    "procaddress",
+)
+_STRING_INDICATOR_RE = re.compile(
+    r"(?:https?://|\b(?:bearer|token|password|secret|api[_ -]?key)\b|\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)",
+    re.IGNORECASE,
+)
+
+
+class ProfileError(ValueError):
+    """A bounded input or static-analysis failure."""
+
+
+@dataclass(frozen=True)
+class Section:
+    name: str
+    virtual_address: int
+    virtual_size: int
+    raw_offset: int
+    raw_size: int
+
+    @property
+    def end_rva(self) -> int:
+        return self.virtual_address + max(self.virtual_size, self.raw_size)
+
+
+@dataclass(frozen=True)
+class Symbol:
+    name: str
+    address: int
+    section: int
+    value: int
+    size: int = 0
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """Small architecture-neutral representation used by the profiler/tests."""
+
+    address: int
+    mnemonic: str
+    operand_classes: tuple[str, ...] = ()
+    target: str | None = None
+    target_address: int | None = None
+    string_value: str | None = None
+
+    @property
+    def normalized(self) -> str:
+        mnemonic = self.mnemonic.casefold().strip() or "?"
+        classes = ",".join(item.casefold() for item in self.operand_classes)
+        target_class = _target_class(self.target)
+        if mnemonic in {"call", "jmp", "jz", "jnz", "je", "jne", "ja", "jb", "jg", "jl"}:
+            return f"{mnemonic}|{classes}|{target_class}"
+        return f"{mnemonic}|{classes}"
+
+
+@dataclass
+class FunctionIR:
+    name: str
+    address: int
+    size: int
+    instructions: list[Instruction] = field(default_factory=list)
+
+
+def _bounded_text(value: Any, maximum: int = MAX_NAME_CHARS) -> str:
+    text = str(value) if value is not None else ""
+    text = text.replace("\x00", "")
+    if len(text) <= maximum:
+        return text
+    return text[: maximum - 14] + "...[truncated]"
+
+
+def _target_class(target: str | None) -> str:
+    if not target:
+        return "indirect"
+    lowered = target.casefold()
+    if lowered.startswith("runtime.") or lowered.startswith("internal/"):
+        return "runtime"
+    if lowered.startswith("main."):
+        return "application"
+    if any(term in lowered for term in _DYNAMIC_TERMS):
+        return "dynamic"
+    if "!" in lowered or lowered.startswith(("syscall.", "kernel32", "ntdll", "ws2_32")):
+        return "external"
+    return "named"
+
+
+def _call_family(target: str | None) -> str | None:
+    if not target:
+        return "indirect"
+    lowered = target.casefold()
+    for family, term in _SENSITIVE_TERMS:
+        if term in lowered:
+            return family
+    if any(term in lowered for term in _DYNAMIC_TERMS):
+        return "dynamic_resolution"
+    if lowered.startswith("runtime.") or lowered.startswith("internal/"):
+        return "runtime"
+    if lowered.startswith("main."):
+        return "application"
+    return "other"
+
+
+def _is_sensitive(call: Instruction) -> bool:
+    family = _call_family(call.target)
+    return family in {"network", "process", "persistence", "file", "crypto", "credential", "loader", "dynamic_resolution"}
+
+
+def _is_dynamic(call: Instruction) -> bool:
+    target = (call.target or "").casefold()
+    return not target or target == "<indirect>" or any(term in target for term in _DYNAMIC_TERMS)
+
+
+def _read_u16(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 2 > len(data):
+        raise ProfileError("truncated PE u16")
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _read_i16(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 2 > len(data):
+        raise ProfileError("truncated PE i16")
+    return struct.unpack_from("<h", data, offset)[0]
+
+
+def _read_u32(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise ProfileError("truncated PE u32")
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _read_u64(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 8 > len(data):
+        raise ProfileError("truncated PE u64")
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _decode_symbol_name(record: bytes, string_table: bytes) -> str:
+    name = record[:8]
+    if name[:4] == b"\x00\x00\x00\x00":
+        offset = struct.unpack_from("<I", name, 4)[0]
+        if offset < 4 or offset >= len(string_table):
+            return ""
+        end = string_table.find(b"\x00", offset)
+        if end < 0:
+            end = len(string_table)
+        return string_table[offset:end].decode("utf-8", errors="replace")
+    return name.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def _parse_pe(data: bytes) -> tuple[int, int, list[Section], list[Symbol], int]:
+    """Return image base, machine, sections, symbols, and entry RVA."""
+
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ProfileError("not a PE image")
+    pe_offset = _read_u32(data, 0x3C)
+    if pe_offset < 64 or pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+        raise ProfileError("malformed PE signature")
+    coff = pe_offset + 4
+    machine = _read_u16(data, coff)
+    section_count = _read_u16(data, coff + 2)
+    symbol_pointer = _read_u32(data, coff + 8)
+    symbol_count = _read_u32(data, coff + 12)
+    optional_size = _read_u16(data, coff + 16)
+    optional = coff + 20
+    if section_count < 1 or section_count > 96 or optional + optional_size > len(data):
+        raise ProfileError("malformed PE headers")
+    magic = _read_u16(data, optional)
+    if magic == 0x20B:
+        image_base = _read_u64(data, optional + 24)
+        entry_rva = _read_u32(data, optional + 16)
+    elif magic == 0x10B:
+        image_base = _read_u32(data, optional + 28)
+        entry_rva = _read_u32(data, optional + 16)
+    else:
+        raise ProfileError("unsupported PE optional header")
+
+    section_table = optional + optional_size
+    if section_table + section_count * 40 > len(data):
+        raise ProfileError("truncated PE section table")
+    sections: list[Section] = []
+    for index in range(section_count):
+        start = section_table + index * 40
+        name = data[start : start + 8].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+        virtual_size = _read_u32(data, start + 8)
+        virtual_address = _read_u32(data, start + 12)
+        raw_size = _read_u32(data, start + 16)
+        raw_offset = _read_u32(data, start + 20)
+        if raw_size and (raw_offset > len(data) or raw_offset + raw_size > len(data)):
+            raise ProfileError("PE section extends beyond file")
+        sections.append(Section(name, virtual_address, virtual_size, raw_offset, raw_size))
+
+    symbols: list[Symbol] = []
+    table_end = symbol_pointer + symbol_count * 18
+    if symbol_pointer and symbol_count and symbol_count <= 2_000_000 and table_end + 4 <= len(data):
+        string_size = _read_u32(data, table_end)
+        string_end = min(len(data), table_end + max(4, string_size))
+        string_table = data[table_end:string_end]
+        index = 0
+        while index < symbol_count:
+            record_offset = symbol_pointer + index * 18
+            if record_offset + 18 > len(data):
+                break
+            record = data[record_offset : record_offset + 18]
+            name = _decode_symbol_name(record, string_table)
+            value = _read_u32(record, 8)
+            section_number = _read_i16(record, 12)
+            aux_count = record[17]
+            if name and section_number > 0 and section_number <= len(sections):
+                section = sections[section_number - 1]
+                address = image_base + section.virtual_address + value
+                symbols.append(Symbol(name=_bounded_text(name), address=address, section=section_number, value=value))
+            index += 1 + aux_count
+
+    return image_base, machine, sections, symbols, entry_rva
+
+
+def _rva_to_file_offset(rva: int, sections: Sequence[Section]) -> int | None:
+    for section in sections:
+        if section.virtual_address <= rva < section.end_rva:
+            relative = rva - section.virtual_address
+            if relative >= section.raw_size:
+                return None
+            return section.raw_offset + relative
+    return None
+
+
+def _section_for_address(address: int, image_base: int, sections: Sequence[Section]) -> Section | None:
+    rva = address - image_base
+    for section in sections:
+        if section.virtual_address <= rva < section.end_rva:
+            return section
+    return None
+
+
+def _load_capstone(machine: int):
+    try:
+        import capstone  # type: ignore
+    except Exception as error:  # pragma: no cover - exercised in stripped images
+        raise ProfileError("Capstone is unavailable") from error
+    if machine == 0x8664:
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64), capstone
+    if machine == 0x14C:
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32), capstone
+    raise ProfileError(f"unsupported PE machine 0x{machine:x}")
+
+
+def _instruction_from_capstone(insn: Any, symbol_by_address: Mapping[int, Symbol], capstone: Any) -> Instruction:
+    operand_classes: list[str] = []
+    target_address: int | None = None
+    target: str | None = None
+    try:
+        operands = insn.operands
+    except AttributeError:
+        operands = ()
+    for operand in operands:
+        if operand.type == capstone.x86.X86_OP_REG:
+            operand_classes.append("reg")
+        elif operand.type == capstone.x86.X86_OP_IMM:
+            operand_classes.append("imm")
+            if insn.mnemonic.casefold() in {"call", "jmp", "jz", "jnz", "je", "jne", "ja", "jb", "jg", "jl"}:
+                target_address = int(operand.imm)
+                symbol = symbol_by_address.get(target_address)
+                target = symbol.name if symbol else None
+        elif operand.type == capstone.x86.X86_OP_MEM:
+            operand_classes.append("mem")
+        else:
+            operand_classes.append("other")
+    if insn.mnemonic.casefold() == "call" and target is None and "[" in insn.op_str:
+        target = "<indirect>"
+    string_value = None
+    return Instruction(
+        address=int(insn.address),
+        mnemonic=insn.mnemonic,
+        operand_classes=tuple(operand_classes),
+        target=target,
+        target_address=target_address,
+        string_value=string_value,
+    )
+
+
+def _disassemble_functions(
+    data: bytes,
+    image_base: int,
+    machine: int,
+    sections: Sequence[Section],
+    symbols: Sequence[Symbol],
+) -> list[FunctionIR]:
+    text_index = next((index for index, section in enumerate(sections, start=1) if section.name == ".text"), None)
+    if text_index is None:
+        return []
+    text_section = sections[text_index - 1]
+    text_symbols = sorted(
+        {symbol.address: symbol for symbol in symbols if symbol.section == text_index}.values(),
+        key=lambda item: (item.address, item.name),
+    )
+    app_symbols = [
+        symbol for symbol in text_symbols
+        if symbol.name.startswith("main.") and symbol.address >= image_base + text_section.virtual_address
+    ][:MAX_FUNCTIONS]
+    if not app_symbols:
+        return []
+    symbol_by_address = {symbol.address: symbol for symbol in text_symbols}
+    engine, capstone = _load_capstone(machine)
+    engine.detail = True
+    result: list[FunctionIR] = []
+    total_instructions = 0
+    text_end = image_base + text_section.virtual_address + text_section.raw_size
+    for index, symbol in enumerate(app_symbols):
+        next_address = text_end
+        for candidate in text_symbols:
+            if candidate.address > symbol.address:
+                next_address = candidate.address
+                break
+        size = min(max(0, next_address - symbol.address), MAX_FUNCTION_BYTES)
+        offset = _rva_to_file_offset(symbol.address - image_base, sections)
+        if offset is None or offset >= len(data) or size <= 0:
+            result.append(FunctionIR(symbol.name, symbol.address, 0, []))
+            continue
+        size = min(size, len(data) - offset)
+        blob = data[offset : offset + size]
+        instructions: list[Instruction] = []
+        try:
+            for raw in engine.disasm(blob, symbol.address):
+                instructions.append(_instruction_from_capstone(raw, symbol_by_address, capstone))
+                total_instructions += 1
+                if total_instructions >= MAX_TOTAL_INSTRUCTIONS:
+                    break
+        except Exception:
+            instructions = []
+        result.append(FunctionIR(symbol.name, symbol.address, size, instructions))
+        # Keep the symbol coverage record for later functions even when the
+        # global instruction cap is reached.  A missing record would make a
+        # large Go binary's late loader/crypto functions invisible to triage.
+        if total_instructions >= MAX_TOTAL_INSTRUCTIONS:
+            for remaining in app_symbols[index + 1 :]:
+                result.append(FunctionIR(remaining.name, remaining.address, 0, []))
+            break
+    return result
+
+
+def _shingle_hash(tokens: Sequence[str]) -> str:
+    payload = "\x1f".join(tokens).encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
+def _function_call_record(call: Instruction, *, repeated: bool) -> dict[str, Any]:
+    family = _call_family(call.target)
+    return {
+        "offset": f"0x{call.address:x}",
+        "target": _bounded_text(call.target or "<indirect>"),
+        "family": family,
+        "repeated": repeated,
+        "sensitive": _is_sensitive(call),
+    }
+
+
+def _reachable_functions(functions: Sequence[FunctionIR]) -> tuple[set[str], str]:
+    by_address = {function.address: function.name for function in functions}
+    by_name = {function.name: function for function in functions}
+    roots = [name for name in ("main.main", "main.init") if name in by_name]
+    if not roots:
+        return set(), "unavailable"
+    reachable: set[str] = set(roots)
+    pending = list(roots)
+    while pending:
+        current = by_name[pending.pop()]
+        for instruction in current.instructions:
+            if instruction.target_address is None:
+                continue
+            target_name = by_address.get(instruction.target_address)
+            if target_name and target_name not in reachable:
+                reachable.add(target_name)
+                pending.append(target_name)
+    has_indirect = any(
+        instruction.mnemonic.casefold() == "call" and instruction.target_address is None
+        for function in functions for instruction in function.instructions
+    )
+    return reachable, "partial" if has_indirect else "direct"
+
+
+def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, entry_rva: int = 0) -> dict[str, Any]:
+    ordered = sorted(functions, key=lambda item: (item.address, item.name))[:MAX_FUNCTIONS]
+    reachable, graph_status = _reachable_functions(ordered)
+    occurrences: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    token_cache: dict[str, list[str]] = {}
+    for function in ordered:
+        tokens = [instruction.normalized for instruction in function.instructions]
+        token_cache[function.name] = tokens
+        if len(tokens) < MAX_SHINGLE_INSTRUCTIONS:
+            continue
+        for position in range(len(tokens) - MAX_SHINGLE_INSTRUCTIONS + 1):
+            key = _shingle_hash(tokens[position : position + MAX_SHINGLE_INSTRUCTIONS])
+            occurrences[key].append((function.name, position))
+
+    clone_candidates: list[tuple[str, list[tuple[str, int]], set[str]]] = []
+    for key, sites in occurrences.items():
+        members = {name for name, _ in sites}
+        if len(sites) >= MIN_REPEAT_OCCURRENCES and len(members) >= MIN_REPEAT_FUNCTIONS:
+            clone_candidates.append((key, sites, members))
+    clone_candidates.sort(key=lambda item: (-len(item[1]), -len(item[2]), item[0]))
+    clone_candidates = clone_candidates[:MAX_CLONE_CLUSTERS]
+
+    covered_by_function: dict[str, set[int]] = defaultdict(set)
+    clone_clusters: list[dict[str, Any]] = []
+    for key, sites, members in clone_candidates:
+        for name, position in sites:
+            covered_by_function[name].update(range(position, position + MAX_SHINGLE_INSTRUCTIONS))
+        representative = min(sites, key=lambda item: (item[0], item[1]))
+        function = next(item for item in ordered if item.name == representative[0])
+        calls = [
+            instruction for index, instruction in enumerate(function.instructions)
+            if representative[1] <= index < representative[1] + MAX_SHINGLE_INSTRUCTIONS
+            and instruction.mnemonic.casefold() == "call"
+        ]
+        sensitive = any(_is_sensitive(call) for call in calls)
+        clone_clusters.append({
+            "id": "clone-" + key,
+            "representative": {
+                "function": function.name,
+                "address": f"0x{function.instructions[representative[1]].address:x}",
+            },
+            "members": sorted(members)[:MAX_CLUSTER_MEMBERS],
+            "occurrences": len(sites),
+            "instruction_count": MAX_SHINGLE_INSTRUCTIONS,
+            "clone_ratio": round(min(1.0, len(sites) * MAX_SHINGLE_INSTRUCTIONS / max(1, sum(len(item.instructions) for item in ordered))), 6),
+            "shared_calls": sorted({_bounded_text(call.target or "<indirect>") for call in calls})[:32],
+            "sensitive": sensitive,
+            "disposition": "review" if sensitive else "deprioritize_for_behavior",
+        })
+
+    function_records: list[dict[str, Any]] = []
+    all_dynamic_sites: list[dict[str, Any]] = []
+    total_instructions = 0
+    total_clone_instructions = 0
+    for function in ordered:
+        instructions = function.instructions
+        covered = covered_by_function.get(function.name, set())
+        total_instructions += len(instructions)
+        total_clone_instructions += len(covered)
+        calls: list[dict[str, Any]] = []
+        unique_strings: list[dict[str, Any]] = []
+        for index, instruction in enumerate(instructions):
+            if instruction.string_value and _STRING_INDICATOR_RE.search(instruction.string_value):
+                unique_strings.append({
+                    "offset": f"0x{instruction.address:x}",
+                    "value": _bounded_text(instruction.string_value, 512),
+                    "repeated": index in covered,
+                })
+            if instruction.mnemonic.casefold() != "call":
+                continue
+            repeated = index in covered and not _is_sensitive(instruction)
+            family = _call_family(instruction.target)
+            if family != "runtime" and (not repeated or _is_sensitive(instruction)):
+                record = _function_call_record(instruction, repeated=index in covered)
+                calls.append(record)
+                if _is_dynamic(instruction):
+                    all_dynamic_sites.append({
+                        "function": function.name,
+                        "offset": record["offset"],
+                        "target": record["target"],
+                        "family": record["family"],
+                        "resolved": (
+                            record["target"] != "<indirect>"
+                            and not any(term in record["target"].casefold() for term in _DYNAMIC_TERMS)
+                        ),
+                    })
+            if len(calls) >= MAX_CALLS_PER_FUNCTION:
+                break
+        unique_strings = unique_strings[:MAX_STRINGS_PER_FUNCTION]
+        residue_count = max(0, len(instructions) - len(covered))
+        sensitive_count = sum(1 for item in calls if item["sensitive"])
+        dynamic_count = sum(1 for item in calls if item["family"] == "dynamic_resolution")
+        priority_score = (
+            (4 * sensitive_count)
+            + (3 * dynamic_count)
+            + len(calls)
+            + (2 if function.name in reachable else 0)
+            + (1 if unique_strings else 0)
+        )
+        priority = "high" if priority_score >= 4 else "medium" if priority_score >= 2 else "low"
+        function_records.append({
+            "name": function.name,
+            "address": f"0x{function.address:x}",
+            "size": function.size,
+            "reachable": function.name in reachable,
+            "instruction_count": len(instructions),
+            "clone_instruction_count": len(covered),
+            "clone_ratio": round(len(covered) / max(1, len(instructions)), 6),
+            "unique_residue_instruction_count": residue_count,
+            "unique_residue_ratio": round(residue_count / max(1, len(instructions)), 6),
+            "unique_calls": calls,
+            "unique_strings": unique_strings,
+            "priority_score": priority_score,
+            "priority": priority,
+        })
+    function_records.sort(key=lambda item: (-int(item["priority_score"]), not bool(item["reachable"]), item["name"], item["address"]))
+    clone_dominated = bool(clone_clusters) and (
+        total_clone_instructions / max(1, total_instructions) >= 0.20
+        or any(item["clone_ratio"] >= 0.35 for item in function_records)
+    )
+    unresolved_dynamic = [item for item in all_dynamic_sites if not item["resolved"] or item["family"] == "dynamic_resolution"]
+    negative_blocked = bool(unresolved_dynamic) or graph_status != "direct"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "detected": True,
+        "status": "ok",
+        "image_base": f"0x{image_base:x}",
+        "entry_rva": f"0x{entry_rva:x}",
+        "roots": sorted(name for name in ("main.main", "main.init") if name in {item["name"] for item in function_records}),
+        "function_count": len(function_records),
+        "reachable_main_functions": sorted(reachable),
+        "graph_status": graph_status,
+        "clone_dominated": clone_dominated,
+        "clone_clusters": clone_clusters,
+        "functions": function_records,
+        "dynamic_resolution": {
+            "sites": unresolved_dynamic[:MAX_CALLS_PER_FUNCTION * 4],
+            "unresolved_count": len(unresolved_dynamic),
+            "negative_capability_claims_blocked": negative_blocked,
+        },
+        "coverage_status": "partial" if clone_dominated or negative_blocked else "direct",
+        "analysis_limits": {
+            "max_functions": MAX_FUNCTIONS,
+            "max_total_instructions": MAX_TOTAL_INSTRUCTIONS,
+            "shingle_instructions": MAX_SHINGLE_INSTRUCTIONS,
+        },
+    }
+
+
+def profile_bytes(data: bytes) -> dict[str, Any]:
+    """Profile one inert PE byte string and return bounded JSON-compatible data."""
+
+    if len(data) > MAX_INPUT_BYTES:
+        raise ProfileError(f"input exceeds {MAX_INPUT_BYTES}-byte safety limit")
+    try:
+        image_base, machine, sections, symbols, entry_rva = _parse_pe(data)
+    except ProfileError as error:
+        if str(error) == "not a PE image":
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "tool": TOOL_NAME,
+                "tool_version": TOOL_VERSION,
+                "detected": False,
+                "status": "not_pe",
+                "reason": "input is not a Portable Executable",
+            }
+        raise
+    has_go_markers = any(symbol.name in {"go:buildid", "runtime.text", "runtime.main"} for symbol in symbols)
+    app_symbols = [symbol for symbol in symbols if symbol.name.startswith("main.")]
+    if not has_go_markers or not app_symbols:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "detected": False,
+            "status": "not_go",
+            "reason": "Go runtime markers or main.* application symbols were not found",
+            "symbol_count": len(symbols),
+        }
+    functions = _disassemble_functions(data, image_base, machine, sections, symbols)
+    if not functions:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+            "detected": True,
+            "status": "partial",
+            "reason": "Go markers found but no disassemblable main.* functions were available",
+            "image_base": f"0x{image_base:x}",
+            "entry_rva": f"0x{entry_rva:x}",
+            "function_count": 0,
+            "dynamic_resolution": {
+                "sites": [],
+                "unresolved_count": 0,
+                "negative_capability_claims_blocked": True,
+            },
+        }
+    return _profile_functions(functions, image_base=image_base, entry_rva=entry_rva)
+
+
+def _bounded_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply a final deterministic output cap without changing semantics."""
+
+    value = json.loads(json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    if isinstance(value.get("functions"), list):
+        value["functions"] = value["functions"][:MAX_FUNCTIONS]
+        for function in value["functions"]:
+            if isinstance(function, dict):
+                function["unique_calls"] = function.get("unique_calls", [])[:MAX_CALLS_PER_FUNCTION]
+                function["unique_strings"] = function.get("unique_strings", [])[:MAX_STRINGS_PER_FUNCTION]
+    if isinstance(value.get("clone_clusters"), list):
+        value["clone_clusters"] = value["clone_clusters"][:MAX_CLONE_CLUSTERS]
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return value
+    # Keep the deterministic summary and the highest-priority functions.  A
+    # caller can rerun the fixed static command for deeper, bounded slices.
+    value["output_truncated"] = True
+    value["functions"] = value.get("functions", [])[:64]
+    value["clone_clusters"] = value.get("clone_clusters", [])[:32]
+    for function in value.get("functions", []):
+        function["unique_calls"] = function.get("unique_calls", [])[:16]
+        function["unique_strings"] = function.get("unique_strings", [])[:8]
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return value
+    # This final fallback is intentionally valid, versioned JSON and retains
+    # the safety-relevant gate even for an unusually pathological symbol set.
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "detected": bool(value.get("detected")),
+        "status": "partial",
+        "output_truncated": True,
+        "clone_dominated": bool(value.get("clone_dominated")),
+        "dynamic_resolution": value.get("dynamic_resolution", {
+            "sites": [], "unresolved_count": 0, "negative_capability_claims_blocked": True,
+        }),
+        "coverage_status": "partial",
+    }
+
+
+def profile_file(path: str | Path) -> dict[str, Any]:
+    selected = Path(path)
+    if not selected.is_absolute():
+        raise ProfileError("input path must be absolute")
+    try:
+        info = selected.stat()
+    except OSError as error:
+        raise ProfileError("could not stat input") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise ProfileError("input is not a regular file")
+    if info.st_size > MAX_INPUT_BYTES:
+        raise ProfileError(f"input exceeds {MAX_INPUT_BYTES}-byte safety limit")
+    try:
+        data = selected.read_bytes()
+    except (OSError, MemoryError) as error:
+        raise ProfileError("could not read input") from error
+    return profile_bytes(data)
+
+
+def _error_profile(message: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "detected": False,
+        "status": "error",
+        "reason": _bounded_text(message, 500),
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog=TOOL_NAME, description="Bounded static Go clone/residue profile")
+    parser.add_argument("sample", help="absolute PE path")
+    args = parser.parse_args(argv)
+    try:
+        profile = profile_file(args.sample)
+        output = _bounded_profile(profile)
+        encoded = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        sys.stdout.write(encoded + "\n")
+        return 0
+    except (ProfileError, OSError, MemoryError) as error:
+        sys.stdout.write(json.dumps(_error_profile(str(error)), sort_keys=True, separators=(",", ":")) + "\n")
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by container integration
+    raise SystemExit(main())

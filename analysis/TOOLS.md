@@ -11,7 +11,12 @@ debug them.
 - `file`, `rabin2`, `readpe`, `pedis`, `pescan`, `pepack`, `peres`, `pehash`:
   identify formats and inspect PE headers, sections, imports, resources,
   signatures, hashes, and packing indicators.
-- `capa`: identify executable capabilities using Mandiant capa rules.
+- `capa`: identify executable capabilities using the vendored Mandiant capa
+  9.4.0 rules at `/opt/jaq/capa-rules` and signatures at
+  `/opt/jaq/capa-signatures`. JAQ's `capa` wrapper supplies both paths by
+  default, while preserving explicit `--rules`/`--signatures` overrides. The
+  assets are included in the image and are never fetched at runtime. Capa is a
+  static scanner and does not execute the sample.
 - `yara`: local pattern matching. No network-backed rule retrieval is present.
 - `binwalk`, `bsdtar`, `7z`, `unzip`, `cabextract`, `innoextract`, `msiinfo`,
   `msiextract`: locate and extract appended archives, resources, installers,
@@ -29,6 +34,16 @@ debug them.
   additional object, PE/COFF, PDB, and debug-data inspection.
 - `upx`: identify/test/unpack UPX containers into `/work`; never run the
   unpacked output.
+
+## Go
+
+- `go-profile /input/sample.exe`: deterministic, bounded static profiling of
+  Go `main.*` functions. It fingerprints repeated instruction shingles,
+  separates clone-heavy regions from unique call residue, builds a conservative
+  direct-call graph, and prioritizes unresolved loader, syscall, callback,
+  network, process, file, registry, credential, and crypto sites. Its JSON
+  output calls repeated code a clone candidate rather than assuming it is junk
+  or program purpose. JAQ records this profile automatically before model work.
 
 ## Python and PyInstaller
 
@@ -57,6 +72,12 @@ debug them.
 - `openssl`, `base64`, `xxd`, `jq`, `sqlite3`, `zstd`, `lz4`, `xz`, `bzip2`:
   common crypto, encoding, structured-data, database, and compression work.
 - `rg`: fast searching across recovered text and generated disassembly.
+
+Commands run through JAQ's shell facade use Bash with `pipefail` enabled via
+`BASH_ENV=/etc/jaq/bash-env`. A failed stage in a pipeline therefore remains a
+failed command. Keep the capa exit status visible; for example, use
+`capa --quiet --json /input/sample.exe` directly, or use a pipeline only when
+its final status is checked.
 
 ## Deliberately absent
 

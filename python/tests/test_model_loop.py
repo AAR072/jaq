@@ -75,8 +75,8 @@ def final_claims():
             {
                 "schema_version": "1.0",
                 "id": "claim-1",
-                "classification": "benign",
-                "explanation": "The fixture contains no suspicious behavior in the cited record.",
+                "classification": "observed fixture behavior",
+                "explanation": "The fixture contains deterministic behavior in the cited record.",
                 "confidence": 0.8,
                 "evidence_ids": ["obs-1"],
                 "asset_role": "primary",

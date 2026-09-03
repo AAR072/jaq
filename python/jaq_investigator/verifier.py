@@ -20,6 +20,66 @@ from .schemas import (
 )
 
 
+_ABBREVIATED_HASH_RE = re.compile(
+    r"\b(?:sha(?:-?256)?|sha(?:-?1)|md5)\s*[:=]?\s*`?"
+    r"([0-9a-fA-F]{8,63})(?:…|\.\.\.)([0-9a-fA-F]{4,63})`?",
+    re.IGNORECASE,
+)
+_BENIGN_CONCLUSION_RE = re.compile(
+    r"\b(?:benign|harmless|safe|non[- ]malicious)\b",
+    re.IGNORECASE,
+)
+_NO_CRYPTO_RE = re.compile(
+    r"\b(?:no|without)\b[^\n.]{0,100}\b(?:crypto(?:graphic)?|encryption)(?:\s+routine)?\b",
+    re.IGNORECASE,
+)
+_APP_CRYPTO_CALL_RE = re.compile(
+    r"(?:main\.[^\n]{0,300}(?:calls?:|call)[^\n]{0,300}crypto/|call\s+crypto/)",
+    re.IGNORECASE,
+)
+_NEGATIVE_CAPABILITY_RE = re.compile(
+    r"\b(?:no|without)\b[^\n.]{0,120}\b(?:network|phone[- ]home|c2|command(?:[- ]and[- ]control)?|"
+    r"exfiltrat(?:e|ion)|persist(?:ence|ent)|inject(?:ion)?|credential access|crypto(?:graphic)?|encryption)\b",
+    re.IGNORECASE,
+)
+_APP_DYNAMIC_RESOLUTION_RE = re.compile(
+    r"main\.[^\n]{0,400}(?:lazyproc|syscalln|getprocaddress|loadlibrary|newcallback)",
+    re.IGNORECASE,
+)
+_DOMINANT_BEHAVIOR_RE = re.compile(
+    r"\b(?:dominant|primary)\b[^\n.]{0,60}\b(?:workload|purpose|behavio(?:u)?r)\b|"
+    r"\bprogram(?:'s)?\s+(?:actual\s+)?purpose\b",
+    re.IGNORECASE,
+)
+_QUALIFIED_NEGATIVE_RE = re.compile(
+    r"\b(?:no evidence (?:was )?recovered|not recovered in (?:the )?analy[sz]ed paths|"
+    r"no [^\n.]{0,80} (?:was|were) recovered in (?:the )?analy[sz]ed paths)\b",
+    re.IGNORECASE,
+)
+
+
+def _go_behavior_profile(store: EvidenceStore) -> tuple[str, Mapping[str, Any]] | None:
+    for observation in store.observations:
+        if (
+            observation.type != "static-sandbox.tool_result"
+            or observation.metadata.get("tool_name") != "go_profile_static_scan"
+            or observation.metadata.get("status") != "ok"
+        ):
+            continue
+        value = observation.normalized_value
+        result = value.get("result") if isinstance(value, Mapping) else None
+        stdout = result.get("stdout") if isinstance(result, Mapping) else None
+        if not isinstance(stdout, str):
+            continue
+        try:
+            profile = json.loads(stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(profile, Mapping) and profile.get("schema_version") == "1.0":
+            return observation.id, profile
+    return None
+
+
 def _claim_id_hint(value: Any) -> str:
     if isinstance(value, Claim):
         return value.id
@@ -77,6 +137,82 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
     unsupported_values = sorted(value for value in exact_values if value.lower().rstrip(".,);") not in cited_text)
     if unsupported_values:
         return _result(normalized, "rejected", ("exact value absent from cited evidence: " + ", ".join(unsupported_values[:10]),))
+
+    abbreviated = _ABBREVIATED_HASH_RE.findall(normalized.explanation)
+    cited_hashes = set(re.findall(r"\b[0-9a-f]{64}\b", cited_text))
+    unsupported_abbreviated = [
+        prefix + "…" + suffix
+        for prefix, suffix in abbreviated
+        if not any(
+            digest.startswith(prefix.casefold())
+            and digest.endswith(suffix.casefold())
+            and digest in cited_text
+            for digest in cited_hashes
+        )
+    ]
+    if unsupported_abbreviated:
+        return _result(
+            normalized,
+            "rejected",
+            ("abbreviated hash absent from cited evidence: " + ", ".join(unsupported_abbreviated[:10]),),
+        )
+
+    narrative = normalized.classification + "\n" + normalized.explanation
+    go_profile = _go_behavior_profile(store)
+    if (
+        go_profile is not None
+        and go_profile[1].get("clone_dominated") is True
+        and _DOMINANT_BEHAVIOR_RE.search(narrative)
+        and (
+            go_profile[0] not in normalized.evidence_ids
+            or "unique residue" not in narrative.casefold()
+        )
+    ):
+        return _result(
+            normalized,
+            "unclear",
+            ("clone-dominated Go code cannot establish dominant behavior without citing the deterministic profile and unique residue analysis",),
+        )
+    if _NO_CRYPTO_RE.search(narrative):
+        crypto_evidence = "\n".join(
+            json.dumps(item.to_dict(), ensure_ascii=False, sort_keys=True)
+            for item in store.search("crypto/", limit=100)
+        )
+        if _APP_CRYPTO_CALL_RE.search(crypto_evidence):
+            return _result(
+                normalized,
+                "unclear",
+                ("negative cryptography conclusion conflicts with an application-owned crypto call in persisted evidence",),
+            )
+
+    if _NEGATIVE_CAPABILITY_RE.search(narrative):
+        if not _QUALIFIED_NEGATIVE_RE.search(narrative):
+            return _result(
+                normalized,
+                "unclear",
+                ("categorical negative capability claims must be scoped as not recovered in the analyzed paths",),
+            )
+        dynamic_evidence = "\n".join(
+            json.dumps(item.to_dict(), ensure_ascii=False, sort_keys=True)
+            for item in store.search("LazyProc", limit=100)
+        )
+        analyzer_failed = any(
+            item.type.endswith("tool_result") and item.metadata.get("status") in {"error", "timeout"}
+            for item in store.observations
+        )
+        if _APP_DYNAMIC_RESOLUTION_RE.search(dynamic_evidence) or analyzer_failed:
+            return _result(
+                normalized,
+                "unclear",
+                ("negative capability conclusion is not conclusive while application dynamic resolution or analyzer failures remain",),
+            )
+
+    if _BENIGN_CONCLUSION_RE.search(narrative):
+        return _result(
+            normalized,
+            "unclear",
+            ("static evidence may describe observed behavior but cannot certify a binary as benign, harmless, safe, or non-malicious",),
+        )
 
     reachability = normalized.reachability
     missing_path = [

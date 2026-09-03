@@ -54,6 +54,17 @@ class FakeSandbox:
         self.closed = True
 
 
+class BrokenCapaSandbox(FakeSandbox):
+    def run(self, command, timeout_seconds=60, max_output_bytes=65536):
+        if "capa --version" in command:
+            self.commands.append(command)
+            return SandboxResult(
+                command, ("docker", "exec"), 0,
+                "ERROR capa: default embedded rules not found!\n", "", 0.01,
+            )
+        return super().run(command, timeout_seconds, max_output_bytes)
+
+
 class RuntimeTest(unittest.TestCase):
     def store(self):
         directory = TemporaryDirectory()
@@ -81,9 +92,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(store.get(radare["observation_id"]))
         self.assertTrue(store.get(command["observation_id"]))
         lines = path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 9)  # native + request/result for version, open, r2, command
+        self.assertEqual(len(lines), 13)  # native + request/result for version, capa, Go profile, open, r2, command
         self.assertEqual(mcp.calls[0], ("open_file", {"file_path": "/input/sample.exe"}))
-        self.assertEqual(sandbox.commands, ["radare2 -v", "python3 -c 'print(1)'"])
+        self.assertEqual(sandbox.commands, [
+            "radare2 -v",
+            "test $(find /opt/jaq/capa-rules -type f -name '*.yml' | wc -l) -ge 1000 && test $(find /opt/jaq/capa-signatures -type f -name '*.sig' | wc -l) -eq 3 && capa --version",
+            "go-profile /input/sample.exe",
+            "python3 -c 'print(1)'",
+        ])
         runtime.close()
         self.assertTrue(mcp.closed and sandbox.closed)
 
@@ -99,6 +115,23 @@ class RuntimeTest(unittest.TestCase):
         self.assertIn("r2_decompile_function", names)
         self.assertNotIn("run_command", names)
         runtime.close()
+
+    def test_fatal_capa_diagnostic_is_error_even_with_zero_exit(self):
+        store, _ = self.store()
+        sandbox = BrokenCapaSandbox()
+        with self.assertRaisesRegex(RuntimeError, "capa health check failed"):
+            StaticToolRuntime(
+                container="jaq-sandbox-test", evidence=store, sample_sha256="a" * 64,
+                radare_version="6.2.0", mcp_version="1.8.6",
+                mcp_client=FakeMCP(), sandbox=sandbox,
+            )
+        capa_results = [
+            item for item in store.observations
+            if item.metadata.get("tool_name") == "capa_health_check" and item.type.endswith("tool_result")
+        ]
+        self.assertEqual(len(capa_results), 1)
+        self.assertEqual(capa_results[0].metadata["status"], "error")
+        self.assertTrue(sandbox.closed)
 
     def test_tool_arguments_are_strictly_typed_and_bounded(self):
         store, _ = self.store()

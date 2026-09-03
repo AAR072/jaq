@@ -42,6 +42,11 @@ RUN git clone --branch 1.8.6 --depth 1 \
 
 ARG PYTHON314_VERSION=3.14.7
 ARG PYTHON314_SHA256=3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81
+ARG CAPA_RULES_VERSION=9.4.0
+ARG CAPA_RULES_COMMIT=2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80
+ARG CAPA_RULES_SHA256=d18c5d57c3ab2089a54ca95da2b54d83ccb7dbc6c9db071f47d3f6c4afe703de
+ARG CAPA_SOURCE_COMMIT=7a79f799a70f052e8382cdbeaec8115daba14a5b
+ARG CAPA_SOURCE_SHA256=89a4ef8d6c11c822c4cfff5d2d42171dde1ebac5d563a1d7ff49adbcd4f22a0a
 
 RUN mkdir -p /build/python314 \
     && curl --fail --location --proto '=https' --tlsv1.2 \
@@ -58,6 +63,30 @@ RUN mkdir -p /build/python314 \
     && /opt/python314/bin/python3.14 -c 'import dis, marshal; print(marshal.version)' \
     && rm -rf /build/python314 /tmp/Python-${PYTHON314_VERSION}.tar.xz
 
+RUN mkdir -p /opt/jaq/capa-rules \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/capa-rules-${CAPA_RULES_VERSION}.tar.gz \
+        https://github.com/mandiant/capa-rules/archive/${CAPA_RULES_COMMIT}.tar.gz \
+    && echo "${CAPA_RULES_SHA256}  /tmp/capa-rules-${CAPA_RULES_VERSION}.tar.gz" \
+        | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/capa-rules-${CAPA_RULES_VERSION}.tar.gz \
+        --strip-components=1 --directory /opt/jaq/capa-rules \
+    && test -s /opt/jaq/capa-rules/README.md \
+    && test "$(find /opt/jaq/capa-rules -type f -name '*.yml' | wc -l)" -ge 1000 \
+    && rm -f /tmp/capa-rules-${CAPA_RULES_VERSION}.tar.gz
+
+RUN mkdir -p /build/capa-source /opt/jaq/capa-signatures \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/capa-${CAPA_RULES_VERSION}.tar.gz \
+        https://github.com/mandiant/capa/archive/${CAPA_SOURCE_COMMIT}.tar.gz \
+    && echo "${CAPA_SOURCE_SHA256}  /tmp/capa-${CAPA_RULES_VERSION}.tar.gz" \
+        | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/capa-${CAPA_RULES_VERSION}.tar.gz \
+        --strip-components=1 --directory /build/capa-source \
+    && install -m 0444 /build/capa-source/sigs/*.sig /opt/jaq/capa-signatures/ \
+    && test "$(find /opt/jaq/capa-signatures -type f -name '*.sig' | wc -l)" -eq 3 \
+    && rm -rf /build/capa-source /tmp/capa-${CAPA_RULES_VERSION}.tar.gz
+
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
 LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
@@ -71,7 +100,12 @@ LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
       org.opencontainers.image.r2mcp.commit="d74b6b9855622c9a7070165b1961262afd686a3f" \
       org.opencontainers.image.python314.version="3.14.7" \
       org.opencontainers.image.pyinstxtractor-ng.version="2026.7.3" \
-      org.opencontainers.image.capa.version="9.4.0"
+      org.opencontainers.image.capa.version="9.4.0" \
+      org.opencontainers.image.capa-rules.version="9.4.0" \
+      org.opencontainers.image.capa-rules.commit="2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80" \
+      org.opencontainers.image.capa-rules.archive-sha256="d18c5d57c3ab2089a54ca95da2b54d83ccb7dbc6c9db071f47d3f6c4afe703de" \
+      org.opencontainers.image.capa.source-commit="7a79f799a70f052e8382cdbeaec8115daba14a5b" \
+      org.opencontainers.image.capa.source-archive-sha256="89a4ef8d6c11c822c4cfff5d2d42171dde1ebac5d563a1d7ff49adbcd4f22a0a"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -91,14 +125,19 @@ RUN apt-get update \
 COPY --from=build /opt/r2 /opt/r2
 COPY --from=build /opt/r2mcp /opt/r2mcp
 COPY --from=build /opt/python314 /opt/python314
+COPY --from=build /opt/jaq/capa-rules /opt/jaq/capa-rules
+COPY --from=build /opt/jaq/capa-signatures /opt/jaq/capa-signatures
 COPY requirements-static.txt /opt/jaq/requirements-static.txt
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check pip==26.2.1 \
     && python3 -m pip install --no-cache-dir --disable-pip-version-check \
         --requirement /opt/jaq/requirements-static.txt \
     && python3 -m pip check \
-    && python3 -m pip freeze > /opt/jaq/requirements-resolved.txt
+    && python3 -m pip freeze > /opt/jaq/requirements-resolved.txt \
+    && mv /usr/local/bin/capa /usr/local/bin/capa-real
 COPY --chmod=0555 entrypoint.sh /opt/jaq/entrypoint.sh
 COPY --chmod=0444 TOOLS.md /opt/jaq/TOOLS.md
+COPY --chmod=0555 capa /usr/local/bin/capa
+COPY --chmod=0555 go-profile /usr/local/bin/go-profile
 COPY --chmod=0555 jaq-tools /usr/local/bin/jaq-tools
 COPY --chmod=0555 pyc-disasm /usr/local/bin/pyc-disasm
 
@@ -121,21 +160,29 @@ RUN rm -f \
         /usr/lib/llvm-*/bin/llvm-jitlink* \
         /usr/lib/llvm-*/bin/llvm-rtdyld* \
         /usr/lib/llvm-*/bin/opt* \
+    && install --directory --mode=0555 /etc/jaq \
+    && printf '%s\n' 'set -o pipefail' > /etc/jaq/bash-env \
+    && chmod 0444 /etc/jaq/bash-env \
     && printf '%s\n' /opt/r2/lib > /etc/ld.so.conf.d/jaq-radare2.conf \
     && ldconfig \
     && /opt/r2/bin/r2 -v \
     && /opt/r2mcp/bin/r2mcp -v \
     && /opt/python314/bin/python3.14 --version \
     && python3 -c 'import capstone, dncil, dnfile, malduck, pefile, r2pipe, xdis' \
+    && test "$(find /opt/jaq/capa-rules -type f -name '*.yml' | wc -l)" -ge 1000 \
+    && capa --quiet --json /bin/true > /tmp/jaq-capa-smoke.json \
+    && python3 -c 'import json; json.load(open("/tmp/jaq-capa-smoke.json"))' \
     && command -v binwalk bsdtar capa innoextract llvm-objdump msiextract \
-        pyinstxtractor-ng pydisasm readpe upx yara \
+        go-profile pyinstxtractor-ng pydisasm readpe upx yara \
+    && go-profile --help >/dev/null \
     && pyc-disasm --help >/dev/null \
     && jaq-tools >/dev/null \
     && ldd /opt/r2mcp/bin/r2mcp
 
 ENV PATH=/opt/r2/bin:/opt/r2mcp/bin:${PATH} \
     HOME=/work \
-    JAQ_TOOLS_MANIFEST=/opt/jaq/TOOLS.md
+    JAQ_TOOLS_MANIFEST=/opt/jaq/TOOLS.md \
+    BASH_ENV=/etc/jaq/bash-env
 
 USER 65532:65532
 WORKDIR /work

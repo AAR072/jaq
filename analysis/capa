@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+has_rules=0
+has_signatures=0
+for argument in "$@"; do
+    case "$argument" in
+        -r|--rules|-r=*|--rules=*) has_rules=1 ;;
+        -s|--signatures|-s=*|--signatures=*) has_signatures=1 ;;
+    esac
+done
+
+if [ "$has_signatures" -eq 0 ]; then
+    set -- --signatures /opt/jaq/capa-signatures "$@"
+fi
+if [ "$has_rules" -eq 0 ]; then
+    set -- --rules /opt/jaq/capa-rules "$@"
+fi
+exec /usr/local/bin/capa-real "$@"
