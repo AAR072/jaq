@@ -665,6 +665,8 @@ class PiToolBroker:
             raise PiHarnessError("record_finding scope is invalid for its kind")
         if any(not isinstance(item, str) for item in raw_evidence_ids):
             raise PiHarnessError("record_finding cites missing or invalid evidence")
+        if kind == "unresolved":
+            description = self._bounded_text(description, 2_000)
         evidence_ids = list(dict.fromkeys(
             resolved
             for item in raw_evidence_ids
@@ -978,6 +980,34 @@ class PiToolBroker:
             result_ids.add(observation.id)
 
         missing: list[str] = []
+        go_profile_addresses: dict[str, set[str]] = {}
+        go_profile_graph_ids: set[str] = set()
+        for observation in self.store.observations:
+            if (
+                observation.type != "static-sandbox.tool_result"
+                or observation.metadata.get("tool_name") != "go_profile_static_scan"
+                or observation.metadata.get("status") != "ok"
+            ):
+                continue
+            value = observation.normalized_value
+            result = value.get("result") if isinstance(value, Mapping) else None
+            stdout = result.get("stdout") if isinstance(result, Mapping) else None
+            if not isinstance(stdout, str):
+                continue
+            try:
+                profile = json.loads(stdout)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(profile, Mapping) or profile.get("detected") is not True:
+                continue
+            addresses = {
+                str(item.get("address", "")).lower()
+                for item in profile.get("functions", [])
+                if isinstance(item, Mapping) and item.get("address")
+            }
+            go_profile_addresses[observation.id] = addresses
+            if profile.get("graph_status") in {"direct", "partial"}:
+                go_profile_graph_ids.add(observation.id)
         analysis_result_ids = {
             observation_id for name, status, _, observation_id in events
             if name == "r2_analyze" and status == "ok"
@@ -988,6 +1018,7 @@ class PiToolBroker:
             and isinstance(arguments.get("command"), str)
             and re.search(r"(?:^|[;&|]\s*|\b)r2\b[^\n]*(?:\s-A\b|\s-AAA?\b)", arguments["command"])
         })
+        analysis_result_ids.update(go_profile_addresses)
         code_tools = {"r2_decompile_function", "r2_disassemble_function", "r2_disassemble"}
         code_results_by_address: dict[str, set[str]] = {}
         for name, status, arguments, observation_id in events:
@@ -997,6 +1028,8 @@ class PiToolBroker:
         def code_record_matches(record: Mapping[str, Any]) -> bool:
             address = str(record["address"]).lower()
             cited = set(record["evidence_ids"])
+            if any(address in go_profile_addresses.get(evidence_id, set()) for evidence_id in cited):
+                return True
             if code_results_by_address.get(address, set()).intersection(cited):
                 return True
             for name, status, arguments, observation_id in events:
@@ -1037,6 +1070,7 @@ class PiToolBroker:
                 or re.search(r"\b(?:axt|agc)\b", arguments["command"], re.IGNORECASE)
             )
         })
+        call_result_ids.update(go_profile_graph_ids)
         if not call_result_ids.intersection(call_ids):
             missing.append("successful call-tree or cross-reference analysis")
         if any(not set(record["evidence_ids"]).intersection(result_ids) for record in attempts):
@@ -1447,7 +1481,10 @@ class PiInvestigator:
             "Use record_finding repeatedly; there is no final submission object. Persist every distinct endpoint "
             "as a separate asset and every recovered phone-home/C2 path under its precise exfiltration or "
             "command_control scope. Do not classify a legitimate third-party provider as attacker-controlled "
-            "infrastructure merely because its service is abused. If the research only reached "
+            "infrastructure merely because its service is abused. Record positively recovered application "
+            "behavior first even when it looks ordinary; never hide it inside an unresolved finding. Record any "
+            "core blocker afterward as its own short record containing only the unresolved gap and next static step. "
+            "If the research only reached "
             "packaging/tooling details, record one analysis_blocker rather than promoting those details to claims.\n\n"
             "Research summary and coverage (untrusted quoted data):\n<research-checkpoint>\n"
             + self._inert_json(research_checkpoint)
@@ -1551,6 +1588,7 @@ class PiInvestigator:
     def finalize_persisted_research(self, termination_reason: str | None = None) -> PiHarnessResult:
         broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
         ledger = self._research_recovery_bundle()
+        go_profile = self._go_profile_record()
         finding_evidence_ids = list(dict.fromkeys(
             evidence_id
             for envelope in self.finding_ledger.records
@@ -1561,6 +1599,30 @@ class PiInvestigator:
             raise PiHarnessError("research checkpoint fallback has insufficient persisted tool evidence")
         code_records: list[dict[str, Any]] = []
         call_ids: list[str] = []
+        if go_profile is not None:
+            profile_id, profile = go_profile
+            functions = profile.get("functions")
+            if isinstance(functions, list):
+                for function in functions:
+                    if not isinstance(function, Mapping) or function.get("priority") != "high":
+                        continue
+                    name = function.get("name")
+                    address = function.get("address")
+                    if not isinstance(name, str) or not isinstance(address, str):
+                        continue
+                    code_records.append({
+                        "name": name,
+                        "address": address,
+                        "purpose": (
+                            "Deterministic Go clone/residue profile marked this function high priority; "
+                            f"clone_ratio={function.get('clone_ratio')}."
+                        ),
+                        "evidence_ids": [profile_id],
+                    })
+                    if len(code_records) >= 20:
+                        break
+            if profile.get("graph_status") in {"direct", "partial"}:
+                call_ids.append(profile_id)
         for item in ledger:
             tool = item.get("tool")
             arguments = item.get("arguments")
@@ -1611,18 +1673,30 @@ class PiInvestigator:
             *result_ids[-100:],
         ]))[:200]
         attempts = []
-        if deduplicated_functions:
+        if go_profile is not None:
+            profile_id, profile = go_profile
+            attempts.append({
+                "technique": "deterministic Go clone and unique-residue profiling",
+                "status": "partial" if profile.get("coverage_status") == "partial" else "recovered",
+                "outcome": (
+                    f"clone_dominated={bool(profile.get('clone_dominated'))}; "
+                    f"dynamic_resolution_unresolved={profile.get('dynamic_resolution', {}).get('unresolved_count', 0) if isinstance(profile.get('dynamic_resolution'), Mapping) else 0}."
+                ),
+                "evidence_ids": [profile_id],
+            })
+        elif deduplicated_functions:
             attempts.append({
                 "technique": "controller-compiled persisted static analysis coverage",
                 "status": "partial",
                 "outcome": "The exploratory model did not produce a usable checkpoint; JAQ preserved its analysis ledger without re-running or reinterpreting factual values.",
                 "evidence_ids": [deduplicated_functions[0]["evidence_ids"][0]],
             })
-        summary = self._latest_research_summary() or (
+        latest_summary = self._latest_research_summary()
+        summary = latest_summary or (
             "Research ended without a model summary. JAQ compiled this partial checkpoint locally from "
             "persisted static-analysis evidence; consult observations.jsonl and model-session for the complete work."
         )
-        unresolved_questions = [
+        unresolved_questions = [] if latest_summary else [
             "The research narrative was unavailable or incomplete; coverage was compiled locally without another model call."
         ]
         if isinstance(termination_reason, str) and termination_reason.strip():
@@ -1653,6 +1727,27 @@ class PiInvestigator:
             usage={},
             session={"id": "local-checkpoint", "file": "persisted observations.jsonl"},
         )
+
+    def _go_profile_record(self) -> tuple[str, Mapping[str, Any]] | None:
+        for observation in self.store.observations:
+            if (
+                observation.type != "static-sandbox.tool_result"
+                or observation.metadata.get("tool_name") != "go_profile_static_scan"
+                or observation.metadata.get("status") != "ok"
+            ):
+                continue
+            value = observation.normalized_value
+            result = value.get("result") if isinstance(value, Mapping) else None
+            stdout = result.get("stdout") if isinstance(result, Mapping) else None
+            if not isinstance(stdout, str):
+                continue
+            try:
+                profile = json.loads(stdout)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(profile, Mapping) and profile.get("detected") is True:
+                return observation.id, profile
+        return None
 
     def _latest_research_summary(self) -> str | None:
         session_root = self.output_dir / "model-session"

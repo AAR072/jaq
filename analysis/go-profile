@@ -72,7 +72,7 @@ _SENSITIVE_TERMS: tuple[tuple[str, str], ...] = (
     ("file", "writefile"),
     ("file", "deletefile"),
     ("crypto", "aes"),
-    ("crypto", "sha"),
+    ("crypto", "crypto/sha"),
     ("crypto", "crypt"),
     ("credential", "username"),
     ("credential", "password"),
@@ -197,7 +197,7 @@ def _is_sensitive(call: Instruction) -> bool:
 
 def _is_dynamic(call: Instruction) -> bool:
     target = (call.target or "").casefold()
-    return not target or target == "<indirect>" or any(term in target for term in _DYNAMIC_TERMS)
+    return bool(target) and target != "<indirect>" and any(term in target for term in _DYNAMIC_TERMS)
 
 
 def _read_u16(data: bytes, offset: int) -> int:
@@ -527,7 +527,9 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
         covered = covered_by_function.get(function.name, set())
         total_instructions += len(instructions)
         total_clone_instructions += len(covered)
-        calls: list[dict[str, Any]] = []
+        meaningful_calls: list[dict[str, Any]] = []
+        indirect_samples: list[dict[str, Any]] = []
+        indirect_call_count = 0
         unique_strings: list[dict[str, Any]] = []
         for index, instruction in enumerate(instructions):
             if instruction.string_value and _STRING_INDICATOR_RE.search(instruction.string_value):
@@ -542,7 +544,12 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
             family = _call_family(instruction.target)
             if family != "runtime" and (not repeated or _is_sensitive(instruction)):
                 record = _function_call_record(instruction, repeated=index in covered)
-                calls.append(record)
+                if family == "indirect":
+                    indirect_call_count += 1
+                    if len(indirect_samples) < 8:
+                        indirect_samples.append(record)
+                elif len(meaningful_calls) < MAX_CALLS_PER_FUNCTION:
+                    meaningful_calls.append(record)
                 if _is_dynamic(instruction):
                     all_dynamic_sites.append({
                         "function": function.name,
@@ -554,20 +561,22 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
                             and not any(term in record["target"].casefold() for term in _DYNAMIC_TERMS)
                         ),
                     })
-            if len(calls) >= MAX_CALLS_PER_FUNCTION:
-                break
+        calls = [*meaningful_calls, *indirect_samples]
         unique_strings = unique_strings[:MAX_STRINGS_PER_FUNCTION]
         residue_count = max(0, len(instructions) - len(covered))
-        sensitive_count = sum(1 for item in calls if item["sensitive"])
-        dynamic_count = sum(1 for item in calls if item["family"] == "dynamic_resolution")
+        sensitive_count = sum(1 for item in meaningful_calls if item["sensitive"])
+        dynamic_count = sum(1 for item in meaningful_calls if item["family"] == "dynamic_resolution")
+        application_count = sum(1 for item in meaningful_calls if item["family"] == "application")
+        other_count = sum(1 for item in meaningful_calls if item["family"] == "other")
         priority_score = (
             (4 * sensitive_count)
             + (3 * dynamic_count)
-            + len(calls)
+            + (2 * application_count)
+            + min(other_count, 4)
             + (2 if function.name in reachable else 0)
             + (1 if unique_strings else 0)
         )
-        priority = "high" if priority_score >= 4 else "medium" if priority_score >= 2 else "low"
+        priority = "high" if priority_score >= 12 else "medium" if priority_score >= 4 else "low"
         function_records.append({
             "name": function.name,
             "address": f"0x{function.address:x}",
@@ -579,6 +588,7 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
             "unique_residue_instruction_count": residue_count,
             "unique_residue_ratio": round(residue_count / max(1, len(instructions)), 6),
             "unique_calls": calls,
+            "indirect_call_count": indirect_call_count,
             "unique_strings": unique_strings,
             "priority_score": priority_score,
             "priority": priority,
@@ -589,7 +599,7 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
         or any(item["clone_ratio"] >= 0.35 for item in function_records)
     )
     unresolved_dynamic = [item for item in all_dynamic_sites if not item["resolved"] or item["family"] == "dynamic_resolution"]
-    negative_blocked = bool(unresolved_dynamic) or graph_status != "direct"
+    negative_blocked = bool(unresolved_dynamic)
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": TOOL_NAME,

@@ -60,6 +60,11 @@ returns a nonzero status did not produce negative evidence. Do not pipe analyzer
 output through `head` or another command that can hide its exit status; command
 output is already bounded. Correct the invocation or record the analyzer as
 unavailable, and never translate its failure into "nothing found."
+The recorded `capa_health_check` proves only that capa and its offline rules are
+available; it is not a sample scan. Run `capa --quiet --json
+/input/sample.exe` once early without piping it through another command. If the
+bounded scan is too slow or fails, continue with other analysis and report capa
+as unavailable for that sample rather than inferring an absence of capabilities.
 
 Your primary objective is to recover the program's actual application behavior,
 not merely enumerate PE metadata, imports, strings, or runtime libraries.
@@ -171,9 +176,24 @@ configuration, and actionable recovery requests or blockers.
 Do not record a benign/safe/non-malicious classification. If repeated suspected
 junk dominates the code while reachable unique calls, dynamically resolved APIs,
 callbacks, or application functions remain unexplained, record one core
-analysis_blocker and describe only the positively recovered behavior. Never
+analysis_blocker describing only that unresolved gap. Never
 repeat or abbreviate the sample hash in a finding narrative; the controller
 already renders canonical artifact hashes.
+
+Apparently ordinary or non-malicious-looking application behavior is still
+reportable behavior. The prohibition above applies only to a safety verdict; it
+does not authorize dropping positively recovered logic. First record each
+distinct positive behavior neutrally with its normal behavior scope. Only after
+those records succeed, record a separate concise analysis_blocker containing
+only the unresolved gap, why it matters, the exact failed/missing static step,
+and the next static action. Never combine recovered behavior, categorical
+absence claims, and a blocker into one finding. A blocker is not a summary and
+must not say that behavior is benign.
+Treat categorical negative conclusions in the research prose as unverified
+unless the cited evidence and completed coverage independently support them.
+Do not copy “no network/C2/credentials/persistence/etc.” inventories into a
+behavior finding or blocker; omission from the relevant structured section is
+sufficient when nothing was positively recovered.
 
 Network reporting is mandatory when the research recovered any network use.
 Record one behavior finding with scope `exfiltration` for each phone-home/data

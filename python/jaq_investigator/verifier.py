@@ -157,6 +157,13 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
             ("abbreviated hash absent from cited evidence: " + ", ".join(unsupported_abbreviated[:10]),),
         )
 
+    if normalized.unresolved:
+        return _result(
+            normalized,
+            "unclear",
+            ("claim is marked unresolved", "all cited evidence exists and deterministic checks passed"),
+        )
+
     narrative = normalized.classification + "\n" + normalized.explanation
     go_profile = _go_behavior_profile(store)
     if (
@@ -244,14 +251,6 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
     else:
         supported = None
         reachability_reason = "all cited evidence exists and deterministic checks passed"
-
-    if normalized.unresolved:
-        return _result(
-            normalized,
-            "unclear",
-            tuple(dict.fromkeys(("claim is marked unresolved", reachability_reason))),
-            reachability_supported=supported,
-        )
 
     return _result(
         normalized,

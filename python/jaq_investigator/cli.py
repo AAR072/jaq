@@ -309,12 +309,13 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
 
 def _render_analysis_quality(score: Mapping[str, Any], store: CanonicalEvidenceStore) -> str:
     lines = ["\n## Analysis quality\n"]
+    health_tools = {"verify_radare2_version", "capa_health_check", "go_profile_static_scan"}
     failed_tools = sorted({
         str(item.metadata.get("tool_name"))
         for item in store.observations
         if item.type.endswith("tool_result")
         and item.metadata.get("status") in {"error", "timeout"}
-        and item.metadata.get("tool_name")
+        and item.metadata.get("tool_name") in health_tools
     })
     if failed_tools:
         lines.append("- Failed or timed-out analyzers: " + ", ".join(f"`{name}`" for name in failed_tools) + ".")
