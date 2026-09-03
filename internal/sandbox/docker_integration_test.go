@@ -116,9 +116,42 @@ func TestPersistentSandboxRuntimeContract(t *testing.T) {
 		t.Fatalf("expected exactly one sample mount, got %d: %#v", sampleMounts, state.Mounts)
 	}
 
-	for _, binary := range []string{"python3", "objdump", "r2", "r2mcp"} {
+	for _, binary := range []string{
+		"python3", "pyc-disasm", "pyinstxtractor-ng", "pydisasm",
+		"capa", "binwalk", "bsdtar", "readpe", "peres", "yara",
+		"upx", "llvm-objdump", "llvm-pdbutil", "jaq-tools",
+		"objdump", "r2", "r2mcp",
+	} {
 		if _, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "command -v "+binary); err != nil {
 			t.Fatalf("required sandbox binary %s is unavailable: %v", binary, err)
+		}
+	}
+	if output, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "jaq-tools | grep -q pyc-disasm"); err != nil {
+		t.Fatalf("static tool inventory is unavailable: %v: %s", err, output)
+	}
+	pythonFixture := `import importlib.util,marshal; c=compile("answer=42", "fixture.py", "exec"); open("/work/fixture.pyc","wb").write(importlib.util.MAGIC_NUMBER + b"\0"*12 + marshal.dumps(c))`
+	if output, err := dockerExec(ctx, session.ContainerName(), "/opt/python314/bin/python3.14", "-c", pythonFixture); err != nil {
+		t.Fatalf("could not create harmless Python 3.14 fixture: %v: %s", err, output)
+	}
+	if output, err := dockerExec(ctx, session.ContainerName(), "pyc-disasm", "/work/fixture.pyc"); err != nil || !strings.Contains(string(output), "STORE_NAME") {
+		t.Fatalf("Python 3.14 marshal disassembler failed: %v: %s", err, output)
+	}
+	if output, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "printf not-marshal >/work/malformed.bin && pyc-disasm --raw /work/malformed.bin"); err == nil || !strings.Contains(string(output), "marshal decode failed") {
+		t.Fatalf("Python 3.14 marshal disassembler accepted malformed input: %v: %s", err, output)
+	}
+	if output, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "truncate -s 65M /work/oversized.pyc && pyc-disasm /work/oversized.pyc"); err == nil || !strings.Contains(string(output), "safety limit") {
+		t.Fatalf("Python 3.14 marshal disassembler accepted oversized input: %v: %s", err, output)
+	}
+	versionCheck := `from importlib.metadata import version
+expected={"capstone":"5.0.9","dncil":"1.0.2","dnfile":"0.18.0","flare-capa":"9.4.0","malduck":"4.4.1","oletools":"0.60.2","pefile":"2024.8.26","pycryptodome":"3.17","pyinstxtractor-ng":"2026.7.3","r2pipe":"1.9.8","xdis":"6.3.0"}
+actual={name:version(name) for name in expected}
+assert actual == expected, (actual, expected)`
+	if output, err := dockerExec(ctx, session.ContainerName(), "python3", "-c", versionCheck); err != nil {
+		t.Fatalf("pinned Python tool versions differ: %v: %s", err, output)
+	}
+	for _, binary := range []string{"python3.14", "floss", "binref", "bugpoint", "lli", "llvm-jitlink", "llvm-rtdyld", "opt", "wine", "mono", "dotnet", "qemu-x86_64", "frida"} {
+		if _, err := dockerExec(ctx, session.ContainerName(), "sh", "-c", "command -v "+binary); err == nil {
+			t.Fatalf("execution/emulation binary %s is unexpectedly available on PATH", binary)
 		}
 	}
 	plugins, err := dockerExec(ctx, session.ContainerName(), "r2", "-L")

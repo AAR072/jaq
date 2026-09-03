@@ -5,7 +5,9 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential ca-certificates curl file git jq libssl-dev libzip-dev \
-        meson ninja-build pkg-config python3 xz-utils \
+        libbz2-dev libffi-dev libgdbm-dev liblzma-dev libncurses-dev \
+        libreadline-dev libsqlite3-dev meson ninja-build pkg-config python3 \
+        uuid-dev xz-utils zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/r2 /build \
@@ -38,6 +40,24 @@ RUN git clone --branch 1.8.6 --depth 1 \
     && install -D -m 0755 src/r2mcp /opt/r2mcp/bin/r2mcp \
     && rm -rf /build/radare2-mcp
 
+ARG PYTHON314_VERSION=3.14.7
+ARG PYTHON314_SHA256=3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81
+
+RUN mkdir -p /build/python314 \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/Python-${PYTHON314_VERSION}.tar.xz \
+        https://www.python.org/ftp/python/${PYTHON314_VERSION}/Python-${PYTHON314_VERSION}.tar.xz \
+    && echo "${PYTHON314_SHA256}  /tmp/Python-${PYTHON314_VERSION}.tar.xz" \
+        | sha256sum --check --strict \
+    && tar --extract --xz --file /tmp/Python-${PYTHON314_VERSION}.tar.xz \
+        --strip-components=1 --directory /build/python314 \
+    && cd /build/python314 \
+    && ./configure --prefix=/opt/python314 --with-ensurepip=no --disable-test-modules \
+    && make -j2 \
+    && make install \
+    && /opt/python314/bin/python3.14 -c 'import dis, marshal; print(marshal.version)' \
+    && rm -rf /build/python314 /tmp/Python-${PYTHON314_VERSION}.tar.xz
+
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
 LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
@@ -48,13 +68,19 @@ LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
       org.opencontainers.image.radare2.commit="e1fc278734ad62f933fc6f91edb29e4ba732f402" \
       org.opencontainers.image.radare2.archive-sha256="098488a3a0a4c11b893ae9e74496cf65561d17cefd9b7f2661a48b4be97b663a" \
       org.opencontainers.image.r2mcp.version="1.8.6" \
-      org.opencontainers.image.r2mcp.commit="d74b6b9855622c9a7070165b1961262afd686a3f"
+      org.opencontainers.image.r2mcp.commit="d74b6b9855622c9a7070165b1961262afd686a3f" \
+      org.opencontainers.image.python314.version="3.14.7" \
+      org.opencontainers.image.pyinstxtractor-ng.version="2026.7.3" \
+      org.opencontainers.image.capa.version="9.4.0"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        binutils build-essential file jq p7zip-full python3 unzip xxd \
+        binutils binwalk build-essential bzip2 cabextract file innoextract jq \
+        libarchive-tools libimage-exiftool-perl llvm lz4 msitools openssl osslsigncode p7zip-full \
+        pev python3 python3-pip ripgrep sqlite3 ssdeep unzip upx-ucl xxd yara \
+        xz-utils zstd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 jaq \
     && useradd --uid 65532 --gid 65532 --no-create-home \
@@ -64,7 +90,17 @@ RUN apt-get update \
 
 COPY --from=build /opt/r2 /opt/r2
 COPY --from=build /opt/r2mcp /opt/r2mcp
+COPY --from=build /opt/python314 /opt/python314
+COPY requirements-static.txt /opt/jaq/requirements-static.txt
+RUN python3 -m pip install --no-cache-dir --disable-pip-version-check pip==26.2.1 \
+    && python3 -m pip install --no-cache-dir --disable-pip-version-check \
+        --requirement /opt/jaq/requirements-static.txt \
+    && python3 -m pip check \
+    && python3 -m pip freeze > /opt/jaq/requirements-resolved.txt
 COPY --chmod=0555 entrypoint.sh /opt/jaq/entrypoint.sh
+COPY --chmod=0444 TOOLS.md /opt/jaq/TOOLS.md
+COPY --chmod=0555 jaq-tools /usr/local/bin/jaq-tools
+COPY --chmod=0555 pyc-disasm /usr/local/bin/pyc-disasm
 
 RUN rm -f \
         /opt/r2/bin/clang-format-radare2 \
@@ -73,14 +109,33 @@ RUN rm -f \
         /opt/r2/bin/r2r \
         /opt/r2/bin/rarun2 \
         /opt/r2/bin/r2sdb \
+        /usr/bin/lli* \
+        /usr/bin/bugpoint* \
+        /usr/bin/llvm-exegesis* \
+        /usr/bin/llvm-jitlink* \
+        /usr/bin/llvm-rtdyld* \
+        /usr/bin/opt* \
+        /usr/lib/llvm-*/bin/lli* \
+        /usr/lib/llvm-*/bin/bugpoint* \
+        /usr/lib/llvm-*/bin/llvm-exegesis* \
+        /usr/lib/llvm-*/bin/llvm-jitlink* \
+        /usr/lib/llvm-*/bin/llvm-rtdyld* \
+        /usr/lib/llvm-*/bin/opt* \
     && printf '%s\n' /opt/r2/lib > /etc/ld.so.conf.d/jaq-radare2.conf \
     && ldconfig \
     && /opt/r2/bin/r2 -v \
     && /opt/r2mcp/bin/r2mcp -v \
+    && /opt/python314/bin/python3.14 --version \
+    && python3 -c 'import capstone, dncil, dnfile, malduck, pefile, r2pipe, xdis' \
+    && command -v binwalk bsdtar capa innoextract llvm-objdump msiextract \
+        pyinstxtractor-ng pydisasm readpe upx yara \
+    && pyc-disasm --help >/dev/null \
+    && jaq-tools >/dev/null \
     && ldd /opt/r2mcp/bin/r2mcp
 
 ENV PATH=/opt/r2/bin:/opt/r2mcp/bin:${PATH} \
-    HOME=/work
+    HOME=/work \
+    JAQ_TOOLS_MANIFEST=/opt/jaq/TOOLS.md
 
 USER 65532:65532
 WORKDIR /work

@@ -1,0 +1,11 @@
+capstone==5.0.9
+dncil==1.0.2
+dnfile==0.18.0
+flare-capa==9.4.0
+malduck==4.4.1
+oletools==0.60.2
+pefile==2024.8.26
+pycryptodome==3.17
+pyinstxtractor-ng==2026.7.3
+r2pipe==1.9.8
+xdis==6.3.0

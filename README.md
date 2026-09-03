@@ -31,6 +31,8 @@ For the normal local workflow, put those two assignments in the gitignored `.env
 
 The wrapper loads `.env`, activates `.venv` when present, builds the CLI if needed, and writes to a fresh timestamped directory under `runs/`. Supply an absolute second argument to choose a different output directory.
 
+The offline image includes native PE tooling, capa, PyInstaller extraction, Python 3.14 marshal/bytecode disassembly, .NET metadata/CIL libraries, archive/installer extractors, YARA, and common decoding/crypto utilities. Inside the sandbox, `jaq-tools` prints the installed inventory from `/opt/jaq/TOOLS.md`; tools are ordinary commands and libraries on `PATH`, not additional model APIs.
+
 Runs emit safe structured progress without exposing model prose, sample strings, commands, endpoints, or credentials. Specialized analysis tools are shown immediately; repeated static-command work and model/cost counters are summarized periodically:
 
 ```text

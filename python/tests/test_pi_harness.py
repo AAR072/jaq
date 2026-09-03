@@ -17,7 +17,7 @@ from jaq_investigator.pi_harness import (
     PiHarnessConfig, PiHarnessError, PiHarnessRunner, PiInvestigator, PiToolBroker,
     _emit_progress,
 )
-from jaq_investigator.prompts import RESEARCH_SCHEMA
+from jaq_investigator.prompts import INVESTIGATOR_SYSTEM_PROMPT, RESEARCH_SCHEMA
 from jaq_investigator.schemas import Observation
 
 
@@ -103,6 +103,13 @@ def coverage_checkpoint(important_id: str) -> dict:
 
 
 class PiHarnessProtocolTest(unittest.TestCase):
+    def test_researcher_discovers_real_static_tool_inventory(self):
+        self.assertIn("/opt/jaq/TOOLS.md", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("jaq-tools", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("dnfile", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertNotIn("monodis", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertNotIn("go version -m", INVESTIGATOR_SYSTEM_PROMPT)
+
     def test_recovery_cli_compiles_research_without_removed_checkpoint_api(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

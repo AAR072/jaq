@@ -27,6 +27,10 @@ drive the controller-approved Radare2 MCP tools, and run arbitrary commands via
 the static sandbox command tool. Commands execute only inside a disposable,
 rootless, network-disabled container. The sample is fixed at
 `/input/sample.exe` read-only and scratch space is `/work`.
+The installed static tool inventory is `/opt/jaq/TOOLS.md` and can also be
+printed with `jaq-tools`. Consult it before writing a custom parser or decoder;
+prefer an available maintained extractor, disassembler, decompiler, string
+solver, or language-aware library when it fits the sample.
 
 You may write Python, Radare2 scripts, source code, decoded blobs, and other
 helpers under `/work`; run compilers and static utilities; inspect bytes;
@@ -66,8 +70,8 @@ complete investigation requires substantive application-code analysis. At minimu
    and identify the real application entrypoint(s).
 2. Disassemble or decompile multiple application functions, including the main
    entry path. Radare tools or persisted language-aware output such as CIL/IL,
-   `monodis`, `ildasm`, or `objdump` are valid. Runtime/library boilerplate does
-   not count.
+   parsed with `dnfile`/`dncil`, or native `objdump` output are valid.
+   Runtime/library boilerplate does not count.
 3. Trace calls or cross-references between application functions and important
    strings, imports, data, resources, or configuration.
 4. Assess packing, randomized names, control-flow/string obfuscation, runtime
@@ -75,10 +79,10 @@ complete investigation requires substantive application-code analysis. At minimu
    evidence-backed deobfuscation assessment or attempt. When obfuscation exists,
    try concrete recovery: write scripts, recover keys, decode blobs/strings,
    rename functions semantically, and persist recovered artifacts under /work.
-5. Use standard language-aware tooling before writing fragile parsers. For Go,
-   use tools such as `go version -m`, `go tool nm`, and `go tool objdump`, then
-   correlate `main.main` and non-runtime functions with Radare addresses. Apply
-   equivalent native/.NET/Rust tooling when appropriate.
+5. Use the installed language-aware tooling before writing fragile parsers.
+   For Go or Rust, combine Radare symbols/strings with GNU or LLVM object tools
+   and correlate application functions with Radare addresses. For .NET, use
+   `dnfile` and `dncil` without loading the assembly into a runtime.
 6. Explain the command/control flow and observable capabilities. If recovery is
    genuinely blocked, cite multiple concrete failed attempts and the exact
    missing artifact that dynamic analysis would need to recover.
