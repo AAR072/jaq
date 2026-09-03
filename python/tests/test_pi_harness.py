@@ -109,6 +109,8 @@ class PiHarnessProtocolTest(unittest.TestCase):
         self.assertIn("dnfile", INVESTIGATOR_SYSTEM_PROMPT)
         self.assertNotIn("monodis", INVESTIGATOR_SYSTEM_PROMPT)
         self.assertNotIn("go version -m", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("phones home", INVESTIGATOR_SYSTEM_PROMPT)
+        self.assertIn("legitimate third-party", INVESTIGATOR_SYSTEM_PROMPT)
 
     def test_recovery_cli_compiles_research_without_removed_checkpoint_api(self):
         with TemporaryDirectory() as directory:
@@ -174,9 +176,12 @@ class PiHarnessProtocolTest(unittest.TestCase):
             output = root / "output"
             output.mkdir()
             token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.abcdef.abcdefghijklmnopqrstuvwxyz123456"
+            webhook = "https://discord.example/api/webhooks/123/secret-value"
+            profile_api = "https://discord.example/api/v10/users/@me"
             observation = Observation(
                 id="obs-token", type="fixture.decoded_config",
-                raw_value={"discord_token": token}, normalized_value={"discord_token": token},
+                raw_value={"discord_token": token, "webhook": webhook, "profile_api": profile_api},
+                normalized_value={"discord_token": token, "webhook": webhook, "profile_api": profile_api},
                 artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
                 provenance={"source": "fixture"},
             )
@@ -198,13 +203,15 @@ assert init["mode"] == "report"
 names = {{item["name"] for item in init["tool_definitions"]}}
 assert "record_finding" in names and "static_fixture" not in names
 records = [
-  {{"kind":"behavior","scope":"command_control","title":"Discord command and control","description":"The decoded configuration contains a Discord command-and-control credential.","confidence":0.95,"evidence_ids":["obs-token"]}},
-  {{"kind":"asset","scope":"credential","title":"Discord bot token","description":"Exact embedded Discord credential.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"bearer_token","value":{json.dumps(token)},"role":"Discord C2 authentication"}}
+  {{"kind":"behavior","scope":"exfiltration","title":"POST stolen data to webhook","description":"The application sends collected data by HTTPS POST to a third-party-hosted webhook.","confidence":0.95,"evidence_ids":["obs-token"]}},
+  {{"kind":"asset","scope":"credential","title":"Discord user token","description":"Exact victim credential pattern.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"bearer_token","value":{json.dumps(token)},"role":"harvested_victim_credential"}},
+  {{"kind":"asset","scope":"infrastructure","title":"Discord exfiltration webhook","description":"Secret-bearing third-party webhook used for exfiltration.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"webhook","value":{json.dumps(webhook)},"role":"third_party_exfiltration_webhook"}},
+  {{"kind":"asset","scope":"infrastructure","title":"Discord profile API","description":"Legitimate third-party profile lookup endpoint.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"url","value":{json.dumps(profile_api)},"role":"third_party_profile_lookup"}}
 ]
 for index, finding in enumerate(records, 1):
     print(json.dumps({{"type":"request","id":index,"operation":"execute_tool","payload":{{"name":"record_finding","arguments":finding}}}}), flush=True)
     assert json.loads(sys.stdin.readline())["ok"] is True
-print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":20,"output_tokens":5,"total_tokens":25,"cost_usd":0.002,"provider_calls":2,"tool_calls":2}},"session":{{"id":"report","file":"report.jsonl"}}}}), flush=True)
+print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":20,"output_tokens":5,"total_tokens":25,"cost_usd":0.002,"provider_calls":2,"tool_calls":4}},"session":{{"id":"report","file":"report.jsonl"}}}}), flush=True)
 ''',
                 encoding="utf-8",
             )
@@ -217,9 +224,18 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
             self.assertEqual(result["claims"]["assets"][0]["value"], token)
             self.assertIn(token, (output / "assets.json").read_text(encoding="utf-8"))
             self.assertIn(token, (output / "report.md").read_text(encoding="utf-8"))
+            communications = json.loads((output / "communications.json").read_text(encoding="utf-8"))
+            self.assertEqual(communications["communications"][0]["scope"], "exfiltration")
+            assets = json.loads((output / "assets.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(assets["categories"]["communication_endpoints"]), 2)
+            self.assertEqual(assets["categories"]["attacker_controlled_infrastructure"], [])
+            self.assertEqual(
+                {item["type"] for item in assets["categories"]["credentials_and_tokens"]},
+                {"bearer_token", "webhook"},
+            )
             for name in (
                 "findings.jsonl", "research.json", "claims.json", "assets.json",
-                "requests.json", "score.json", "report.md",
+                "communications.json", "requests.json", "score.json", "report.md",
             ):
                 self.assertTrue((output / name).is_file(), name)
             self.assertFalse((output / "model-session" / "harvest").exists())

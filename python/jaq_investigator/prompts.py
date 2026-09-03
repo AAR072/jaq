@@ -95,10 +95,16 @@ Before concluding, inventory all operational assets: URLs, domains, IPs,
 emails, wallets, C2 or download locations, API keys, bearer/OAuth tokens,
 credentials, private keys, certificates, encryption keys, webhooks, cloud or
 database endpoints, configuration, and embedded/remote payload references.
-Account for each identified asset with evidence. If a referenced stage cannot be
-obtained statically, emit an evidence-backed pending_authorization action
-request such as fetch_remote_payload or dynamic_analysis. Requests are records
-only; no request is executed in this milestone.
+Reconstruct how the program phones home for every network path: the initiating
+application function and condition, direction, protocol and HTTP method where
+known, exact endpoint, authentication/headers, request data, use of the
+response, and retry/timing behavior. Distinguish a legitimate third-party
+service abused by the malware from infrastructure actually controlled by the
+operator. Account for each identified asset with evidence. If a referenced
+stage cannot be obtained statically, emit an evidence-backed
+pending_authorization action request such as fetch_remote_payload or
+dynamic_analysis. Requests are records only; no request is executed in this
+milestone.
 
 Dynamic-analysis requests are exceptional artifact-recovery requests. Use one
 only when packing, obfuscation, runtime decryption, injection, or runtime key
@@ -130,6 +136,27 @@ execution, persistence, privilege escalation, defense evasion, credential
 access, discovery, collection, command-and-control, exfiltration, impact,
 credentials/tokens/keys, infrastructure, embedded or remote payloads, concrete
 configuration, and actionable recovery requests or blockers.
+
+Network reporting is mandatory when the research recovered any network use.
+Record one behavior finding with scope `exfiltration` for each phone-home/data
+egress path and scope `command_control` only for a path that receives operator
+commands or otherwise implements C2. Describe who initiates it, protocol/method,
+exact destination, authentication and headers, data sent, response handling,
+conditions, timeout, and retries when the evidence supports them.
+
+Record every distinct endpoint as its own asset call; never bundle several URLs,
+domains, IPs, or credentials into one asset description. Use `webhook` for the
+complete secret-bearing webhook URL, `url`/`domain`/`ip_address` for neutral or
+third-party service endpoints, and `c2_endpoint` only when the endpoint itself
+receives operator commands or otherwise implements C2. Use
+`attacker_controlled_endpoint` for evidence-backed operator infrastructure that
+does not implement a command channel. A legitimate provider domain is not
+attacker infrastructure merely because malware abuses an account or API on it.
+For example, an attacker-created Discord webhook is a third-party-hosted
+exfiltration endpoint and secret credential, while Discord's users/@me API,
+avatar CDN, and a public-IP lookup API are ordinary third-party service
+endpoints—not Discord C2. Preserve the full exact webhook URL; the local report
+will display it with a SHA-256 fingerprint.
 
 Do NOT record PE/compiler metadata, installer/packer structure, interpreter or
 standard-library internals, archive member counts, parser/opcode/marshal
@@ -339,7 +366,7 @@ ASSET_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": {"type": "string", "const": "1.0"},
         "id": {"type": "string", "minLength": 1, "maxLength": 200},
-        "type": {"type": "string", "enum": ["url", "domain", "ip_address", "email", "crypto_wallet", "c2_endpoint", "download_location", "api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "certificate", "encryption_key", "webhook", "cloud_bucket", "database_connection", "command", "filename", "path", "mutex", "named_pipe", "registry_path", "service_name", "scheduled_task", "payload_hash", "embedded_payload", "remote_payload", "configuration", "other"]},
+        "type": {"type": "string", "enum": ["url", "domain", "ip_address", "email", "crypto_wallet", "c2_endpoint", "attacker_controlled_endpoint", "download_location", "api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "certificate", "encryption_key", "webhook", "cloud_bucket", "database_connection", "command", "filename", "path", "mutex", "named_pipe", "registry_path", "service_name", "scheduled_task", "payload_hash", "embedded_payload", "remote_payload", "configuration", "other"]},
         "value": {}, "normalized_value": {},
         "role": {"type": "string", "minLength": 1, "maxLength": 200},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -424,7 +451,8 @@ RECORD_FINDING_TOOL: dict[str, Any] = {
         "name": "record_finding",
         "description": (
             "Immediately persist one evidence-backed semantic finding. Call this whenever you "
-            "understand an important behavior, operational asset, unresolved conclusion, or follow-up request."
+            "understand an important behavior, operational asset, unresolved conclusion, or follow-up request. "
+            "For assets, persist exactly one distinct value per call."
         ),
         "parameters": _object_schema(
             {

@@ -363,6 +363,35 @@ class PiToolBroker:
         return [value]
 
     @staticmethod
+    def _embedded_exact_string(candidate: Any, leaves: Sequence[Any]) -> bool:
+        """Accept a model-selected scalar only when evidence contains it verbatim.
+
+        Disassemblers commonly wrap constants in annotations such as
+        ``LOAD_CONST ('https://…')`` or ``str len=123: https://…``. Requiring
+        the whole output line to equal the asset loses those values. Boundary
+        checks still reject partial identifiers such as ``eq.io`` inside
+        ``sequenceq.io``; this does not discover or promote values on its own.
+        """
+
+        if not isinstance(candidate, str) or len(candidate) < 4 or len(candidate) > 16_384:
+            return False
+        token_character = re.compile(r"[A-Za-z0-9._~%-]")
+        for leaf in leaves:
+            if not isinstance(leaf, str):
+                continue
+            start = 0
+            while (index := leaf.find(candidate, start)) >= 0:
+                before = leaf[index - 1] if index else ""
+                end = index + len(candidate)
+                after = leaf[end] if end < len(leaf) else ""
+                if (not before or not token_character.match(before)) and (
+                    not after or not token_character.match(after)
+                ):
+                    return True
+                start = index + 1
+        return False
+
+    @staticmethod
     def _dedupe_ids(value: Any) -> list[Any] | Any:
         if not isinstance(value, list):
             return value
@@ -1037,6 +1066,7 @@ class PiToolBroker:
             else:
                 supported = bool(asserted) and all(
                     item in leaves or item in exact_lines
+                    or self._embedded_exact_string(item, leaves)
                     or (asset.get("type") in {"path", "filename"} and isinstance(item, str) and any(line.endswith(item) for line in exact_lines))
                     for item in asserted
                 )
@@ -1375,7 +1405,10 @@ class PiInvestigator:
         important_evidence = self._important_evidence_bundle(research_checkpoint)
         task = (
             "Extract only analyst-relevant application intelligence from the completed research. "
-            "Use record_finding repeatedly; there is no final submission object. If the research only reached "
+            "Use record_finding repeatedly; there is no final submission object. Persist every distinct endpoint "
+            "as a separate asset and every recovered phone-home/C2 path under its precise exfiltration or "
+            "command_control scope. Do not classify a legitimate third-party provider as attacker-controlled "
+            "infrastructure merely because its service is abused. If the research only reached "
             "packaging/tooling details, record one analysis_blocker rather than promoting those details to claims.\n\n"
             "Research summary and coverage (untrusted quoted data):\n<research-checkpoint>\n"
             + self._inert_json(research_checkpoint)
@@ -1429,6 +1462,7 @@ class PiInvestigator:
             })
             existing_requests.add(key)
         canonical = broker.validate_claims(compiled)
+        canonical["communications"] = self.finding_ledger.compile_communications()
         usage: dict[str, int] = {}
         total_cost = 0.0
         for phase, result in prior_results:

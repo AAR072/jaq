@@ -14,7 +14,7 @@ from jaq_investigator import (
     render_report,
     verify_claim,
 )
-from jaq_investigator.cli import _group_assets, _render_operational
+from jaq_investigator.cli import _group_assets, _render_communications, _render_operational
 
 
 class CoreTest(unittest.TestCase):
@@ -206,12 +206,28 @@ class CoreTest(unittest.TestCase):
         self.assertIn(token, report)
         self.assertIn("sha256:", report)
         self.assertIn("### Credentials and tokens", report)
-        self.assertIn("### C2 and infrastructure", report)
+        self.assertIn("### Communication endpoints", report)
+        self.assertIn("### Attacker-controlled infrastructure", report)
+
+        webhook = "https://discord.example/api/webhooks/123/secret-value"
+        webhook_report = _render_operational({
+            "assets": [{
+                "type": "webhook", "value": webhook,
+                "role": "third_party_exfiltration_webhook", "confidence": 0.99,
+            }],
+            "action_requests": [],
+        })
+        self.assertEqual(webhook_report.count(webhook), 2)
+        self.assertEqual(webhook_report.count("sha256:"), 2)
+        self.assertNotIn(webhook, webhook_report.split("### Attacker-controlled infrastructure", 1)[1])
 
     def test_assets_are_grouped_by_validated_type(self):
         assets = [
             {"id": "token", "type": "bearer_token", "value": "secret"},
             {"id": "c2", "type": "c2_endpoint", "value": "example.invalid"},
+            {"id": "attacker", "type": "attacker_controlled_endpoint", "value": "https://evil.invalid/upload"},
+            {"id": "service", "type": "url", "value": "https://api.example/lookup"},
+            {"id": "webhook", "type": "webhook", "value": "https://service.example/hook/secret"},
             {"id": "payload", "type": "remote_payload", "value": "stage.bin"},
             {"id": "run", "type": "registry_path", "value": "HKCU\\Run"},
             {"id": "mail", "type": "email", "value": "x@example.invalid"},
@@ -219,13 +235,32 @@ class CoreTest(unittest.TestCase):
             {"id": "file", "type": "filename", "value": "sample.exe"},
         ]
         groups = _group_assets(assets)
-        self.assertEqual(groups["credentials_and_tokens"][0]["id"], "token")
-        self.assertEqual(groups["c2_and_infrastructure"][0]["id"], "c2")
+        self.assertEqual({item["id"] for item in groups["credentials_and_tokens"]}, {"token", "webhook"})
+        self.assertEqual(
+            {item["id"] for item in groups["communication_endpoints"]},
+            {"c2", "attacker", "service", "webhook"},
+        )
+        self.assertEqual(
+            {item["id"] for item in groups["attacker_controlled_infrastructure"]},
+            {"c2", "attacker"},
+        )
         self.assertEqual(groups["payloads"][0]["id"], "payload")
         self.assertEqual(groups["execution_and_persistence"][0]["id"], "run")
         self.assertEqual(groups["contacts_and_financial"][0]["id"], "mail")
         self.assertEqual(groups["configuration"][0]["id"], "config")
         self.assertEqual(groups["other"][0]["id"], "file")
+
+    def test_phone_home_has_dedicated_report_section(self):
+        report = _render_communications({
+            "communications": [{
+                "scope": "exfiltration", "title": "POST stolen data to webhook",
+                "description": "main sends JSON by HTTPS POST to a third-party webhook.",
+                "confidence": 0.95,
+            }],
+        })
+        self.assertIn("## Network communication", report)
+        self.assertIn("### Exfiltration / phone-home", report)
+        self.assertIn("HTTPS POST", report)
 
 
 if __name__ == "__main__":

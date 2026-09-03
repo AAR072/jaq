@@ -379,7 +379,7 @@ func validateInvestigatorOutputs(outputDir string, observations []evidence.Obser
 	if judgeRequired && len(score.Judgments) != len(claims) {
 		return fmt.Errorf("reject investigator score: configured judge returned %d judgments for %d claims", len(score.Judgments), len(claims))
 	}
-	for _, name := range []string{"assets.json", "requests.json"} {
+	for _, name := range []string{"assets.json", "communications.json", "requests.json"} {
 		info, statErr := os.Stat(filepath.Join(outputDir, name))
 		if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
 			return fmt.Errorf("reject investigator output: %s must be a nonempty bounded regular file", name)
@@ -620,7 +620,11 @@ func validateOperationalReferences(outputDir string, observations []evidence.Obs
 	for _, item := range observations {
 		ids[item.ID] = true
 	}
-	for _, spec := range []struct{ name, key string }{{"assets.json", "assets"}, {"requests.json", "action_requests"}} {
+	for _, spec := range []struct{ name, key string }{
+		{"assets.json", "assets"},
+		{"communications.json", "communications"},
+		{"requests.json", "action_requests"},
+	} {
 		var document map[string]any
 		if err := readJSONStrict(filepath.Join(outputDir, spec.name), &document); err != nil {
 			return fmt.Errorf("reject %s: %w", spec.name, err)
@@ -687,7 +691,7 @@ func fileSize(path string) int64 {
 
 func outputSize(directory string) int64 {
 	var total int64
-	for _, name := range []string{"findings.jsonl", "research.json", "claims.json", "assets.json", "requests.json", "score.json", "report.md"} {
+	for _, name := range []string{"findings.jsonl", "research.json", "claims.json", "assets.json", "communications.json", "requests.json", "score.json", "report.md"} {
 		total += fileSize(filepath.Join(directory, name))
 	}
 	return total

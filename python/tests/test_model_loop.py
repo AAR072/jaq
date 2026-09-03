@@ -387,13 +387,14 @@ class ModelLoopTests(unittest.TestCase):
                 investigator_config=InvestigatorConfig(model="mock/investigator"),
             )
             self.assertEqual(result["score"]["accepted"], 1)
-            self.assertEqual({item.name for item in output.iterdir()}, {"findings.jsonl", "claims.json", "assets.json", "requests.json", "score.json", "report.md"})
+            self.assertEqual({item.name for item in output.iterdir()}, {"findings.jsonl", "claims.json", "assets.json", "communications.json", "requests.json", "score.json", "report.md"})
             self.assertEqual(json.loads((output / "claims.json").read_text())["schema_version"], "1.0")
             asset_document = json.loads((output / "assets.json").read_text())
             self.assertEqual(
                 set(asset_document["categories"]),
                 {
-                    "credentials_and_tokens", "c2_and_infrastructure", "payloads",
+                    "credentials_and_tokens", "communication_endpoints",
+                    "attacker_controlled_infrastructure", "payloads",
                     "execution_and_persistence", "contacts_and_financial",
                     "configuration", "other",
                 },

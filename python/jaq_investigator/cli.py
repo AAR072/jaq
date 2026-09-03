@@ -24,7 +24,8 @@ from .verifier import verify_and_score
 
 _ASSET_CATEGORY_ORDER = (
     "credentials_and_tokens",
-    "c2_and_infrastructure",
+    "communication_endpoints",
+    "attacker_controlled_infrastructure",
     "payloads",
     "execution_and_persistence",
     "contacts_and_financial",
@@ -33,30 +34,48 @@ _ASSET_CATEGORY_ORDER = (
 )
 _ASSET_CATEGORY_LABELS = {
     "credentials_and_tokens": "Credentials and tokens",
-    "c2_and_infrastructure": "C2 and infrastructure",
+    "communication_endpoints": "Communication endpoints",
+    "attacker_controlled_infrastructure": "Attacker-controlled infrastructure",
     "payloads": "Payloads",
     "execution_and_persistence": "Execution and persistence",
     "contacts_and_financial": "Contacts and financial",
     "configuration": "Configuration",
     "other": "Other assets",
 }
-_ASSET_TYPE_CATEGORIES = {
-    **dict.fromkeys({
-        "api_key", "bearer_token", "oauth_credential", "username_password",
-        "private_key", "certificate", "encryption_key", "database_connection",
-    }, "credentials_and_tokens"),
-    **dict.fromkeys({
-        "c2_endpoint", "domain", "ip_address", "url", "download_location",
-        "webhook", "cloud_bucket",
-    }, "c2_and_infrastructure"),
-    **dict.fromkeys({"payload_hash", "embedded_payload", "remote_payload"}, "payloads"),
-    **dict.fromkeys({
-        "command", "path", "mutex", "named_pipe", "registry_path",
-        "service_name", "scheduled_task",
-    }, "execution_and_persistence"),
-    **dict.fromkeys({"email", "crypto_wallet"}, "contacts_and_financial"),
-    "configuration": "configuration",
+_CREDENTIAL_TYPES = {
+    "api_key", "bearer_token", "oauth_credential", "username_password",
+    "private_key", "certificate", "encryption_key", "database_connection",
+    "webhook",
 }
+_COMMUNICATION_TYPES = {
+    "c2_endpoint", "attacker_controlled_endpoint", "domain", "ip_address",
+    "url", "download_location", "webhook", "cloud_bucket", "database_connection",
+}
+_PAYLOAD_TYPES = {"payload_hash", "embedded_payload", "remote_payload"}
+_EXECUTION_TYPES = {
+    "command", "path", "mutex", "named_pipe", "registry_path",
+    "service_name", "scheduled_task",
+}
+_CONTACT_TYPES = {"email", "crypto_wallet"}
+
+
+def _asset_categories(asset_type: str) -> tuple[str, ...]:
+    categories: list[str] = []
+    if asset_type in _CREDENTIAL_TYPES:
+        categories.append("credentials_and_tokens")
+    if asset_type in _COMMUNICATION_TYPES:
+        categories.append("communication_endpoints")
+    if asset_type in {"c2_endpoint", "attacker_controlled_endpoint"}:
+        categories.append("attacker_controlled_infrastructure")
+    if asset_type in _PAYLOAD_TYPES:
+        categories.append("payloads")
+    if asset_type in _EXECUTION_TYPES:
+        categories.append("execution_and_persistence")
+    if asset_type in _CONTACT_TYPES:
+        categories.append("contacts_and_financial")
+    if asset_type == "configuration":
+        categories.append("configuration")
+    return tuple(categories or ("other",))
 
 
 def _group_assets(assets: Any) -> dict[str, list[dict[str, Any]]]:
@@ -67,8 +86,8 @@ def _group_assets(assets: Any) -> dict[str, list[dict[str, Any]]]:
         if not isinstance(raw, Mapping):
             continue
         item = dict(raw)
-        category = _ASSET_TYPE_CATEGORIES.get(str(item.get("type")), "other")
-        groups[category].append(item)
+        for category in _asset_categories(str(item.get("type"))):
+            groups[category].append(item)
     for records in groups.values():
         records.sort(key=lambda item: (str(item.get("type")), str(item.get("id"))))
     return groups
@@ -208,9 +227,13 @@ def run_pipeline(
             "assets": claims.get("assets", []),
             "categories": _group_assets(claims.get("assets", [])),
         }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "communications.json": json.dumps({
+            "schema_version": "1.0",
+            "communications": claims.get("communications", []),
+        }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        "report.md": render_report(claims["claims"], score, store) + _render_operational(claims),
+        "report.md": render_report(claims["claims"], score, store) + _render_communications(claims) + _render_operational(claims),
     }
     targets = [output_dir / name for name in contents]
     if any(path.exists() for path in targets):
@@ -248,7 +271,7 @@ def finalize_research_only(evidence_path: str | Path, output_dir: str | Path) ->
 
 def _render_operational(investigation: Mapping[str, Any]) -> str:
     safe = lambda value: html.escape(str(value), quote=True).replace("\n", " ")
-    sensitive = {"api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "encryption_key", "database_connection"}
+    sensitive = {"api_key", "bearer_token", "oauth_credential", "username_password", "private_key", "encryption_key", "database_connection", "webhook"}
     def display(item: Mapping[str, Any]) -> str:
         value = str(item.get("value"))
         if item.get("type") in sensitive:
@@ -276,6 +299,31 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
     )
     if not requests:
         lines.append("- None.")
+    return "\n".join(lines) + "\n"
+
+
+def _render_communications(investigation: Mapping[str, Any]) -> str:
+    safe = lambda value: html.escape(str(value), quote=True).replace("\n", " ")
+    lines = ["\n## Network communication\n"]
+    communications = investigation.get("communications", [])
+    if not isinstance(communications, list) or not communications:
+        lines.append("- None identified.")
+        return "\n".join(lines) + "\n"
+    labels = {
+        "exfiltration": "Exfiltration / phone-home",
+        "command_control": "Command and control",
+    }
+    for scope in ("exfiltration", "command_control"):
+        records = [item for item in communications if isinstance(item, Mapping) and item.get("scope") == scope]
+        if not records:
+            continue
+        lines.append(f"### {labels[scope]}\n")
+        for item in records:
+            lines.append(
+                f"- **{safe(item.get('title'))}** — {safe(item.get('description'))} "
+                f"(confidence {safe(item.get('confidence'))})"
+            )
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 

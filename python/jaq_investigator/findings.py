@@ -288,5 +288,32 @@ class FindingLedger:
             result[target].append(record)
         return result
 
+    def compile_communications(self) -> list[dict[str, Any]]:
+        """Return locally derived communication paths from scoped claims.
+
+        Scope lives in the append-only envelope rather than the persisted Claim
+        contract. Preserve it here so reports can present command/control and
+        exfiltration behavior explicitly without asking a model to reformat its
+        already-recorded findings.
+        """
+
+        communications: list[dict[str, Any]] = []
+        for envelope in self._records:
+            if envelope["kind"] != "claim" or envelope.get("scope") not in {
+                "command_control", "exfiltration",
+            }:
+                continue
+            record = envelope["record"]
+            communications.append({
+                "schema_version": FINDING_SCHEMA_VERSION,
+                "id": record["id"],
+                "scope": envelope["scope"],
+                "title": envelope["title"],
+                "description": envelope["description"],
+                "confidence": envelope["confidence"],
+                "evidence_ids": list(record["evidence_ids"]),
+            })
+        return communications
+
 
 __all__ = ["FINDING_SCHEMA_VERSION", "FindingError", "FindingLedger"]

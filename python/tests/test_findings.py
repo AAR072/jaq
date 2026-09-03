@@ -135,6 +135,41 @@ class FindingLedgerTest(unittest.TestCase):
                 })
             self.assertEqual(ledger.records, ())
 
+    def test_accepts_exact_webhook_wrapped_in_disassembly_but_not_partial_domain(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            webhook = "https://discord.example/api/webhooks/123/secret-value"
+            observation = Observation(
+                id="obs-disassembly", type="static-sandbox.tool_result",
+                raw_value={"stdout": f"22 LOAD_CONST 3 ('{webhook}')\nconst[3] str len={len(webhook)}: {webhook}\nsequenceq.io"},
+                normalized_value={"status": "ok"},
+                artifact_location={"artifact": "sample"},
+                analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            )
+            evidence_path = root / "observations.jsonl"
+            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            ledger = FindingLedger(root / "findings.jsonl")
+            broker = PiToolBroker(EvidenceStore(evidence_path), NoRuntime(), ledger)
+            result = broker.execute("record_finding", {
+                "kind": "asset", "scope": "infrastructure",
+                "title": "Third-party exfiltration webhook",
+                "description": "Exact secret-bearing webhook used for outbound exfiltration.",
+                "confidence": 0.99, "evidence_ids": ["obs-disassembly"],
+                "asset_type": "webhook", "value": webhook,
+                "role": "third_party_exfiltration_webhook",
+            })
+            self.assertEqual(result["status"], "recorded")
+            self.assertEqual(ledger.compile()["assets"][0]["value"], webhook)
+
+            with self.assertRaisesRegex(PiHarnessError, "not present exactly"):
+                broker.execute("record_finding", {
+                    "kind": "asset", "scope": "infrastructure",
+                    "title": "Partial false positive", "description": "Not an exact domain.",
+                    "confidence": 0.9, "evidence_ids": ["obs-disassembly"],
+                    "asset_type": "domain", "value": "eq.io", "role": "unknown",
+                })
+
     def test_duplicate_assets_merge_without_losing_evidence(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -165,6 +200,30 @@ class FindingLedgerTest(unittest.TestCase):
             second = broker.execute("record_finding", {**base, "role": "command-and-control"})
             self.assertNotEqual(first["record_id"], second["record_id"])
             self.assertEqual(len(ledger.compile()["claims"]), 2)
+
+    def test_communication_paths_are_compiled_from_precise_scopes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, ledger = self.fixture(root)
+            broker = PiToolBroker(store, NoRuntime(), ledger)
+            for scope, title in (
+                ("exfiltration", "POST stolen data to webhook"),
+                ("command_control", "Poll operator task endpoint"),
+                ("collection", "Collect local credentials"),
+            ):
+                broker.execute("record_finding", {
+                    "kind": "behavior", "scope": scope, "title": title,
+                    "description": "Evidence-backed application behavior.",
+                    "confidence": 0.9, "evidence_ids": ["obs-config"],
+                })
+            communications = ledger.compile_communications()
+            self.assertEqual(
+                [(item["scope"], item["title"]) for item in communications],
+                [
+                    ("exfiltration", "POST stolen data to webhook"),
+                    ("command_control", "Poll operator task endpoint"),
+                ],
+            )
 
     def test_rejects_missing_reachability_evidence_before_append(self):
         with TemporaryDirectory() as directory:
