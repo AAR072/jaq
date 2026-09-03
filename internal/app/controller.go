@@ -395,7 +395,7 @@ func validateFindingsLedger(path string, observations []evidence.Observation) er
 	sequence := 0
 	for scanner.Scan() {
 		sequence++
-		if sequence > 1000 {
+		if sequence > 1200 {
 			return errors.New("reject findings.jsonl: too many records")
 		}
 		decoder := json.NewDecoder(bytes.NewReader(scanner.Bytes()))

@@ -34,6 +34,9 @@ test("BudgetGuard blocks before excess provider and tool calls", () => {
   assert.throws(() => guard.beforeProviderCall(), HarnessLimitError);
   guard.beforeToolCall();
   assert.throws(() => guard.beforeToolCall(), /tool-call budget/);
+  guard.beforeFindingToolCall();
+  assert.equal(guard.snapshot().investigation_tool_calls, 1);
+  assert.equal(guard.snapshot().finding_tool_calls, 1);
   stats = { tokens: { total: 101 }, cost: 0.01 };
   const tokenGuard = new BudgetGuard({
     max_model_calls: 3, max_tool_calls: 3, max_total_tokens: 100, max_cost_usd: 0.1,

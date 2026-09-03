@@ -146,8 +146,11 @@ export class BudgetGuard {
     this.stats = stats;
     this.providerCalls = 0;
     this.summaryProviderCalls = 0;
+    this.findingFlushProviderCalls = 0;
     this.reportingAuxiliaryProviderCalls = 0;
     this.toolCalls = 0;
+    this.investigationToolCalls = 0;
+    this.findingToolCalls = 0;
   }
 
   beforeProviderCall() {
@@ -174,6 +177,14 @@ export class BudgetGuard {
     this.providerCalls += 1;
   }
 
+  beforeFindingFlushProviderCall() {
+    if (this.findingFlushProviderCalls >= 2) {
+      throw new HarnessLimitError("SUMMARY_CALL_BUDGET", "investigator finding-flush call budget exhausted");
+    }
+    this.findingFlushProviderCalls += 1;
+    this.providerCalls += 1;
+  }
+
   beforeReportingAuxiliaryProviderCall() {
     if (this.reportingAuxiliaryProviderCalls >= 2) {
       throw new HarnessLimitError("SUMMARY_CALL_BUDGET", "investigator reporting-compaction call budget exhausted");
@@ -185,9 +196,18 @@ export class BudgetGuard {
   }
 
   beforeToolCall() {
-    if (Number.isInteger(this.limits.max_tool_calls) && this.toolCalls >= this.limits.max_tool_calls) {
+    if (Number.isInteger(this.limits.max_tool_calls) && this.investigationToolCalls >= this.limits.max_tool_calls) {
       throw new HarnessLimitError("TOOL_CALL_BUDGET", "investigator tool-call budget exhausted");
     }
+    this.investigationToolCalls += 1;
+    this.toolCalls += 1;
+  }
+
+  beforeFindingToolCall() {
+    if (this.findingToolCalls >= 1000) {
+      throw new HarnessLimitError("TOOL_CALL_BUDGET", "investigator finding-record budget exhausted");
+    }
+    this.findingToolCalls += 1;
     this.toolCalls += 1;
   }
 
@@ -205,8 +225,11 @@ export class BudgetGuard {
     return {
       provider_calls: this.providerCalls,
       summary_provider_calls: this.summaryProviderCalls,
+      finding_flush_provider_calls: this.findingFlushProviderCalls,
       reporting_auxiliary_provider_calls: this.reportingAuxiliaryProviderCalls,
       tool_calls: this.toolCalls,
+      investigation_tool_calls: this.investigationToolCalls,
+      finding_tool_calls: this.findingToolCalls,
     };
   }
 }

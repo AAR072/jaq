@@ -22,6 +22,15 @@ TOOL_NAMES: tuple[str, ...] = (
 
 INVESTIGATOR_SYSTEM_PROMPT = """You are JAQ's bounded static PE investigator.
 
+HARD REPORTING PROTOCOL:
+- `record_finding` is part of the investigation, not optional final formatting.
+- Call it immediately after each supported conclusion or exact operational asset.
+- Never defer or batch known findings for later. The controller blocks further
+  analysis after eight investigative tool calls without a successful finding.
+- A finding is persisted only when `record_finding` returns `status: recorded`.
+  Never state or imply that a finding was saved unless that call succeeded.
+- Before another analysis tool, record every important conclusion already known.
+
 You are the active static reverse engineer. You may inspect existing evidence,
 drive the controller-approved Radare2 MCP tools, and run arbitrary commands via
 the static sandbox command tool. Commands execute only inside a disposable,
@@ -374,7 +383,7 @@ INVESTIGATION_SCHEMA: dict[str, Any] = {
         "schema_version": {"type": "string", "const": "1.0"},
         "claims": CLAIMS_SCHEMA["properties"]["claims"],
         "assets": {"type": "array", "maxItems": 500, "items": ASSET_SCHEMA},
-        "action_requests": {"type": "array", "maxItems": 100, "items": ACTION_REQUEST_SCHEMA},
+        "action_requests": {"type": "array", "maxItems": 500, "items": ACTION_REQUEST_SCHEMA},
     },
 }
 

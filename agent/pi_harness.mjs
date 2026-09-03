@@ -19,7 +19,7 @@ import {
   relaxedTerminalSchema,
   sanitizeError,
 } from "./protocol.mjs";
-import { budgetedModelRuntime, budgetReason } from "./research_budget.mjs";
+import { budgetedModelRuntime, budgetReason, FindingCadence } from "./research_budget.mjs";
 
 function requireObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -116,17 +116,18 @@ async function main() {
   let terminalAttempts = 0;
   let providerError;
   let statsSnapshot;
-  let finalizing = false;
+  let finalizationStage = null;
+  const findingCadence = new FindingCadence();
   let sendProgress = () => {};
   const enterFinalization = (reason) => {
     if (submission !== undefined) return;
-    if (finalizing) return;
-    finalizing = true;
-    sendProgress("finalizing");
+    if (finalizationStage) return;
+    finalizationStage = "findings";
+    sendProgress(researchMode ? "finding_flush" : "finalizing");
     if (session) {
       session.setThinkingLevel("off");
       if (researchMode) {
-        session.setActiveToolsByName([]);
+        session.setActiveToolsByName(["record_finding"]);
       } else {
         session.setActiveToolsByName([terminalName]);
         void session.steer(
@@ -134,6 +135,11 @@ async function main() {
         ).catch(() => {});
       }
     }
+  };
+  const enterSummary = () => {
+    if (finalizationStage !== "summary") sendProgress("finalizing");
+    finalizationStage = "summary";
+    session?.setActiveToolsByName([]);
   };
   const guard = new BudgetGuard(init.budgets, () => session?.getSessionStats());
   sendProgress = (event, extra = {}) => {
@@ -159,8 +165,9 @@ async function main() {
     }),
     guard,
     researchMode,
-    () => finalizing,
+    () => finalizationStage,
     enterFinalization,
+    enterSummary,
     () => guard.nearCost(0.70),
     init.budgets.summary_max_output_tokens,
     () => {
@@ -236,10 +243,11 @@ async function main() {
     parameters: Type.Unsafe(definition.parameters),
     executionMode: "sequential",
     async execute(_callID, params) {
+      const findingTool = researchMode && definition.name === "record_finding";
       if (submission !== undefined) {
         return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
       }
-      if (finalizing) {
+      if (finalizationStage && !(finalizationStage === "findings" && findingTool)) {
         return toolResult(
           researchMode
             ? "Investigation tools are closed. Return the concise final research summary now."
@@ -248,15 +256,24 @@ async function main() {
           true,
         );
       }
+      if (!finalizationStage && researchMode && findingCadence.blocks(definition.name)) {
+        return toolResult(
+          "Reporting checkpoint required: call record_finding now for every supported conclusion from the evidence already collected before using another analysis tool. Do not batch findings for the end.",
+          { tool: definition.name },
+          true,
+        );
+      }
       try {
-        guard.beforeToolCall();
+        if (findingTool) guard.beforeFindingToolCall();
+        else guard.beforeToolCall();
         if (definition.name !== "run_static_command" || guard.toolCalls % 5 === 0) {
           sendProgress("tool_started", { tool: definition.name });
         }
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
+        if (researchMode) findingCadence.recordSuccess(definition.name);
         if (
           Number.isInteger(init.budgets.max_tool_calls)
-          && guard.toolCalls >= init.budgets.max_tool_calls
+          && guard.investigationToolCalls >= init.budgets.max_tool_calls
         ) {
           enterFinalization("the tool-call investigation budget is exhausted");
         }

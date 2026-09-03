@@ -71,6 +71,25 @@ class FindingLedgerTest(unittest.TestCase):
             self.assertEqual(compiled["action_requests"][0]["target"]["url"], url)
             self.assertIn(token, (root / "findings.jsonl").read_text(encoding="utf-8"))
 
+    def test_model_identified_payload_download_derives_pending_fetch_request(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, ledger = self.fixture(root)
+            broker = PiToolBroker(store, NoRuntime(), ledger)
+            url = store.get("obs-config").raw_value["payload_url"]
+            result = broker.execute("record_finding", {
+                "kind": "asset", "title": "Referenced second stage",
+                "description": "The sample references a remote plugin DLL.",
+                "confidence": 0.95, "evidence_ids": ["obs-config"],
+                "asset_type": "url", "value": url, "role": "Plugin module download",
+            })
+            compiled = ledger.compile()
+            self.assertIn("derived_request_id", result)
+            self.assertEqual(len(compiled["action_requests"]), 1)
+            self.assertEqual(compiled["action_requests"][0]["kind"], "fetch_remote_payload")
+            self.assertEqual(compiled["action_requests"][0]["target"], {"url": url})
+            self.assertEqual(compiled["action_requests"][0]["status"], "pending_authorization")
+
     def test_rejects_missing_evidence_without_appending(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,6 +161,26 @@ class FindingLedgerTest(unittest.TestCase):
                     "path_evidence_ids": ["obs-missing"],
                 })
             self.assertEqual(ledger.records, ())
+
+    def test_unambiguous_compacted_evidence_id_is_resolved(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation_id = "obs-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            observation = Observation(
+                id=observation_id, type="fixture", raw_value="supported",
+                normalized_value="supported", artifact_location={"artifact": "sample"},
+                analyzer={"name": "fixture", "version": "1"}, provenance={"source": "fixture"},
+            )
+            evidence_path = root / "observations.jsonl"
+            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            ledger = FindingLedger(root / "findings.jsonl")
+            broker = PiToolBroker(EvidenceStore(evidence_path), NoRuntime(), ledger)
+            result = broker.execute("record_finding", {
+                "kind": "behavior", "title": "Supported behavior",
+                "description": "The behavior is supported.", "confidence": 1.0,
+                "evidence_ids": ["obs-0123456789ab…"],
+            })
+            self.assertEqual(result["evidence_ids"], [observation_id])
 
     def test_identical_append_is_idempotent_and_private(self):
         with TemporaryDirectory() as directory:

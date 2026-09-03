@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlparse
 
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .findings import FindingError, FindingLedger
@@ -38,6 +39,7 @@ MAX_RESEARCH_RECOVERY_ITEM_BYTES = 1_600
 _PROGRESS_PHASES = {"research", "harvest"}
 _PROGRESS_EVENTS = {
     "phase_started", "model_progress", "tool_started", "finalizing",
+    "finding_flush",
     "submission_attempt", "submission_rejected", "submission_accepted",
     "phase_completed", "local_checkpoint", "local_dossier",
 }
@@ -85,6 +87,8 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
             if phase == "research"
             else f"{prefix} preparing checkpoint at cost=${float(cost):.5f}"
         )
+    elif event == "finding_flush":
+        message = f"{prefix} investigation cap reached; recording final findings at cost=${float(cost):.5f}"
     elif event == "submission_attempt":
         attempt = frame.get("attempt")
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -517,6 +521,35 @@ class PiToolBroker:
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return f"{prefix}-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:24]}"
 
+    def _resolve_evidence_id(self, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if self.store.get(value) is not None:
+            return value
+        prefix = value.removesuffix("…").removesuffix("...")
+        if len(prefix) < 12 or prefix == value:
+            return None
+        matches = [item.id for item in self.store.observations if item.id.startswith(prefix)]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _is_remote_payload_asset(record: Mapping[str, Any]) -> bool:
+        value = record.get("value")
+        role = record.get("role")
+        if not isinstance(value, str) or not isinstance(role, str):
+            return False
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        executable_suffixes = {
+            ".exe", ".dll", ".sys", ".scr", ".msi", ".ps1", ".bat", ".cmd", ".jar", ".apk", ".bin",
+        }
+        payload_role = any(word in role.lower() for word in ("download", "payload", "plugin", "module", "stage"))
+        return (
+            record.get("type") in {"remote_payload", "download_location"}
+            or payload_role and PureWindowsPath(unquote(parsed.path)).suffix.lower() in executable_suffixes
+        )
+
     def _record_finding(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if self.finding_ledger is None:
             raise PiHarnessError("record_finding is unavailable without a findings ledger")
@@ -542,10 +575,14 @@ class PiToolBroker:
             or not isinstance(raw_evidence_ids, list)
         ):
             raise PiHarnessError("record_finding common fields are invalid")
-        evidence_ids = list(dict.fromkeys(raw_evidence_ids))
-        if not 1 <= len(evidence_ids) <= 100 or any(
-            not isinstance(item, str) or self.store.get(item) is None for item in evidence_ids
-        ):
+        if any(not isinstance(item, str) for item in raw_evidence_ids):
+            raise PiHarnessError("record_finding cites missing or invalid evidence")
+        evidence_ids = list(dict.fromkeys(
+            resolved
+            for item in raw_evidence_ids
+            if (resolved := self._resolve_evidence_id(item)) is not None
+        ))
+        if not 1 <= len(evidence_ids) <= 100 or len(evidence_ids) != len(set(raw_evidence_ids)):
             raise PiHarnessError("record_finding cites missing or invalid evidence")
 
         candidate: dict[str, Any] = {
@@ -559,11 +596,12 @@ class PiToolBroker:
                 raise PiHarnessError("record_finding has invalid reachability")
             if not isinstance(entrypoints, list) or not isinstance(path_ids, list):
                 raise PiHarnessError("record_finding reachability IDs must be arrays")
-            if any(
-                not isinstance(item, str) or self.store.get(item) is None
-                for item in [*entrypoints, *path_ids]
-            ):
+            resolved_entrypoints = [self._resolve_evidence_id(item) for item in entrypoints]
+            resolved_path_ids = [self._resolve_evidence_id(item) for item in path_ids]
+            if any(item is None for item in [*resolved_entrypoints, *resolved_path_ids]):
                 raise PiHarnessError("record_finding reachability cites missing evidence")
+            entrypoints = list(dict.fromkeys(resolved_entrypoints))
+            path_ids = list(dict.fromkeys(resolved_path_ids))
             seed = {
                 "kind": kind, "title": title.strip(), "description": description.strip(),
                 "confidence": float(confidence), "evidence_ids": evidence_ids,
@@ -670,7 +708,7 @@ class PiToolBroker:
                 if item["kind"] == record["kind"]
                 and json.dumps(item["target"], ensure_ascii=False, sort_keys=True) == target_key
             ), None)
-            if duplicate is None and len(existing["action_requests"]) >= 100:
+            if duplicate is None and len(existing["action_requests"]) >= 500:
                 raise PiHarnessError("action-request finding limit reached")
             if duplicate is not None and (
                 len(set([*duplicate["evidence_ids"], *record["evidence_ids"]])) > 100
@@ -684,13 +722,26 @@ class PiToolBroker:
             )
         except FindingError as error:
             raise PiHarnessError(str(error)) from error
-        return {
+        response = {
             "status": "recorded",
             "finding_id": envelope["id"],
             "record_kind": envelope["kind"],
             "record_id": envelope["record"]["id"],
             "evidence_ids": envelope["record"]["evidence_ids"],
         }
+        if record_kind == "asset" and self._is_remote_payload_asset(record):
+            derived = self._record_finding({
+                "kind": "action_request",
+                "title": "Fetch referenced remote payload",
+                "description": "Fetch the model-identified remote payload in JAQ's isolated acquisition container for child static analysis.",
+                "confidence": float(confidence),
+                "evidence_ids": evidence_ids,
+                "request_kind": "fetch_remote_payload",
+                "target": {"url": record["value"]},
+                "requested_observations": ["downloaded_payload", "payload_hash", "static_analysis"],
+            })
+            response["derived_request_id"] = derived["record_id"]
+        return response
 
     def validate_research(self, payload: Any) -> dict[str, Any]:
         payload = self._canonicalize_research(payload)
@@ -911,7 +962,7 @@ class PiToolBroker:
             evidence_store=self.store,
         )
         assets = self._validate_records(payload.get("assets"), "asset", 500)
-        requests = self._validate_records(payload.get("action_requests"), "request", 100, requests=True)
+        requests = self._validate_records(payload.get("action_requests"), "request", 500, requests=True)
         covered: set[tuple[str, str]] = set()
         verified_assets: list[dict[str, Any]] = []
         for asset in assets:
@@ -1268,7 +1319,35 @@ class PiInvestigator:
         prior_results: Sequence[tuple[str, PiHarnessResult]] = (),
     ) -> dict[str, Any]:
         compiled = self.finding_ledger.compile()
-        canonical = PiToolBroker(self.store, EvidenceOnlyRuntime()).validate_claims(compiled)
+        broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
+        existing_requests = {
+            (item["kind"], json.dumps(item["target"], ensure_ascii=False, sort_keys=True))
+            for item in compiled["action_requests"]
+        }
+        for asset in compiled["assets"]:
+            if not broker._is_remote_payload_asset(asset):
+                continue
+            target = {"url": asset["value"]}
+            key = ("fetch_remote_payload", json.dumps(target, ensure_ascii=False, sort_keys=True))
+            if key in existing_requests:
+                continue
+            reason = "Fetch the model-identified remote payload in JAQ's isolated acquisition container for child static analysis."
+            seed = {
+                "request_kind": "fetch_remote_payload", "target": target,
+                "description": reason, "evidence_ids": asset["evidence_ids"],
+            }
+            compiled["action_requests"].append({
+                "schema_version": "1.0",
+                "id": broker._semantic_id("request", seed),
+                "kind": "fetch_remote_payload",
+                "status": "pending_authorization",
+                "reason": reason,
+                "evidence_ids": asset["evidence_ids"],
+                "target": target,
+                "requested_observations": ["downloaded_payload", "payload_hash", "static_analysis"],
+            })
+            existing_requests.add(key)
+        canonical = broker.validate_claims(compiled)
         usage: dict[str, int] = {}
         total_cost = 0.0
         for phase, result in prior_results:

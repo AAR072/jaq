@@ -228,6 +228,16 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
             summary_output.getvalue(),
             "JAQ_PROGRESS [research] preparing final summary at cost=$0.10000\n",
         )
+        flush_output = io.StringIO()
+        with patch.dict(os.environ, {"JAQ_PROGRESS_TRANSPORT": "1"}), redirect_stderr(flush_output):
+            _emit_progress({
+                "type": "progress", "phase": "research", "event": "finding_flush",
+                "provider_calls": 113, "tool_calls": 119, "cost_usd": 0.1,
+            })
+        self.assertEqual(
+            flush_output.getvalue(),
+            "JAQ_PROGRESS [research] investigation cap reached; recording final findings at cost=$0.10000\n",
+        )
         with self.assertRaises(PiHarnessError):
             _emit_progress({
                 "type": "progress", "phase": "research", "event": "tool_started",
