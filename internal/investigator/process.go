@@ -19,7 +19,7 @@ import (
 const DefaultTimeout = 30 * time.Minute
 const progressPrefix = "JAQ_PROGRESS "
 
-var progressLinePattern = regexp.MustCompile(`^\[(research|report|harvest)\] (started|model calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5}|tool #[0-9]+: [A-Za-z][A-Za-z0-9_]{0,99}|budget reached; recording final findings at cost=\$[0-9]+\.[0-9]{5}|preparing (checkpoint|final summary) at cost=\$[0-9]+\.[0-9]{5}|submission attempt #[0-9]+|submission rejected; correcting|submission accepted|checkpoint compiled locally from persisted evidence|dossier compiled locally from [0-9]+ recorded findings|completed calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5})$`)
+var progressLinePattern = regexp.MustCompile(`^\[(research|report|harvest)\] (started|model calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5}|tool #[0-9]+: [A-Za-z][A-Za-z0-9_]{0,99}|inactivity timeout; preserving evidence|budget reached; recording final findings at cost=\$[0-9]+\.[0-9]{5}|preparing (checkpoint|final summary) at cost=\$[0-9]+\.[0-9]{5}|submission attempt #[0-9]+|submission rejected; correcting|submission accepted|checkpoint compiled locally from persisted evidence|dossier compiled locally from [0-9]+ recorded findings|completed calls=[0-9]+ tools=[0-9]+ cost=\$[0-9]+\.[0-9]{5})$`)
 
 type progressFilter struct {
 	mu          sync.Mutex

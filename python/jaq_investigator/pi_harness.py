@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 from pathlib import Path, PureWindowsPath
 import signal
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
@@ -40,6 +42,7 @@ _PROGRESS_PHASES = {"research", "report"}
 _PROGRESS_EVENTS = {
     "phase_started", "model_progress", "tool_started", "finalizing",
     "finding_flush",
+    "inactivity_timeout",
     "submission_attempt", "submission_rejected", "submission_accepted",
     "phase_completed", "local_checkpoint", "local_dossier",
 }
@@ -113,6 +116,8 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
         if not isinstance(findings, int) or isinstance(findings, bool) or findings < 0:
             raise PiHarnessError("Pi progress finding count is invalid")
         message = f"{prefix} dossier compiled locally from {findings} recorded findings"
+    elif event == "inactivity_timeout":
+        message = f"{prefix} inactivity timeout; preserving evidence"
     else:
         message = f"{prefix} completed calls={provider_calls} tools={tool_calls} cost=${float(cost):.5f}"
     transport_prefix = "JAQ_PROGRESS " if os.environ.get("JAQ_PROGRESS_TRANSPORT") == "1" else "jaq: "
@@ -195,6 +200,7 @@ class PiHarnessConfig:
     tool_preview_chars: int
     max_context_tokens: int
     keep_recent_tokens: int
+    inactivity_timeout_seconds: int
 
     @classmethod
     def from_env(cls, output_dir: Path) -> "PiHarnessConfig":
@@ -223,6 +229,7 @@ class PiHarnessConfig:
             tool_preview_chars=_positive_int_env("JAQ_TOOL_PREVIEW_CHARS", 2_400, 64_000),
             max_context_tokens=_positive_int_env("JAQ_MAX_CONTEXT_TOKENS", 64_000, 2_000_000),
             keep_recent_tokens=_positive_int_env("JAQ_KEEP_RECENT_TOKENS", 12_000, 500_000),
+            inactivity_timeout_seconds=_positive_int_env("JAQ_INACTIVITY_TIMEOUT_SECONDS", 300, 3600),
         )
 
     def init_frame(
@@ -279,6 +286,9 @@ class PiHarnessConfig:
                 max_total_tokens=_positive_int_env("JAQ_REPORT_MAX_TOTAL_TOKENS", 200_000, 100_000_000),
                 max_cost_usd=_positive_float_env("JAQ_REPORT_MAX_COST_USD", 0.03, 1000.0),
                 max_output_tokens=_positive_int_env("JAQ_REPORT_MAX_OUTPUT_TOKENS", 8_192, 100_000),
+                inactivity_timeout_seconds=_positive_int_env(
+                    "JAQ_REPORT_INACTIVITY_TIMEOUT_SECONDS", self.inactivity_timeout_seconds, 3600,
+                ),
             )
         raise PiHarnessError("unknown Pi harness phase")
 
@@ -1300,6 +1310,21 @@ class PiHarnessRunner:
         last_progress_usage: dict[str, Any] = {}
         stderr_thread = threading.Thread(target=diagnostics.drain, args=(process.stderr,), daemon=True)
         stderr_thread.start()
+        stdout_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def read_stdout() -> None:
+            try:
+                while True:
+                    value = self._read_frame(process.stdout)
+                    stdout_queue.put(("frame", value))
+                    if value is None:
+                        return
+            except BaseException as error:
+                stdout_queue.put(("error", error))
+
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        stdout_thread.start()
+        last_activity = time.monotonic()
         try:
             self._write_frame(
                 process.stdin,
@@ -1312,7 +1337,27 @@ class PiHarnessRunner:
                 ),
             )
             while True:
-                frame = self._read_frame(process.stdout)
+                remaining = self.config.inactivity_timeout_seconds - (time.monotonic() - last_activity)
+                if remaining <= 0:
+                    _emit_progress({
+                        "type": "progress", "phase": mode, "event": "inactivity_timeout",
+                        "provider_calls": last_progress_usage.get("provider_calls", 0),
+                        "tool_calls": last_progress_usage.get("tool_calls", 0),
+                        "cost_usd": last_progress_usage.get("cost_usd", 0),
+                    })
+                    raise PiHarnessError(
+                        f"Pi {mode} phase produced no protocol activity for "
+                        f"{self.config.inactivity_timeout_seconds} seconds; preserved evidence will be compiled locally",
+                        partial_usage=last_progress_usage,
+                    )
+                try:
+                    item_kind, item = stdout_queue.get(timeout=remaining)
+                except queue.Empty:
+                    continue
+                if item_kind == "error":
+                    raise item
+                frame = item
+                last_activity = time.monotonic()
                 if frame is None:
                     code = process.wait(timeout=2)
                     raise PiHarnessError(
@@ -1351,10 +1396,12 @@ class PiHarnessRunner:
                             "type": "response", "id": request_id, "ok": False,
                             "error": {"type": error.__class__.__name__, "message": " ".join(str(error).split())[:500]},
                         })
+                        last_activity = time.monotonic()
                     else:
                         self._write_frame(process.stdin, {
                             "type": "response", "id": request_id, "ok": True, "result": result,
                         })
+                        last_activity = time.monotonic()
                     continue
                 if kind == "error":
                     error = frame.get("error") if isinstance(frame.get("error"), dict) else {}
@@ -1378,6 +1425,7 @@ class PiHarnessRunner:
             except (OSError, ValueError):
                 pass
             self._stop(process)
+            stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
             for stream in (process.stdout, process.stderr):
                 try:

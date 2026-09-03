@@ -350,6 +350,7 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10
                 max_cost_usd=0.1, max_output_tokens=1000, summary_max_output_tokens=256,
                 tool_preview_chars=1000,
                 max_context_tokens=1000, keep_recent_tokens=100,
+                inactivity_timeout_seconds=300,
             )
             store = EvidenceStore(evidence_path)
             ledger = FindingLedger(root / "findings.jsonl")
@@ -443,6 +444,7 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"total_tokens":3,
                 max_tool_calls=2, max_total_tokens=1000, max_cost_usd=0.1,
                 max_output_tokens=1000, summary_max_output_tokens=256, tool_preview_chars=1000,
                 max_context_tokens=1000, keep_recent_tokens=100,
+                inactivity_timeout_seconds=300,
             )
             result = PiHarnessRunner(config).run(
                 PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()), mode="research",
