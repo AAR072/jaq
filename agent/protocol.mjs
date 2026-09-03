@@ -204,7 +204,7 @@ export class BudgetGuard {
   }
 
   beforeFindingToolCall() {
-    if (this.findingToolCalls >= 1000) {
+    if (this.findingToolCalls >= 100) {
       throw new HarnessLimitError("TOOL_CALL_BUDGET", "investigator finding-record budget exhausted");
     }
     this.findingToolCalls += 1;

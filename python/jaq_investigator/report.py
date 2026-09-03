@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import hashlib
 import html
 import json
 import re
@@ -29,6 +30,18 @@ def _inline(value: Any) -> str:
 
 def _code(value: Any) -> str:
     return f"<code>{_inline(value)}</code>"
+
+
+def _evidence_preview(value: Any, maximum: int = 700) -> str:
+    text = (
+        value if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    )
+    if len(text) <= maximum:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    marker = f"… [truncated; sha256:{digest}]"
+    return text[: maximum - len(marker)] + marker
 
 
 def _observation_values(observation: Observation) -> list[tuple[str, str]]:
@@ -232,7 +245,7 @@ def render_report(
         for observation in sorted(details, key=lambda item: item.id):
             lines.append(
                 f"- Evidence {_code(observation.id)} ({_code(observation.type)}): "
-                f"normalized value {_code(observation.normalized_value)}"
+                f"normalized preview {_code(_evidence_preview(observation.normalized_value))}"
             )
         lines.append("")
 

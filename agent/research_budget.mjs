@@ -1,23 +1,7 @@
 import { HarnessLimitError } from "./protocol.mjs";
 
 export const FINAL_RESEARCH_SUMMARY_INSTRUCTION = "The investigation budget is exhausted. Do not use tools. Return only a concise final research summary of the strongest recovered behavior, assets, deobfuscation work, artifacts, exact evidence IDs, and unresolved gaps.";
-export const FINAL_FINDING_FLUSH_INSTRUCTION = "The investigation budget is exhausted. Analysis tools are closed. Before summarizing, call record_finding now for every supported behavior, credential, token, C2 endpoint, URL, payload, persistence mechanism, configuration value, recovery request, and unresolved conclusion not already recorded. Use multiple record_finding calls in this response when needed. Do not claim a finding was persisted unless you actually call the tool.";
-
-export class FindingCadence {
-  constructor(interval = 8) {
-    this.interval = interval;
-    this.analysisCallsSinceFinding = 0;
-  }
-
-  blocks(toolName) {
-    return toolName !== "record_finding" && this.analysisCallsSinceFinding >= this.interval;
-  }
-
-  recordSuccess(toolName) {
-    if (toolName === "record_finding") this.analysisCallsSinceFinding = 0;
-    else this.analysisCallsSinceFinding += 1;
-  }
-}
+export const FINAL_FINDING_FLUSH_INSTRUCTION = "The reporting budget is exhausted. Evidence-reading tools are closed. Call record_finding now for any remaining reportable application behavior, credential, infrastructure, payload, persistence, impact, recovery request, or single concrete analysis blocker. Do not record packaging, parser, interpreter, library, tooling, or investigation-process details. Use multiple record_finding calls in this response when needed. Do not claim a finding was persisted unless you actually call the tool.";
 
 export function budgetReason(error) {
   if (error?.code === "MODEL_CALL_BUDGET") return "the model-call investigation budget is exhausted";
@@ -65,12 +49,34 @@ export function forceFindingFlushArguments(args, maxOutputTokens) {
   ];
 }
 
-export function budgetedModelRuntime(runtime, guard, researchMode, finalizationStage, enterFinalization, enterSummary, shouldFinalizeForCost, summaryMaxOutputTokens, onProviderCall) {
+export function budgetedModelRuntime(runtime, guard, mode, finalizationStage, enterFinalization, enterSummary, summaryMaxOutputTokens, onProviderCall) {
   for (const method of ["stream", "streamSimple"]) {
     const original = runtime[method].bind(runtime);
     runtime[method] = (...args) => {
       let requestArgs = args;
-      if (researchMode) {
+      if (mode === "research") {
+        const compaction = isCompactionCall(args);
+        const stage = finalizationStage();
+        if (stage && compaction) {
+          guard.beforeReportingAuxiliaryProviderCall();
+        } else if (stage === "summary") {
+          guard.beforeSummaryProviderCall();
+          requestArgs = forceSummaryArguments(args, summaryMaxOutputTokens);
+        } else {
+          try {
+            guard.beforeProviderCall();
+          } catch (error) {
+            if (!(error instanceof HarnessLimitError)) throw error;
+            enterFinalization(budgetReason(error));
+            if (compaction) {
+              guard.beforeReportingAuxiliaryProviderCall();
+            } else {
+              guard.beforeSummaryProviderCall();
+              requestArgs = forceSummaryArguments(args, summaryMaxOutputTokens);
+            }
+          }
+        }
+      } else if (mode === "report") {
         const compaction = isCompactionCall(args);
         let stage = finalizationStage();
         if (stage && compaction) {
@@ -99,11 +105,6 @@ export function budgetedModelRuntime(runtime, guard, researchMode, finalizationS
             }
           }
         }
-      } else {
-        if (shouldFinalizeForCost()) {
-          enterFinalization("the cost budget is nearly exhausted");
-        }
-        guard.beforeProviderCall();
       }
       onProviderCall();
       return original(...requestArgs);

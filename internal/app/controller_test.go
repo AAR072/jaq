@@ -70,12 +70,43 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	if _, ok := manifest.ModelRoles["harvester"]; ok {
 		t.Fatalf("normal runs must not claim a separate harvester model role: %#v", manifest.ModelRoles)
 	}
+	if role, ok := manifest.ModelRoles["reporter"]; !ok || role.Model != "investigator" || role.Provider != "mock" {
+		t.Fatalf("missing reporter model role: %#v", manifest.ModelRoles)
+	}
 	if !session.closed {
 		t.Fatal("sandbox session was not closed")
 	}
 	observations, err := evidence.ReadObservationsFile(filepath.Join(output, "observations.jsonl"))
 	if err != nil || len(observations) < 10 {
 		t.Fatalf("expected deterministic native evidence: count=%d err=%v", len(observations), err)
+	}
+}
+
+func TestControllerMarksBlockerOnlyDossierPartial(t *testing.T) {
+	sample := writeFixture(t)
+	output := filepath.Join(t.TempDir(), "run")
+	controller, _ := mockedController(t, nil)
+	controller.Investigator = &fakeInvestigator{run: func(ctx context.Context, output string) error {
+		if err := writeMockDossier(ctx, output); err != nil {
+			return err
+		}
+		path := filepath.Join(output, "findings.jsonl")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		data = []byte(strings.Replace(string(data), `"kind":"claim"`, `"kind":"claim","scope":"analysis_blocker"`, 1))
+		return os.WriteFile(path, data, 0o600)
+	}}
+	if err := controller.Analyze(context.Background(), sample, output); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := evidence.ReadManifest(filepath.Join(output, "run-manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Status != "partial" {
+		t.Fatalf("blocker-only dossier status = %q, want partial", manifest.Status)
 	}
 }
 

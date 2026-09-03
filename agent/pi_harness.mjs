@@ -16,10 +16,9 @@ import {
   HarnessLimitError,
   LineChannel,
   parseModelSelector,
-  relaxedTerminalSchema,
   sanitizeError,
 } from "./protocol.mjs";
-import { budgetedModelRuntime, budgetReason, FindingCadence } from "./research_budget.mjs";
+import { budgetedModelRuntime, budgetReason } from "./research_budget.mjs";
 
 function requireObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -46,14 +45,14 @@ function positiveNumber(value, label) {
 
 function validateInit(frame) {
   if (frame.type !== "init") throw new Error("first JAQ harness frame must be init");
-  if (!["research", "harvest"].includes(frame.mode)) {
-    throw new Error("mode must be research or harvest");
+  if (!["research", "report"].includes(frame.mode)) {
+    throw new Error("mode must be research or report");
   }
   const budgets = requireObject(frame.budgets, "budgets");
   const compaction = requireObject(frame.compaction, "compaction");
   const tools = frame.tool_definitions;
-  if (!Array.isArray(tools) || tools.length > 128 || (frame.mode === "research" && tools.length < 1)) {
-    throw new Error("tool_definitions must be a bounded array and nonempty during research");
+  if (!Array.isArray(tools) || tools.length < 1 || tools.length > 128) {
+    throw new Error("tool_definitions must be a bounded array and nonempty during research/report");
   }
   const names = new Set();
   for (const tool of tools) {
@@ -107,32 +106,25 @@ async function main() {
   const channel = new LineChannel();
   const init = validateInit(await channel.read());
   const researchMode = init.mode === "research";
-  const terminalName = "submit_investigation";
+  const reportMode = init.mode === "report";
   const { provider, model: modelID } = parseModelSelector(init.model);
   await mkdir(init.session_dir, { recursive: true, mode: 0o700 });
 
   let session;
-  let submission;
-  let terminalAttempts = 0;
   let providerError;
   let statsSnapshot;
   let finalizationStage = null;
-  const findingCadence = new FindingCadence();
   let sendProgress = () => {};
   const enterFinalization = (reason) => {
-    if (submission !== undefined) return;
     if (finalizationStage) return;
-    finalizationStage = "findings";
-    sendProgress(researchMode ? "finding_flush" : "finalizing");
+    finalizationStage = reportMode ? "findings" : "summary";
+    sendProgress(reportMode ? "finding_flush" : "finalizing");
     if (session) {
       session.setThinkingLevel("off");
-      if (researchMode) {
+      if (reportMode) {
         session.setActiveToolsByName(["record_finding"]);
       } else {
-        session.setActiveToolsByName([terminalName]);
-        void session.steer(
-          `Controller budget notice: ${reason}. Stop working and call ${terminalName} now using the strongest evidence already collected.`,
-        ).catch(() => {});
+        session.setActiveToolsByName([]);
       }
     }
   };
@@ -153,7 +145,6 @@ async function main() {
       cost_usd: typeof stats?.cost === "number" ? stats.cost : 0,
     };
     if (event === "tool_started") frame.tool = extra.tool;
-    if (event.startsWith("submission_")) frame.attempt = extra.attempt;
     channel.send(frame);
   };
   const runtime = budgetedModelRuntime(
@@ -164,11 +155,10 @@ async function main() {
       modelsPath: null,
     }),
     guard,
-    researchMode,
+    init.mode,
     () => finalizationStage,
     enterFinalization,
     enterSummary,
-    () => guard.nearCost(0.70),
     init.budgets.summary_max_output_tokens,
     () => {
       if (guard.providerCalls === 1 || guard.providerCalls % 5 === 0) {
@@ -195,21 +185,6 @@ async function main() {
     name: "jaq-compaction",
     hidden: true,
     factory(pi) {
-      pi.on("before_provider_request", (event) => {
-        if (
-          researchMode
-          ||
-          !event.payload
-          || typeof event.payload !== "object"
-        ) return;
-        const payload = event.payload;
-        if (Array.isArray(payload.tools)) {
-          payload.tools = payload.tools.filter((tool) =>
-            tool?.name === terminalName || tool?.function?.name === terminalName
-          );
-        }
-        payload.tool_choice = { type: "function", function: { name: terminalName } };
-      });
       pi.on("session_before_compact", () => ({
         customInstructions: [
           "Preserve exact JAQ evidence observation IDs and never invent IDs.",
@@ -232,7 +207,7 @@ async function main() {
     noContextFiles: true,
     systemPrompt: researchMode
       ? `${init.system_prompt}\n\nWhen research is complete, end with a concise assistant summary. Do not format or submit a checkpoint; the controller compiles it locally from persisted evidence.`
-      : `${init.system_prompt}\n\nWhen finished, you MUST call ${terminalName} exactly once. Do not print final JSON as assistant text.`,
+      : `${init.system_prompt}\n\nRecord each reportable item with record_finding, then end naturally. Do not construct or submit a complete dossier.`,
   });
   await loader.reload();
 
@@ -243,34 +218,23 @@ async function main() {
     parameters: Type.Unsafe(definition.parameters),
     executionMode: "sequential",
     async execute(_callID, params) {
-      const findingTool = researchMode && definition.name === "record_finding";
-      if (submission !== undefined) {
-        return toolResult("This phase is already complete; no further tool calls are allowed.", undefined, true);
-      }
+      const findingTool = reportMode && definition.name === "record_finding";
       if (finalizationStage && !(finalizationStage === "findings" && findingTool)) {
         return toolResult(
-          researchMode
-            ? "Investigation tools are closed. Return the concise final research summary now."
-            : `Evidence collection is closed. Call ${terminalName} now.`,
+          reportMode
+            ? "Evidence reading is closed. Finish recording supported findings, then end naturally."
+            : "Investigation tools are closed. Return the concise final research summary now.",
           undefined,
           true,
         );
       }
-      if (!finalizationStage && researchMode && findingCadence.blocks(definition.name)) {
-        return toolResult(
-          "Reporting checkpoint required: call record_finding now for every supported conclusion from the evidence already collected before using another analysis tool. Do not batch findings for the end.",
-          { tool: definition.name },
-          true,
-        );
-      }
       try {
-        if (findingTool) guard.beforeFindingToolCall();
+        if (findingTool && finalizationStage === "findings") guard.beforeFindingToolCall();
         else guard.beforeToolCall();
         if (definition.name !== "run_static_command" || guard.toolCalls % 5 === 0) {
           sendProgress("tool_started", { tool: definition.name });
         }
         const result = await channel.request("execute_tool", { name: definition.name, arguments: params });
-        if (researchMode) findingCadence.recordSuccess(definition.name);
         if (
           Number.isInteger(init.budgets.max_tool_calls)
           && guard.investigationToolCalls >= init.budgets.max_tool_calls
@@ -282,7 +246,7 @@ async function main() {
           { tool: definition.name },
         );
       } catch (error) {
-        if (researchMode && error instanceof HarnessLimitError) {
+        if ((researchMode || reportMode) && error instanceof HarnessLimitError) {
           enterFinalization(budgetReason(error));
         }
         return toolResult(
@@ -293,47 +257,6 @@ async function main() {
       }
     },
   }));
-
-  if (!researchMode) customTools.push({
-    name: terminalName,
-    label: "Submit investigation",
-    description: "Validate and submit final claims, operational assets, and pending action requests. This terminates the legacy harvest phase.",
-    // Let formatting-only defects reach the controller-owned canonicalizer.
-    // The original strict schema is still enforced after local repair.
-    parameters: Type.Unsafe(relaxedTerminalSchema(init.output_schema)),
-    prepareArguments(args) {
-      const value = structuredClone(args ?? {});
-      value.schema_version ??= "1.0";
-      if (init.mode === "harvest") {
-        for (const item of value.claims ?? []) item.schema_version ??= "1.0";
-        for (const item of value.assets ?? []) item.schema_version ??= "1.0";
-        for (const item of value.action_requests ?? []) item.schema_version ??= "1.0";
-        for (const claim of value.claims ?? []) claim.reachability && (claim.reachability.schema_version ??= "1.0");
-      }
-      return value;
-    },
-    executionMode: "sequential",
-    async execute(_callID, params) {
-      terminalAttempts += 1;
-      sendProgress("submission_attempt", { attempt: terminalAttempts });
-      if (submission !== undefined) {
-        return toolResult("This phase was already submitted.", undefined, true);
-      }
-      try {
-        const canonical = await channel.request("validate_claims", { claims: params });
-        submission = canonical;
-        sendProgress("submission_accepted", { attempt: terminalAttempts });
-        return toolResult(`${init.mode} submission validated and accepted.`, undefined, false, true);
-      } catch (error) {
-        sendProgress("submission_rejected", { attempt: terminalAttempts });
-        return toolResult(
-          JSON.stringify({ status: "rejected", error_type: error?.name ?? "ClaimsError", message: sanitizeError(error) }),
-          undefined,
-          true,
-        );
-      }
-    },
-  });
 
   const sessionManager = SessionManager.create(init.session_dir, init.session_dir);
   ({ session } = await createAgentSession({
@@ -358,60 +281,16 @@ async function main() {
           : undefined
       );
     }
-    if (
-      event.type === "turn_end"
-      && !researchMode
-      && Number.isInteger(init.budgets.max_model_calls)
-      && guard.providerCalls >= Math.max(1, init.budgets.max_model_calls - 3)
-    ) {
-      enterFinalization("the model-call budget is nearly exhausted");
-    }
   });
 
-  if (researchMode) {
-    await session.prompt(init.task, { expandPromptTemplates: false });
-    await session.waitForIdle();
-    if (providerError) throw new Error(`provider error: ${providerError}`);
-    statsSnapshot = session.getSessionStats();
-    sendProgress("phase_completed");
-    channel.send({
-      type: "complete",
-      submission: null,
-      usage: {
-        input_tokens: statsSnapshot.tokens.input,
-        output_tokens: statsSnapshot.tokens.output,
-        cache_read_tokens: statsSnapshot.tokens.cacheRead,
-        cache_write_tokens: statsSnapshot.tokens.cacheWrite,
-        total_tokens: statsSnapshot.tokens.total,
-        cost_usd: statsSnapshot.cost,
-        ...guard.snapshot(),
-      },
-      session: { id: session.sessionId, file: session.sessionFile },
-    });
-    return;
-  }
-
-  for (let attempt = 0; submission === undefined && attempt < 6; attempt += 1) {
-    const prompt = attempt === 0
-      ? init.task
-      : terminalAttempts > 0
-        ? `Your previous ${terminalName} submission was not accepted. Correct the validation error and call ${terminalName} again now.`
-        : `You ended without submitting. Use the existing evidence and call ${terminalName} now.`;
-    await session.prompt(prompt, { expandPromptTemplates: false });
-    await session.waitForIdle();
-    if (providerError) throw new Error(`provider error: ${providerError}`);
-  }
+  await session.prompt(init.task, { expandPromptTemplates: false });
+  await session.waitForIdle();
+  if (providerError) throw new Error(`provider error: ${providerError}`);
   statsSnapshot = session.getSessionStats();
-  if (submission === undefined) {
-    if (terminalAttempts > 0) {
-      throw new Error(`Pi ${init.mode} phase made ${terminalAttempts} ${terminalName} attempt(s), but none passed validation`);
-    }
-    throw new Error(`Pi ${init.mode} phase ended without calling ${terminalName}`);
-  }
   sendProgress("phase_completed");
   channel.send({
     type: "complete",
-    submission,
+    submission: null,
     usage: {
       input_tokens: statsSnapshot.tokens.input,
       output_tokens: statsSnapshot.tokens.output,

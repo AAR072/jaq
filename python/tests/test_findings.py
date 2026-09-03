@@ -45,19 +45,19 @@ class FindingLedgerTest(unittest.TestCase):
             url = store.get("obs-config").raw_value["payload_url"]
 
             asset = broker.execute("record_finding", {
-                "kind": "asset", "title": "Discord bot token",
+                "kind": "asset", "scope": "credential", "title": "Discord bot token",
                 "description": "Decoded Discord command-and-control credential.",
                 "confidence": 0.99, "evidence_ids": ["obs-config"],
                 "asset_type": "bearer_token", "value": token,
                 "role": "Discord C2 authentication",
             })
             broker.execute("record_finding", {
-                "kind": "behavior", "title": "Discord-controlled remote access",
+                "kind": "behavior", "scope": "command_control", "title": "Discord-controlled remote access",
                 "description": "The decoded configuration couples a Discord token with a remote payload URL.",
                 "confidence": 0.9, "evidence_ids": ["obs-config"],
             })
             broker.execute("record_finding", {
-                "kind": "action_request", "title": "Retrieve referenced second stage",
+                "kind": "action_request", "scope": "payload_recovery", "title": "Retrieve referenced second stage",
                 "description": "Recover the statically referenced plugin for separate analysis.",
                 "confidence": 0.95, "evidence_ids": ["obs-config"],
                 "request_kind": "fetch_remote_payload", "target": {"url": url},
@@ -70,6 +70,10 @@ class FindingLedgerTest(unittest.TestCase):
             self.assertEqual(compiled["claims"][0]["classification"], "Discord-controlled remote access")
             self.assertEqual(compiled["action_requests"][0]["target"]["url"], url)
             self.assertIn(token, (root / "findings.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item.get("scope") for item in ledger.records],
+                ["credential", "command_control", "payload_recovery"],
+            )
 
     def test_model_identified_payload_download_derives_pending_fetch_request(self):
         with TemporaryDirectory() as directory:
@@ -78,7 +82,7 @@ class FindingLedgerTest(unittest.TestCase):
             broker = PiToolBroker(store, NoRuntime(), ledger)
             url = store.get("obs-config").raw_value["payload_url"]
             result = broker.execute("record_finding", {
-                "kind": "asset", "title": "Referenced second stage",
+                "kind": "asset", "scope": "payload", "title": "Referenced second stage",
                 "description": "The sample references a remote plugin DLL.",
                 "confidence": 0.95, "evidence_ids": ["obs-config"],
                 "asset_type": "url", "value": url, "role": "Plugin module download",
@@ -97,8 +101,22 @@ class FindingLedgerTest(unittest.TestCase):
             broker = PiToolBroker(store, NoRuntime(), ledger)
             with self.assertRaisesRegex(PiHarnessError, "missing or invalid evidence"):
                 broker.execute("record_finding", {
-                    "kind": "behavior", "title": "Unsupported", "description": "No evidence.",
+                    "kind": "behavior", "scope": "application_logic", "title": "Unsupported", "description": "No evidence.",
                     "confidence": 1.0, "evidence_ids": ["obs-missing"],
+                })
+            self.assertEqual(ledger.records, ())
+
+    def test_rejects_packaging_or_tooling_as_reportable_scope(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, ledger = self.fixture(root)
+            broker = PiToolBroker(store, NoRuntime(), ledger)
+            with self.assertRaisesRegex(PiHarnessError, "scope is invalid"):
+                broker.execute("record_finding", {
+                    "kind": "behavior", "scope": "packaging",
+                    "title": "PyInstaller archive parsed",
+                    "description": "Documented parser implementation progress.",
+                    "confidence": 1.0, "evidence_ids": ["obs-config"],
                 })
             self.assertEqual(ledger.records, ())
 
@@ -109,7 +127,7 @@ class FindingLedgerTest(unittest.TestCase):
             broker = PiToolBroker(store, NoRuntime(), ledger)
             with self.assertRaisesRegex(PiHarnessError, "not present exactly"):
                 broker.execute("record_finding", {
-                    "kind": "asset", "title": "Guessed token",
+                    "kind": "asset", "scope": "credential", "title": "Guessed token",
                     "description": "This value was not actually recovered.",
                     "confidence": 0.9, "evidence_ids": ["obs-config"],
                     "asset_type": "bearer_token", "value": "invented-token-value",
@@ -124,7 +142,7 @@ class FindingLedgerTest(unittest.TestCase):
             broker = PiToolBroker(store, NoRuntime(), ledger)
             token = store.get("obs-config").raw_value["discord_token"]
             base = {
-                "kind": "asset", "title": "Discord token", "description": "Credential.",
+                "kind": "asset", "scope": "credential", "title": "Discord token", "description": "Credential.",
                 "evidence_ids": ["obs-config"], "asset_type": "bearer_token",
                 "value": token, "role": "Discord C2 authentication",
             }
@@ -140,7 +158,7 @@ class FindingLedgerTest(unittest.TestCase):
             store, ledger = self.fixture(root)
             broker = PiToolBroker(store, NoRuntime(), ledger)
             base = {
-                "kind": "behavior", "title": "Capability", "description": "Supported behavior.",
+                "kind": "behavior", "scope": "application_logic", "title": "Capability", "description": "Supported behavior.",
                 "confidence": 0.9, "evidence_ids": ["obs-config"],
             }
             first = broker.execute("record_finding", {**base, "role": "configuration"})
@@ -155,7 +173,7 @@ class FindingLedgerTest(unittest.TestCase):
             broker = PiToolBroker(store, NoRuntime(), ledger)
             with self.assertRaisesRegex(PiHarnessError, "reachability cites missing evidence"):
                 broker.execute("record_finding", {
-                    "kind": "behavior", "title": "Reachable behavior",
+                    "kind": "behavior", "scope": "execution", "title": "Reachable behavior",
                     "description": "Claimed path.", "confidence": 0.9,
                     "evidence_ids": ["obs-config"], "reachability_status": "reachable",
                     "path_evidence_ids": ["obs-missing"],
@@ -176,7 +194,7 @@ class FindingLedgerTest(unittest.TestCase):
             ledger = FindingLedger(root / "findings.jsonl")
             broker = PiToolBroker(EvidenceStore(evidence_path), NoRuntime(), ledger)
             result = broker.execute("record_finding", {
-                "kind": "behavior", "title": "Supported behavior",
+                "kind": "behavior", "scope": "application_logic", "title": "Supported behavior",
                 "description": "The behavior is supported.", "confidence": 1.0,
                 "evidence_ids": ["obs-0123456789ab…"],
             })

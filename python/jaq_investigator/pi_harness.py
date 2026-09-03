@@ -20,11 +20,11 @@ from urllib.parse import unquote, urlparse
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .findings import FindingError, FindingLedger
 from .prompts import (
-    HARVESTER_SYSTEM_PROMPT,
     INVESTIGATION_SCHEMA,
     INVESTIGATOR_SYSTEM_PROMPT,
     INVESTIGATOR_TOOLS,
     RECORD_FINDING_TOOL,
+    REPORTER_SYSTEM_PROMPT,
     RESEARCH_SCHEMA,
     build_investigator_messages,
 )
@@ -36,7 +36,7 @@ MAX_HARVEST_EVIDENCE_BYTES = 48_000
 MAX_HARVEST_EVIDENCE_ITEM_BYTES = 4_000
 MAX_RESEARCH_RECOVERY_EVIDENCE_BYTES = 180_000
 MAX_RESEARCH_RECOVERY_ITEM_BYTES = 1_600
-_PROGRESS_PHASES = {"research", "harvest"}
+_PROGRESS_PHASES = {"research", "report"}
 _PROGRESS_EVENTS = {
     "phase_started", "model_progress", "tool_started", "finalizing",
     "finding_flush",
@@ -48,6 +48,14 @@ _LANGUAGE_CODE_COMMAND_RE = re.compile(
     r"/work/(?:cil|dump)(?:/|\b)|\.il\b|cil2?\.py\b|disas\.py\b|dumprun\.py\b)",
     re.IGNORECASE,
 )
+
+
+def _safe_error_text(error: BaseException) -> str:
+    message = " ".join(str(error).split()) or error.__class__.__name__
+    message = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", message)
+    message = re.sub(r"(?i)(api[_ -]?key|token|secret)\s*[:=]\s*[^,; ]+", r"\1=[redacted]", message)
+    message = re.sub(r"\b(?:sk|sess|key)-[A-Za-z0-9_-]{12,}\b", "[redacted]", message)
+    return message[:500]
 
 
 def _emit_progress(frame: Mapping[str, Any]) -> None:
@@ -84,11 +92,11 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
     elif event == "finalizing":
         message = (
             f"{prefix} preparing final summary at cost=${float(cost):.5f}"
-            if phase == "research"
+            if phase in {"research", "report"}
             else f"{prefix} preparing checkpoint at cost=${float(cost):.5f}"
         )
     elif event == "finding_flush":
-        message = f"{prefix} investigation cap reached; recording final findings at cost=${float(cost):.5f}"
+        message = f"{prefix} budget reached; recording final findings at cost=${float(cost):.5f}"
     elif event == "submission_attempt":
         attempt = frame.get("attempt")
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -114,19 +122,23 @@ def _emit_progress(frame: Mapping[str, Any]) -> None:
 class PiHarnessError(RuntimeError):
     """The host-side Pi session failed or violated its protocol."""
 
+    def __init__(self, message: str, *, partial_usage: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.partial_usage = dict(partial_usage or {})
+
 
 class PiHarnessBudgetError(PiHarnessError):
     """Pi stopped before another provider/tool call because a budget was exhausted."""
 
 
 class EvidenceOnlyRuntime:
-    """Runtime boundary for harvest: no static or arbitrary-command tools."""
+    """Runtime boundary for reporting: no static or arbitrary-command tools."""
 
     def model_tools(self) -> tuple[()]:
         return ()
 
     def execute(self, name: str, arguments: Mapping[str, Any]) -> Any:
-        raise PiHarnessError(f"runtime tool {name!r} is unavailable during harvest")
+        raise PiHarnessError(f"runtime tool {name!r} is unavailable during reporting")
 
     def close(self) -> None:
         return None
@@ -250,25 +262,25 @@ class PiHarnessConfig:
     def for_phase(self, phase: str) -> "PiHarnessConfig":
         if phase == "research":
             return replace(self, session_dir=self.session_dir / "research")
-        if phase != "harvest":
-            raise PiHarnessError("unknown Pi harness phase")
-        model = os.environ.get("JAQ_HARVESTER_MODEL", self.model).strip()
-        if not model or "/" not in model:
-            raise PiHarnessError("JAQ_HARVESTER_MODEL must be a provider/model string")
-        thinking = os.environ.get("JAQ_HARVESTER_THINKING", "off").strip().lower()
-        if thinking not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
-            raise PiHarnessError("JAQ_HARVESTER_THINKING is invalid")
-        return replace(
-            self,
-            model=model,
-            session_dir=self.session_dir / "harvest",
-            thinking_level=thinking,
-            max_model_calls=_positive_int_env("JAQ_HARVEST_MAX_MODEL_CALLS", 5, 100),
-            max_tool_calls=_positive_int_env("JAQ_HARVEST_MAX_TOOL_CALLS", 16, 1000),
-            max_total_tokens=_positive_int_env("JAQ_HARVEST_MAX_TOTAL_TOKENS", 180_000, 100_000_000),
-            max_cost_usd=_positive_float_env("JAQ_HARVEST_MAX_COST_USD", 0.03, 1000.0),
-            max_output_tokens=_positive_int_env("JAQ_HARVEST_MAX_OUTPUT_TOKENS", 32_768, 100_000),
-        )
+        if phase == "report":
+            model = os.environ.get("JAQ_REPORTER_MODEL", self.model).strip()
+            if not model or "/" not in model:
+                raise PiHarnessError("JAQ_REPORTER_MODEL must be a provider/model string")
+            thinking = os.environ.get("JAQ_REPORTER_THINKING", "off").strip().lower()
+            if thinking not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                raise PiHarnessError("JAQ_REPORTER_THINKING is invalid")
+            return replace(
+                self,
+                model=model,
+                session_dir=self.session_dir / "report",
+                thinking_level=thinking,
+                max_model_calls=_positive_int_env("JAQ_REPORT_MAX_MODEL_CALLS", 20, 200),
+                max_tool_calls=_positive_int_env("JAQ_REPORT_MAX_TOOL_CALLS", 100, 1200),
+                max_total_tokens=_positive_int_env("JAQ_REPORT_MAX_TOTAL_TOKENS", 200_000, 100_000_000),
+                max_cost_usd=_positive_float_env("JAQ_REPORT_MAX_COST_USD", 0.03, 1000.0),
+                max_output_tokens=_positive_int_env("JAQ_REPORT_MAX_OUTPUT_TOKENS", 8_192, 100_000),
+            )
+        raise PiHarnessError("unknown Pi harness phase")
 
 
 class _BoundedStderr:
@@ -312,15 +324,17 @@ class PiToolBroker:
         )
 
     def definitions(self, mode: str) -> list[dict[str, Any]]:
-        if mode not in {"research", "harvest"}:
+        if mode not in {"research", "report"}:
             raise PiHarnessError("unknown Pi tool mode")
         definitions: list[dict[str, Any]] = []
         seen: set[str] = set()
         source_tools: list[Mapping[str, Any]] = []
         if mode == "research":
-            if self.finding_ledger is not None:
-                source_tools.append(RECORD_FINDING_TOOL)
             source_tools.extend((*INVESTIGATOR_TOOLS, *self.runtime.model_tools()))
+        elif mode == "report":
+            if self.finding_ledger is None:
+                raise PiHarnessError("report mode requires a findings ledger")
+            source_tools.extend((RECORD_FINDING_TOOL, *INVESTIGATOR_TOOLS))
         for item in source_tools:
             function = item.get("function") if isinstance(item, Mapping) else None
             if not isinstance(function, Mapping):
@@ -554,7 +568,7 @@ class PiToolBroker:
         if self.finding_ledger is None:
             raise PiHarnessError("record_finding is unavailable without a findings ledger")
         allowed = {
-            "kind", "title", "description", "confidence", "evidence_ids",
+            "kind", "scope", "title", "description", "confidence", "evidence_ids",
             "asset_type", "value", "role",
             "request_kind", "target", "requested_observations",
             "reachability_status", "entrypoints", "path_evidence_ids",
@@ -562,6 +576,7 @@ class PiToolBroker:
         if not set(arguments).issubset(allowed):
             raise PiHarnessError("record_finding has unsupported fields")
         kind = arguments.get("kind")
+        scope = arguments.get("scope")
         title = arguments.get("title")
         description = arguments.get("description")
         confidence = arguments.get("confidence")
@@ -575,6 +590,18 @@ class PiToolBroker:
             or not isinstance(raw_evidence_ids, list)
         ):
             raise PiHarnessError("record_finding common fields are invalid")
+        scopes_by_kind = {
+            "behavior": {
+                "application_logic", "execution", "persistence", "privilege_escalation",
+                "defense_evasion", "credential_access", "discovery", "collection",
+                "command_control", "exfiltration", "impact",
+            },
+            "asset": {"credential", "infrastructure", "payload", "configuration", "persistence"},
+            "action_request": {"payload_recovery", "analysis_blocker"},
+            "unresolved": {"analysis_blocker"},
+        }
+        if scope not in scopes_by_kind[kind]:
+            raise PiHarnessError("record_finding scope is invalid for its kind")
         if any(not isinstance(item, str) for item in raw_evidence_ids):
             raise PiHarnessError("record_finding cites missing or invalid evidence")
         evidence_ids = list(dict.fromkeys(
@@ -603,7 +630,7 @@ class PiToolBroker:
             entrypoints = list(dict.fromkeys(resolved_entrypoints))
             path_ids = list(dict.fromkeys(resolved_path_ids))
             seed = {
-                "kind": kind, "title": title.strip(), "description": description.strip(),
+                "kind": kind, "scope": scope, "title": title.strip(), "description": description.strip(),
                 "confidence": float(confidence), "evidence_ids": evidence_ids,
                 "role": arguments.get("role") if isinstance(arguments.get("role"), str) else None,
                 "reachability_status": reachability_status,
@@ -632,7 +659,7 @@ class PiToolBroker:
             if "value" not in arguments or not isinstance(role, str) or not role.strip():
                 raise PiHarnessError("asset findings require value and role")
             seed = {
-                "asset_type": asset_type, "value": arguments["value"],
+                "scope": scope, "asset_type": asset_type, "value": arguments["value"],
                 "role": role.strip(), "evidence_ids": evidence_ids,
             }
             candidate["assets"] = [{
@@ -669,7 +696,7 @@ class PiToolBroker:
             ):
                 raise PiHarnessError("fetch_remote_payload requires an exact cited target.url")
             seed = {
-                "request_kind": request_kind, "target": target,
+                "scope": scope, "request_kind": request_kind, "target": target,
                 "description": description.strip(), "evidence_ids": evidence_ids,
             }
             candidate["action_requests"] = [{
@@ -718,7 +745,7 @@ class PiToolBroker:
         try:
             envelope = self.finding_ledger.append(
                 record_kind, record, title=title.strip(), description=description.strip(),
-                confidence=float(confidence),
+                confidence=float(confidence), scope=scope,
             )
         except FindingError as error:
             raise PiHarnessError(str(error)) from error
@@ -732,6 +759,7 @@ class PiToolBroker:
         if record_kind == "asset" and self._is_remote_payload_asset(record):
             derived = self._record_finding({
                 "kind": "action_request",
+                "scope": "payload_recovery",
                 "title": "Fetch referenced remote payload",
                 "description": "Fetch the model-identified remote payload in JAQ's isolated acquisition container for child static analysis.",
                 "confidence": float(confidence),
@@ -1084,7 +1112,7 @@ class PiHarnessResult:
 
     @property
     def claims(self) -> dict[str, Any]:
-        """Compatibility view for harvest callers."""
+        """Compatibility view for controller callers."""
         return self.submission
 
 
@@ -1144,7 +1172,7 @@ class PiHarnessRunner:
         system_prompt: str,
         task: str,
     ) -> PiHarnessResult:
-        if mode not in {"research", "harvest"}:
+        if mode not in {"research", "report"}:
             raise PiHarnessError("unknown Pi harness phase")
         self.config.session_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
         tool_definitions = broker.definitions(mode)
@@ -1166,6 +1194,7 @@ class PiHarnessRunner:
             self._stop(process)
             raise PiHarnessError("could not open Pi protocol pipes")
         diagnostics = _BoundedStderr()
+        last_progress_usage: dict[str, Any] = {}
         stderr_thread = threading.Thread(target=diagnostics.drain, args=(process.stderr,), daemon=True)
         stderr_thread.start()
         try:
@@ -1184,13 +1213,19 @@ class PiHarnessRunner:
                 if frame is None:
                     code = process.wait(timeout=2)
                     raise PiHarnessError(
-                        f"Pi exited before completing the dossier (status {code}): {diagnostics.text()}"
+                        f"Pi exited before completing the dossier (status {code}): {diagnostics.text()}",
+                        partial_usage=last_progress_usage,
                     )
                 kind = frame.get("type")
                 if kind == "progress":
                     if frame.get("phase") != mode:
                         raise PiHarnessError("Pi progress phase does not match the active phase")
                     _emit_progress(frame)
+                    last_progress_usage = {
+                        "provider_calls": frame.get("provider_calls", 0),
+                        "tool_calls": frame.get("tool_calls", 0),
+                        "cost_usd": frame.get("cost_usd", 0),
+                    }
                     continue
                 if kind == "request":
                     request_id = frame.get("id")
@@ -1204,8 +1239,6 @@ class PiHarnessRunner:
                             if tool_name not in allowed_tool_names:
                                 raise PiHarnessError(f"tool {tool_name!r} is unavailable during {mode}")
                             result = broker.execute(tool_name, payload.get("arguments"))
-                        elif operation == "validate_claims" and mode == "harvest":
-                            result = broker.validate_claims(payload.get("claims"))
                         elif operation == "validate_research" and mode == "research":
                             result = broker.validate_research(payload.get("research"))
                         else:
@@ -1224,18 +1257,12 @@ class PiHarnessRunner:
                     error = frame.get("error") if isinstance(frame.get("error"), dict) else {}
                     code = error.get("code")
                     message = str(error.get("message", "Pi harness failed"))[:1000]
-                    if code in self._BUDGET_CODES:
-                        raise PiHarnessBudgetError(message)
-                    raise PiHarnessError(message)
+                    error_type = PiHarnessBudgetError if code in self._BUDGET_CODES else PiHarnessError
+                    raise error_type(message, partial_usage=last_progress_usage)
                 if kind == "complete":
-                    if mode == "research" and frame.get("submission") is None:
-                        submission = {}
-                    else:
-                        submission = (
-                            broker.validate_research(frame.get("submission"))
-                            if mode == "research"
-                            else broker.validate_claims(frame.get("submission"))
-                        )
+                    if frame.get("submission") is not None:
+                        raise PiHarnessError("Pi research/report completion must not contain a terminal submission")
+                    submission = {}
                     usage = frame.get("usage")
                     session = frame.get("session")
                     if not isinstance(usage, dict) or not isinstance(session, dict):
@@ -1265,6 +1292,7 @@ class PiInvestigator:
         self.output_dir = output_dir
         self.finding_ledger = FindingLedger(output_dir / "findings.jsonl")
         self.config = PiHarnessConfig.from_env(output_dir)
+        self._reporter_model = self.config.model
         self.last_run: InvestigatorRun | None = None
 
     def _phase_config(self, phase: str) -> PiHarnessConfig:
@@ -1279,7 +1307,7 @@ class PiInvestigator:
 
     def run(self, task: str | None = None) -> dict[str, Any]:
         messages = build_investigator_messages(task)
-        research_broker = PiToolBroker(self.store, self.runtime, self.finding_ledger)
+        research_broker = PiToolBroker(self.store, self.runtime)
         research_phase = "research"
         try:
             research = PiHarnessRunner(self._phase_config("research")).run(
@@ -1301,7 +1329,12 @@ class PiInvestigator:
                 })
         except PiHarnessError as error:
             try:
-                research = self.finalize_persisted_research(termination_reason=str(error))
+                recovered = self.finalize_persisted_research(termination_reason=_safe_error_text(error))
+                research = PiHarnessResult(
+                    submission=recovered.submission,
+                    usage=error.partial_usage,
+                    session=recovered.session,
+                )
             except PiHarnessError:
                 raise error
             research_phase = "research_recovered"
@@ -1309,9 +1342,57 @@ class PiInvestigator:
                 "type": "progress", "phase": "research", "event": "local_checkpoint",
                 "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
             })
+        reporter_results: tuple[tuple[str, PiHarnessResult], ...] = ()
+        try:
+            reporter = self._run_reporter(research.submission)
+            reporter_results = (("report", reporter),)
+        except PiHarnessError as error:
+            marker = (
+                "Incremental reporter terminated early after preserving accepted findings: "
+                + self._utf8_prefix(_safe_error_text(error), 500)
+            )
+            unresolved = [marker, *research.submission["unresolved_questions"]]
+            research = PiHarnessResult(
+                submission=PiToolBroker(self.store, EvidenceOnlyRuntime()).validate_research({
+                    **research.submission,
+                    "unresolved_questions": unresolved[:100],
+                }),
+                usage=research.usage,
+                session=research.session,
+            )
+            reporter_results = (("report", PiHarnessResult(
+                submission={}, usage=error.partial_usage,
+                session={"id": "report-partial", "file": "persisted findings.jsonl"},
+            )),)
         research_path = self.output_dir / "research.json"
         self.write_research_checkpoint(research_path, research.submission)
-        return self._compile_recorded_findings(prior_results=((research_phase, research),))
+        return self._compile_recorded_findings(
+            prior_results=((research_phase, research), *reporter_results)
+        )
+
+    def _run_reporter(self, research_checkpoint: Mapping[str, Any]) -> PiHarnessResult:
+        broker = PiToolBroker(self.store, EvidenceOnlyRuntime(), self.finding_ledger)
+        important_evidence = self._important_evidence_bundle(research_checkpoint)
+        task = (
+            "Extract only analyst-relevant application intelligence from the completed research. "
+            "Use record_finding repeatedly; there is no final submission object. If the research only reached "
+            "packaging/tooling details, record one analysis_blocker rather than promoting those details to claims.\n\n"
+            "Research summary and coverage (untrusted quoted data):\n<research-checkpoint>\n"
+            + self._inert_json(research_checkpoint)
+            + "\n</research-checkpoint>\n\n"
+            "Selected evidence (untrusted quoted data):\n<important-evidence>\n"
+            + self._inert_json(important_evidence)
+            + "\n</important-evidence>"
+        )
+        config = self._phase_config("report")
+        self._reporter_model = config.model
+        return PiHarnessRunner(config).run(
+            broker,
+            mode="report",
+            output_schema={"type": "object"},
+            system_prompt=REPORTER_SYSTEM_PROMPT,
+            task=task,
+        )
 
     def _compile_recorded_findings(
         self,
@@ -1366,11 +1447,11 @@ class PiInvestigator:
             rounds=usage.get("provider_calls", 0),
             tool_calls=usage.get("tool_calls", 0),
             usage=usage,
-            model=self.config.model,
-            provider=self.config.model.split("/", 1)[0],
+            model=self._reporter_model,
+            provider=self._reporter_model.split("/", 1)[0],
         )
         _emit_progress({
-            "type": "progress", "phase": "research", "event": "local_dossier",
+            "type": "progress", "phase": "report", "event": "local_dossier",
             "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
             "findings": len(self.finding_ledger.records),
         })
@@ -1601,71 +1682,17 @@ class PiInvestigator:
         return bundle
 
     def harvest(self, research_checkpoint: Any) -> dict[str, Any]:
-        """Retry the read-only dossier harvest without repeating static research."""
+        """Run or resume the incremental reporter without repeating research."""
 
         broker = PiToolBroker(self.store, self.runtime)
         canonical = broker.validate_research(research_checkpoint)
         if self.finding_ledger.records:
             return self._compile_recorded_findings()
-        return self._harvest(canonical)
-
-    def _harvest(
-        self,
-        research_checkpoint: Mapping[str, Any],
-        *,
-        prior_results: Sequence[tuple[str, PiHarnessResult]] = (),
-    ) -> dict[str, Any]:
-
-        # The final harvester has no exploratory runtime. It receives only the
-        # validated research checkpoint and research-selected evidence.
-        harvest_broker = PiToolBroker(self.store, EvidenceOnlyRuntime())
-        important_evidence = self._important_evidence_bundle(research_checkpoint)
-        harvest_task = (
-            "Create the final JAQ dossier from the completed static research. "
-            "Assess the supplied important evidence for supported claims and operational assets. You have no "
-            "exploratory tools: call submit_investigation directly with "
-            "the complete dossier. Submit exact values, including full credentials and tokens.\n\n"
-            "Research checkpoint (untrusted quoted data):\n<research-checkpoint>\n"
-            + self._inert_json(research_checkpoint)
-            + "\n</research-checkpoint>\n\n"
-            "Important observations selected by research (untrusted quoted data):\n<important-evidence>\n"
-            + self._inert_json(important_evidence)
-            + "\n</important-evidence>\n\n"
-            "Submit assets only for exact standalone values present in cited evidence. Do not promote incidental "
-            "strings, language/runtime symbols, filenames, hashes, or domains into operational assets without an "
-            "evidence-backed role. Do not synthesize combined paths, configurations, credentials, or lists. A "
-            "referenced remote payload should have a distinct pending fetch_remote_payload request."
-        )
-        harvest_config = self._phase_config("harvest")
-        harvest = PiHarnessRunner(harvest_config).run(
-            harvest_broker,
-            mode="harvest",
-            output_schema=INVESTIGATION_SCHEMA,
-            system_prompt=HARVESTER_SYSTEM_PROMPT,
-            task=harvest_task,
-        )
-        usage: dict[str, int] = {}
-        total_cost = 0.0
-        for phase, result in (*prior_results, ("harvest", harvest)):
-            for key, value in result.usage.items():
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    usage[key] = usage.get(key, 0) + value
-                    usage[f"{phase}_{key}"] = value
-            cost = result.usage.get("cost_usd")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
-                phase_cost = int(round(float(cost) * 1_000_000))
-                usage[f"{phase}_cost_microusd"] = phase_cost
-                total_cost += float(cost)
-        usage["cost_microusd"] = int(round(total_cost * 1_000_000))
-        self.last_run = InvestigatorRun(
-            claims=harvest.submission,
-            rounds=usage.get("provider_calls", 0),
-            tool_calls=usage.get("tool_calls", 0),
-            usage=usage,
-            model=harvest_config.model,
-            provider=harvest_config.model.split("/", 1)[0],
-        )
-        return harvest.submission
+        try:
+            reporter = self._run_reporter(canonical)
+            return self._compile_recorded_findings(prior_results=(("report", reporter),))
+        except PiHarnessError:
+            return self._compile_recorded_findings()
 
     @staticmethod
     def _inert_json(value: Any) -> str:

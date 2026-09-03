@@ -12,11 +12,12 @@ from unittest.mock import patch
 
 from jaq_investigator.cli import finalize_research_only, run_pipeline
 from jaq_investigator.evidence import EvidenceStore
+from jaq_investigator.findings import FindingLedger
 from jaq_investigator.pi_harness import (
     PiHarnessConfig, PiHarnessError, PiHarnessRunner, PiInvestigator, PiToolBroker,
     _emit_progress,
 )
-from jaq_investigator.prompts import INVESTIGATION_SCHEMA, RESEARCH_SCHEMA
+from jaq_investigator.prompts import RESEARCH_SCHEMA
 from jaq_investigator.schemas import Observation
 
 
@@ -173,20 +174,30 @@ class PiHarnessProtocolTest(unittest.TestCase):
                 provenance={"source": "fixture"},
             )
             evidence_path = output / "observations.jsonl"
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [observation, *coverage_observations()]),
+                encoding="utf-8",
+            )
             fake = root / "fake_pipeline.py"
             fake.write_text(
                 f'''\
 import json, sys
 init = json.loads(sys.stdin.readline())
+if init["mode"] == "research":
+    assert "record_finding" not in {{item["name"] for item in init["tool_definitions"]}}
+    print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0}},"session":{{"id":"research","file":"research.jsonl"}}}}), flush=True)
+    raise SystemExit(0)
+assert init["mode"] == "report"
+names = {{item["name"] for item in init["tool_definitions"]}}
+assert "record_finding" in names and "static_fixture" not in names
 records = [
-  {{"kind":"behavior","title":"Discord command and control","description":"The decoded configuration contains a Discord command-and-control credential.","confidence":0.95,"evidence_ids":["obs-token"]}},
-  {{"kind":"asset","title":"Discord bot token","description":"Exact embedded Discord credential.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"bearer_token","value":{json.dumps(token)},"role":"Discord C2 authentication"}}
+  {{"kind":"behavior","scope":"command_control","title":"Discord command and control","description":"The decoded configuration contains a Discord command-and-control credential.","confidence":0.95,"evidence_ids":["obs-token"]}},
+  {{"kind":"asset","scope":"credential","title":"Discord bot token","description":"Exact embedded Discord credential.","confidence":0.99,"evidence_ids":["obs-token"],"asset_type":"bearer_token","value":{json.dumps(token)},"role":"Discord C2 authentication"}}
 ]
 for index, finding in enumerate(records, 1):
     print(json.dumps({{"type":"request","id":index,"operation":"execute_tool","payload":{{"name":"record_finding","arguments":finding}}}}), flush=True)
     assert json.loads(sys.stdin.readline())["ok"] is True
-print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":20,"output_tokens":5,"total_tokens":25,"cost_usd":0.002,"provider_calls":2,"tool_calls":2}},"session":{{"id":"research","file":"research.jsonl"}}}}), flush=True)
+print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":20,"output_tokens":5,"total_tokens":25,"cost_usd":0.002,"provider_calls":2,"tool_calls":2}},"session":{{"id":"report","file":"report.jsonl"}}}}), flush=True)
 ''',
                 encoding="utf-8",
             )
@@ -205,6 +216,7 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
             ):
                 self.assertTrue((output / name).is_file(), name)
             self.assertFalse((output / "model-session" / "harvest").exists())
+            self.assertTrue((output / "model-session" / "report").exists())
 
     def test_progress_frames_render_only_bounded_controller_fields(self):
         output = io.StringIO()
@@ -231,12 +243,12 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
         flush_output = io.StringIO()
         with patch.dict(os.environ, {"JAQ_PROGRESS_TRANSPORT": "1"}), redirect_stderr(flush_output):
             _emit_progress({
-                "type": "progress", "phase": "research", "event": "finding_flush",
+                "type": "progress", "phase": "report", "event": "finding_flush",
                 "provider_calls": 113, "tool_calls": 119, "cost_usd": 0.1,
             })
         self.assertEqual(
             flush_output.getvalue(),
-            "JAQ_PROGRESS [research] investigation cap reached; recording final findings at cost=$0.10000\n",
+            "JAQ_PROGRESS [report] budget reached; recording final findings at cost=$0.10000\n",
         )
         with self.assertRaises(PiHarnessError):
             _emit_progress({
@@ -253,7 +265,7 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
             with self.assertRaises(PiHarnessError):
                 _emit_progress(malformed)
 
-    def test_fake_pi_process_completes_through_broker_and_submit_claims(self):
+    def test_fake_pi_reporter_records_incrementally_without_terminal_submission(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             evidence_path = root / "observations.jsonl"
@@ -273,18 +285,14 @@ print(json.dumps({{"type":"complete","submission":None,"usage":{{"input_tokens":
 import json, sys
 init = json.loads(sys.stdin.readline())
 assert init["type"] == "init"
-assert init["mode"] == "harvest"
-assert "submit_claims" not in {item["name"] for item in init["tool_definitions"]}
+assert init["mode"] == "report"
+assert "record_finding" in {item["name"] for item in init["tool_definitions"]}
 assert "static_fixture" not in {item["name"] for item in init["tool_definitions"]}
-assert init["tool_definitions"] == []
-print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"list_observation_types","arguments":{}}}), flush=True)
+finding = {"kind":"behavior","scope":"application_logic","title":"fixture behavior","description":"The fixture has deterministic behavior.","confidence":0.9,"evidence_ids":["obs-native"]}
+print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"record_finding","arguments":finding}}), flush=True)
 reply = json.loads(sys.stdin.readline())
-assert reply["ok"] is False
-claims = {"schema_version":"1.0","claims":[{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],"assets":[{"schema_version":"1.0","id":"asset-1","type":"payload_hash","value":"a"*64,"normalized_value":"a"*64,"role":"sample","confidence":1.0,"evidence_ids":["obs-native"],"unresolved":False}],"action_requests":[{"schema_version":"1.0","id":"request-1","kind":"dynamic_analysis","status":"pending_authorization","reason":"Recover a runtime-decrypted payload.","evidence_ids":["obs-native"],"target":{},"requested_observations":["decrypted_payload"]}]}
-print(json.dumps({"type":"request","id":2,"operation":"validate_claims","payload":{"claims":claims}}), flush=True)
-validated = json.loads(sys.stdin.readline())
-assert validated["ok"] is True
-print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_tokens":2,"cache_write_tokens":0,"total_tokens":17,"cost_usd":0.001,"provider_calls":2,"tool_calls":1},"session":{"id":"fake-session","file":"fake.jsonl"}}), flush=True)
+assert reply["ok"] is True
+print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_tokens":2,"cache_write_tokens":0,"total_tokens":17,"cost_usd":0.001,"provider_calls":2,"tool_calls":1},"session":{"id":"fake-session","file":"fake.jsonl"}}), flush=True)
 """,
                 encoding="utf-8",
             )
@@ -297,32 +305,38 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 max_context_tokens=1000, keep_recent_tokens=100,
             )
             store = EvidenceStore(evidence_path)
+            ledger = FindingLedger(root / "findings.jsonl")
             result = PiHarnessRunner(config).run(
-                PiToolBroker(store, FakeRuntime()), mode="harvest",
-                output_schema=INVESTIGATION_SCHEMA,
-                system_prompt="Static fixture investigator.", task="Inspect it.",
+                PiToolBroker(store, FakeRuntime(), ledger), mode="report",
+                output_schema={"type": "object"},
+                system_prompt="Incremental fixture reporter.", task="Report it.",
             )
-            self.assertEqual(result.claims["claims"][0]["id"], "claim-1")
-            self.assertEqual(result.claims["assets"][0]["id"], "asset-1")
-            self.assertEqual(result.claims["action_requests"][0]["status"], "pending_authorization")
+            self.assertEqual(result.submission, {})
+            self.assertEqual(ledger.compile()["claims"][0]["classification"], "fixture behavior")
             self.assertEqual(result.usage["total_tokens"], 17)
             self.assertEqual(result.session["id"], "fake-session")
-            broad = json.loads(json.dumps(result.claims))
+            validated_result = PiToolBroker(store, FakeRuntime()).validate_claims({
+                "schema_version": "1.0",
+                "claims": [{"schema_version":"1.0","id":"claim-1","classification":"fixture","explanation":"The fixture has a deterministic hash observation.","confidence":0.9,"evidence_ids":["obs-native"],"asset_role":"fixture","reachability":{"schema_version":"1.0","status":"unknown","entrypoints":[],"path_evidence_ids":[]},"unresolved":False}],
+                "assets": [{"schema_version":"1.0","id":"asset-1","type":"payload_hash","value":"a"*64,"normalized_value":"a"*64,"role":"sample","confidence":1.0,"evidence_ids":["obs-native"],"unresolved":False}],
+                "action_requests": [{"schema_version":"1.0","id":"request-1","kind":"dynamic_analysis","status":"pending_authorization","reason":"Recover a runtime-decrypted payload.","evidence_ids":["obs-native"],"target":{},"requested_observations":["decrypted_payload"]}],
+            })
+            broad = json.loads(json.dumps(validated_result))
             broad["action_requests"][0]["requested_observations"] = ["processes", "registry writes"]
             filtered = PiToolBroker(store, FakeRuntime()).validate_claims(broad)
             self.assertEqual(filtered["action_requests"], [])
-            mixed = json.loads(json.dumps(result.claims))
+            mixed = json.loads(json.dumps(validated_result))
             rejected_request = json.loads(json.dumps(mixed["action_requests"][0]))
             rejected_request["id"] = "request-broad-confirmation"
             rejected_request["requested_observations"] = ["processes", "registry writes"]
             mixed["action_requests"].insert(0, rejected_request)
             mixed_result = PiToolBroker(store, FakeRuntime()).validate_claims(mixed)
-            self.assertEqual(mixed_result["claims"], result.claims["claims"])
-            self.assertEqual(mixed_result["assets"], result.claims["assets"])
+            self.assertEqual(mixed_result["claims"], validated_result["claims"])
+            self.assertEqual(mixed_result["assets"], validated_result["assets"])
             self.assertEqual(
                 [item["id"] for item in mixed_result["action_requests"]], ["request-1"]
             )
-            formatting = json.loads(json.dumps(result.claims))
+            formatting = json.loads(json.dumps(validated_result))
             formatting["ignored"] = "remove me"
             formatting["claims"][0]["ignored"] = "remove me"
             formatting["claims"][0]["classification"] = "c" * 300
@@ -334,7 +348,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
             self.assertNotIn("ignored", repaired["claims"][0])
             self.assertEqual(len(repaired["assets"][0]["role"]), 200)
             self.assertEqual(repaired["assets"][0]["value"], original_asset_value)
-            omitted = json.loads(json.dumps(result.claims))
+            omitted = json.loads(json.dumps(validated_result))
             omitted["assets"] = []
             recovered = PiToolBroker(store, FakeRuntime()).validate_claims(omitted)
             self.assertEqual(recovered["assets"], [])
@@ -348,7 +362,7 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
                 PiToolBroker(store, FakeRuntime()).validate_claims(unsupported)["assets"], []
             )
 
-    def test_research_checkpoint_uses_phase_specific_contract(self):
+    def test_research_has_analysis_tools_but_no_reporting_or_terminal_tool(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             observation = Observation(
@@ -368,13 +382,12 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"i
 import json, sys
 init = json.loads(sys.stdin.readline())
 assert init["mode"] == "research"
-assert "static_fixture" in {item["name"] for item in init["tool_definitions"]}
-checkpoint = json.loads(r'''__CHECKPOINT__''')
-print(json.dumps({"type":"request","id":1,"operation":"validate_research","payload":{"research":checkpoint}}), flush=True)
-validated = json.loads(sys.stdin.readline())
-assert validated["ok"] is True
-print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"total_tokens":3,"cost_usd":0.0,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
-""".replace("__CHECKPOINT__", json.dumps(coverage_checkpoint("obs-native"))),
+names = {item["name"] for item in init["tool_definitions"]}
+assert "static_fixture" in names
+assert "record_finding" not in names
+assert "submit_investigation" not in names
+print(json.dumps({"type":"complete","submission":None,"usage":{"total_tokens":3,"cost_usd":0.0,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+""",
                 encoding="utf-8",
             )
             config = PiHarnessConfig(
@@ -388,9 +401,13 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()), mode="research",
                 output_schema=RESEARCH_SCHEMA, system_prompt="Research only.", task="Inspect it.",
             )
-            self.assertTrue(result.submission["research_complete"])
+            self.assertEqual(result.submission, {})
+            checkpoint = PiToolBroker(EvidenceStore(evidence_path), FakeRuntime()).validate_research(
+                coverage_checkpoint("obs-native")
+            )
+            self.assertTrue(checkpoint["research_complete"])
             self.assertEqual(
-                result.submission["important_evidence_ids"],
+                checkpoint["important_evidence_ids"],
                 coverage_checkpoint("obs-native")["important_evidence_ids"],
             )
             incomplete = coverage_checkpoint("obs-native")
@@ -460,6 +477,12 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
             self.assertIsNone(config.max_tool_calls)
             self.assertIsNone(config.max_total_tokens)
             self.assertEqual(config.max_cost_usd, 0.10)
+            reporter = config.for_phase("report")
+            self.assertEqual(reporter.model, config.model)
+            self.assertEqual(reporter.thinking_level, "off")
+            self.assertEqual(reporter.max_model_calls, 20)
+            self.assertEqual(reporter.max_tool_calls, 100)
+            self.assertEqual(reporter.max_cost_usd, 0.03)
 
     def test_pi_investigator_compiles_incremental_findings_without_harvest_session(self):
         with TemporaryDirectory() as directory:
@@ -482,20 +505,24 @@ print(json.dumps({"type":"complete","submission":validated["result"],"usage":{"t
                 """
 import json, sys
 init = json.loads(sys.stdin.readline())
-assert init["mode"] == "research"
-assert init["session_dir"].endswith("/model-session/research")
+if init["mode"] == "research":
+    assert init["session_dir"].endswith("/model-session/research")
+    assert "record_finding" not in {item["name"] for item in init["tool_definitions"]}
+    print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+    raise SystemExit(0)
+assert init["mode"] == "report"
+assert init["session_dir"].endswith("/model-session/report")
 assert "record_finding" in {item["name"] for item in init["tool_definitions"]}
-finding = {"kind":"behavior","title":"fixture","description":"The sample has a persisted hash.","confidence":1.0,"evidence_ids":["obs-native"],"role":"sample"}
+finding = {"kind":"behavior","scope":"application_logic","title":"fixture","description":"The sample has a persisted hash.","confidence":1.0,"evidence_ids":["obs-native"],"role":"sample"}
 print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"record_finding","arguments":finding}}), flush=True)
 validated = json.loads(sys.stdin.readline())
 assert validated["ok"] is True
-print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":1},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":1},"session":{"id":"report","file":"report.jsonl"}}), flush=True)
 """,
                 encoding="utf-8",
             )
             environment = {
                 "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
-                "JAQ_HARVESTER_MODEL": "deepseek/deepseek-v4-flash",
                 "JAQ_PI_HARNESS": str(fake),
                 "JAQ_NODE": sys.executable,
             }
@@ -507,8 +534,8 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10
             self.assertEqual(len((output / "findings.jsonl").read_text(encoding="utf-8").splitlines()), 1)
             self.assertTrue((output / "research.json").is_file())
             self.assertFalse((output / "model-session" / "harvest").exists())
-            self.assertEqual(investigator.last_run.usage["total_tokens"], 12)
-            self.assertEqual(investigator.last_run.usage["cost_microusd"], 1000)
+            self.assertEqual(investigator.last_run.usage["total_tokens"], 24)
+            self.assertEqual(investigator.last_run.usage["cost_microusd"], 2000)
             checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
             retried = investigator.harvest(checkpoint)
             self.assertEqual(retried["claims"][0]["classification"], "fixture")
@@ -534,7 +561,7 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10
                 """
 import json, sys
 init = json.loads(sys.stdin.readline())
-assert init["mode"] == "research"
+assert init["mode"] in {"research", "report"}
 print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
 """,
                 encoding="utf-8",
@@ -551,7 +578,7 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10
             self.assertFalse((output / "model-session" / "research-finalize").exists())
             self.assertNotIn("research_recovered_total_tokens", investigator.last_run.usage)
 
-    def test_provider_failure_does_not_trigger_checkpoint_fallback(self):
+    def test_provider_failure_with_persisted_research_produces_partial_dossier(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
@@ -562,7 +589,10 @@ print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10
                 provenance={"source": "fixture"},
             )
             evidence_path = output / "observations.jsonl"
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [observation, *coverage_observations()]),
+                encoding="utf-8",
+            )
             fake = root / "fake_provider_error.py"
             fake.write_text(
                 """
@@ -577,9 +607,54 @@ print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error
                 "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
             }, clear=False):
                 investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
-                with self.assertRaisesRegex(PiHarnessError, "Insufficient Balance"):
-                    investigator.run("Inspect the fixture.")
+                dossier = investigator.run("Inspect the fixture.")
+            self.assertEqual(dossier["claims"], [])
+            checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
+            self.assertTrue(any("Insufficient Balance" in item for item in checkpoint["unresolved_questions"]))
             self.assertFalse((output / "model-session" / "research-finalize").exists())
+
+    def test_invalid_reporter_config_cannot_discard_preexisting_findings(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            native = Observation(
+                id="obs-native", type="fixture", raw_value="behavior", normalized_value="behavior",
+                artifact_location={"artifact": "sample"}, analyzer={"name": "fixture", "version": "1"},
+                provenance={"source": "fixture"},
+            )
+            evidence_path = output / "observations.jsonl"
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [native, *coverage_observations()]),
+                encoding="utf-8",
+            )
+            fake = root / "fake_research.py"
+            fake.write_text(
+                """
+import json, sys
+init = json.loads(sys.stdin.readline())
+assert init["mode"] == "research"
+print(json.dumps({"type":"complete","submission":None,"usage":{"total_tokens":3,"cost_usd":0.0,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "JAQ_INVESTIGATOR_MODEL": "deepseek/deepseek-v4-flash",
+                "JAQ_PI_HARNESS": str(fake), "JAQ_NODE": sys.executable,
+                "JAQ_REPORT_MAX_MODEL_CALLS": "invalid",
+            }, clear=False):
+                investigator = PiInvestigator(EvidenceStore(evidence_path), FakeRuntime(), output)
+                PiToolBroker(investigator.store, FakeRuntime(), investigator.finding_ledger).execute(
+                    "record_finding", {
+                        "kind": "behavior", "scope": "application_logic",
+                        "title": "Recovered behavior", "description": "The application performs behavior.",
+                        "confidence": 0.9, "evidence_ids": ["obs-native"],
+                    },
+                )
+                dossier = investigator.run("Inspect the fixture.")
+            self.assertEqual(dossier["claims"][0]["classification"], "Recovered behavior")
+            checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
+            self.assertTrue(any("JAQ_REPORT_MAX_MODEL_CALLS" in item for item in checkpoint["unresolved_questions"]))
 
     def test_cost_cap_preserves_incremental_findings_and_completes_locally(self):
         with TemporaryDirectory() as directory:
@@ -592,18 +667,25 @@ print(json.dumps({"type":"error","error":{"code":"HARNESS_FAILURE","type":"Error
                 analyzer={"name": "fixture", "version": "1"}, provenance={"source": "fixture"},
             )
             evidence_path = output / "observations.jsonl"
-            evidence_path.write_text(json.dumps(observation.to_dict()) + "\n", encoding="utf-8")
+            evidence_path.write_text(
+                "".join(json.dumps(item.to_dict()) + "\n" for item in [observation, *coverage_observations()]),
+                encoding="utf-8",
+            )
             fake = root / "fake_cost_cap.py"
             fake.write_text(
                 """
 import json, sys
 init = json.loads(sys.stdin.readline())
-assert init["mode"] == "research"
-finding = {"kind":"behavior","title":"embedded capability","description":"The sample contains an embedded capability.","confidence":0.9,"evidence_ids":["obs-native"]}
+if init["mode"] == "research":
+    print(json.dumps({"type":"complete","submission":None,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.001,"provider_calls":1,"tool_calls":0},"session":{"id":"research","file":"research.jsonl"}}), flush=True)
+    raise SystemExit(0)
+assert init["mode"] == "report"
+finding = {"kind":"behavior","scope":"application_logic","title":"embedded capability","description":"The sample contains an embedded capability.","confidence":0.9,"evidence_ids":["obs-native"]}
 print(json.dumps({"type":"request","id":1,"operation":"execute_tool","payload":{"name":"record_finding","arguments":finding}}), flush=True)
 reply = json.loads(sys.stdin.readline())
 assert reply["ok"] is True
-print(json.dumps({"type":"error","error":{"code":"COST_BUDGET","type":"HarnessLimitError","message":"investigator cost budget exhausted"}}), flush=True)
+print(json.dumps({"type":"progress","phase":"report","event":"model_progress","provider_calls":7,"tool_calls":3,"cost_usd":0.02}), flush=True)
+print(json.dumps({"type":"error","error":{"code":"COST_BUDGET","type":"HarnessLimitError","message":"api_key=sk-secret-value-123456 investigator cost budget exhausted"}}), flush=True)
 raise SystemExit(2)
 """,
                 encoding="utf-8",
@@ -617,7 +699,10 @@ raise SystemExit(2)
             self.assertEqual(dossier["claims"][0]["classification"], "embedded capability")
             self.assertTrue((output / "research.json").is_file())
             checkpoint = json.loads((output / "research.json").read_text(encoding="utf-8"))
-            self.assertIn("cost budget exhausted", checkpoint["unresolved_questions"][0])
+            self.assertTrue(any("cost budget exhausted" in item for item in checkpoint["unresolved_questions"]))
+            self.assertFalse(any("sk-secret-value" in item for item in checkpoint["unresolved_questions"]))
+            self.assertEqual(investigator.last_run.usage["report_provider_calls"], 7)
+            self.assertEqual(investigator.last_run.usage["report_cost_microusd"], 20_000)
             self.assertEqual(len((output / "findings.jsonl").read_text(encoding="utf-8").splitlines()), 1)
             self.assertFalse((output / "model-session" / "harvest").exists())
 

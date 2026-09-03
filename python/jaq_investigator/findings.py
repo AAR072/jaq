@@ -72,7 +72,7 @@ class FindingLedger:
                     self._validate_record(record["kind"], record["record"])
                     if record["id"] != self._content_id(
                         record["kind"], record["title"], record["description"],
-                        record["confidence"], record["record"],
+                        record["confidence"], record["record"], record.get("scope"),
                     ):
                         raise FindingError("finding content id does not match its record")
                     if record["id"] in self._by_id:
@@ -86,9 +86,10 @@ class FindingLedger:
 
     @staticmethod
     def _validate_envelope(value: Any) -> None:
-        if not isinstance(value, Mapping) or set(value) != {
+        base_fields = {
             "schema_version", "id", "sequence", "kind", "title", "description", "confidence", "record",
-        }:
+        }
+        if not isinstance(value, Mapping) or set(value) not in {frozenset(base_fields), frozenset(base_fields | {"scope"})}:
             raise FindingError("finding envelope is malformed")
         if value.get("schema_version") != FINDING_SCHEMA_VERSION:
             raise FindingError("finding has an unsupported schema version")
@@ -98,6 +99,10 @@ class FindingLedger:
             raise FindingError("finding sequence is invalid")
         if value.get("kind") not in {"claim", "asset", "action_request"}:
             raise FindingError("finding kind is invalid")
+        if "scope" in value and (
+            not isinstance(value["scope"], str) or not value["scope"] or len(value["scope"]) > 100
+        ):
+            raise FindingError("finding scope is invalid")
         if (
             not isinstance(value.get("title"), str) or not value["title"].strip() or len(value["title"]) > 200
             or not isinstance(value.get("description"), str) or not value["description"].strip()
@@ -158,12 +163,16 @@ class FindingLedger:
         description: str,
         confidence: float,
         record: Mapping[str, Any],
+        scope: str | None = None,
     ) -> str:
+        identity: dict[str, Any] = {
+            "kind": kind, "title": title, "description": description,
+            "confidence": confidence, "record": record,
+        }
+        if scope is not None:
+            identity["scope"] = scope
         encoded = json.dumps(
-            {
-                "kind": kind, "title": title, "description": description,
-                "confidence": confidence, "record": record,
-            },
+            identity,
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
         return f"finding-{hashlib.sha256(encoded).hexdigest()[:24]}"
@@ -176,6 +185,7 @@ class FindingLedger:
         title: str | None = None,
         description: str | None = None,
         confidence: float | None = None,
+        scope: str | None = None,
     ) -> dict[str, Any]:
         if kind not in {"claim", "asset", "action_request"} or not isinstance(record, Mapping):
             raise FindingError("finding kind or record is invalid")
@@ -194,7 +204,9 @@ class FindingLedger:
             raise FindingError("finding narrative is invalid")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
             raise FindingError("finding confidence is invalid")
-        finding_id = self._content_id(kind, title, description, float(confidence), stable)
+        if scope is not None and (not isinstance(scope, str) or not scope or len(scope) > 100):
+            raise FindingError("finding scope is invalid")
+        finding_id = self._content_id(kind, title, description, float(confidence), stable, scope)
         with self._lock:
             existing = self._by_id.get(finding_id)
             if existing is not None:
@@ -211,6 +223,8 @@ class FindingLedger:
                 "confidence": float(confidence),
                 "record": stable,
             }
+            if scope is not None:
+                envelope["scope"] = scope
             encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
             if len(encoded.encode("utf-8")) > MAX_FINDING_LINE_BYTES:
                 raise FindingError("finding exceeds the line size limit")

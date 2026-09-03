@@ -184,6 +184,16 @@ class CoreTest(unittest.TestCase):
         self.assertIn("A" * 64, first)
         self.assertIn("&lt;binary&gt;", first)
 
+    def test_report_uses_bounded_evidence_previews(self):
+        observation = self.observation("large", "x" * 100_000)
+        store = self.store([observation])
+        claim = self.claim(("large",))
+        score = build_score([claim], [verify_claim(claim, store)])
+        report = render_report([claim], score, store)
+        self.assertLess(len(report), 10_000)
+        self.assertIn("[truncated; sha256:", report)
+        self.assertNotIn("x" * 10_000, report)
+
     def test_private_report_shows_full_credential_and_sha256(self):
         token = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         report = _render_operational({

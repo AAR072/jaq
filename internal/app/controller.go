@@ -49,6 +49,7 @@ type SandboxSession interface {
 type Config struct {
 	SandboxImage      string
 	InvestigatorModel string
+	ReporterModel     string
 	JudgeModel        string
 	PromptHashes      map[string]string
 	PythonVersion     string
@@ -100,6 +101,10 @@ func NewController(projectRoot string) (*Controller, error) {
 		return nil, err
 	}
 	sandbox := sandboxruntime.NewDocker()
+	reporterModel := os.Getenv("JAQ_REPORTER_MODEL")
+	if reporterModel == "" {
+		reporterModel = os.Getenv("JAQ_INVESTIGATOR_MODEL")
+	}
 	return &Controller{
 		Investigator:        process,
 		AnalyzePE:           peinfo.AnalyzeFile,
@@ -111,9 +116,11 @@ func NewController(projectRoot string) (*Controller, error) {
 		Config: Config{
 			SandboxImage:      sandbox.Image,
 			InvestigatorModel: os.Getenv("JAQ_INVESTIGATOR_MODEL"),
+			ReporterModel:     reporterModel,
 			JudgeModel:        os.Getenv("JAQ_JUDGE_MODEL"),
 			PromptHashes: map[string]string{
 				"investigator": promptHash,
+				"reporter":     promptHash,
 				"judge":        promptHash,
 			},
 			PythonVersion:  runtimeVersions.Python,
@@ -148,6 +155,14 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	if c.Investigator == nil || c.ResolveSandboxImage == nil || c.StartSandbox == nil {
 		return errors.New("static sandbox stages are not configured")
 	}
+	reporterModel := c.Config.ReporterModel
+	if strings.TrimSpace(reporterModel) == "" {
+		reporterModel = c.Config.InvestigatorModel
+	}
+	reporterPromptHash := c.Config.PromptHashes["reporter"]
+	if reporterPromptHash == "" {
+		reporterPromptHash = c.Config.PromptHashes["investigator"]
+	}
 	sandboxImageID, err := c.ResolveSandboxImage(ctx)
 	if err != nil {
 		return err
@@ -179,6 +194,7 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"schema_version":     evidence.SchemaVersion,
 		"native_config_hash": nativeConfigHash, "sandbox_config_hash": sandboxConfigHash,
 		"investigator_model": c.Config.InvestigatorModel,
+		"reporter_model":     reporterModel,
 		"judge_model":        c.Config.JudgeModel,
 	})
 	if err != nil {
@@ -209,6 +225,7 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		manifest.PromptHashes[role] = hash
 	}
 	manifest.ModelRoles["investigator"] = modelRole(c.Config.InvestigatorModel, c.Config.PromptHashes["investigator"])
+	manifest.ModelRoles["reporter"] = modelRole(reporterModel, reporterPromptHash)
 	if c.Config.JudgeModel != "" {
 		manifest.ModelRoles["judge"] = modelRole(c.Config.JudgeModel, c.Config.PromptHashes["judge"])
 	}
@@ -295,6 +312,9 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	closed = true
 
 	manifest.Status = "completed"
+	if !findingsContainApplicationBehavior(filepath.Join(outputDir, "findings.jsonl")) {
+		manifest.Status = "partial"
+	}
 	var requestDocument map[string]any
 	if readErr := readJSONStrict(filepath.Join(outputDir, "requests.json"), &requestDocument); readErr == nil {
 		if requests, ok := requestDocument["action_requests"].([]any); ok && len(requests) > 0 {
@@ -310,6 +330,32 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		return fmt.Errorf("write completed manifest: %w", err)
 	}
 	return nil
+}
+
+func findingsContainApplicationBehavior(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	applicationScopes := map[string]bool{
+		"application_logic": true, "execution": true, "persistence": true,
+		"privilege_escalation": true, "defense_evasion": true,
+		"credential_access": true, "discovery": true, "collection": true,
+		"command_control": true, "exfiltration": true, "impact": true,
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		var finding persistedFinding
+		if json.Unmarshal(scanner.Bytes(), &finding) != nil {
+			return false
+		}
+		if applicationScopes[finding.Scope] || (finding.Scope == "" && finding.Kind == "claim") {
+			return true
+		}
+	}
+	return false
 }
 
 func validateInvestigatorOutputs(outputDir string, observations []evidence.Observation, judgeRequired bool) error {
@@ -357,6 +403,7 @@ type persistedFinding struct {
 	ID            string          `json:"id"`
 	Sequence      int             `json:"sequence"`
 	Kind          string          `json:"kind"`
+	Scope         string          `json:"scope,omitempty"`
 	Title         string          `json:"title"`
 	Description   string          `json:"description"`
 	Confidence    *float64        `json:"confidence"`
@@ -390,6 +437,14 @@ func validateFindingsLedger(path string, observations []evidence.Observation) er
 		knownEvidence[observation.ID] = true
 	}
 	seen := make(map[string]bool)
+	validScopes := map[string]bool{
+		"application_logic": true, "execution": true, "persistence": true,
+		"privilege_escalation": true, "defense_evasion": true,
+		"credential_access": true, "discovery": true, "collection": true,
+		"command_control": true, "exfiltration": true, "impact": true,
+		"credential": true, "infrastructure": true, "payload": true,
+		"configuration": true, "analysis_blocker": true, "payload_recovery": true,
+	}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	sequence := 0
@@ -416,6 +471,9 @@ func validateFindingsLedger(path string, observations []evidence.Observation) er
 			strings.TrimSpace(finding.Description) == "" || len(finding.Description) > 12000 ||
 			finding.Confidence == nil || *finding.Confidence < 0 || *finding.Confidence > 1 {
 			return fmt.Errorf("reject findings.jsonl: invalid envelope at line %d", sequence)
+		}
+		if finding.Scope != "" && !validScopes[finding.Scope] {
+			return fmt.Errorf("reject findings.jsonl: invalid scope at line %d", sequence)
 		}
 		seen[finding.ID] = true
 		var record struct {
