@@ -14,6 +14,7 @@ import (
 
 	"github.com/jaq-project/jaq/internal/acquire"
 	"github.com/jaq-project/jaq/internal/app"
+	"github.com/jaq-project/jaq/internal/evidence"
 	invprocess "github.com/jaq-project/jaq/internal/investigator"
 	peinfo "github.com/jaq-project/jaq/internal/pe"
 )
@@ -167,6 +168,12 @@ func run(args []string) error {
 	}
 	absoluteOutput, _ := filepath.Abs(*output)
 	fmt.Println("JAQ dossier written to", absoluteOutput)
+	if manifest, err := evidence.ReadManifest(filepath.Join(absoluteOutput, "run-manifest.json")); err == nil {
+		fmt.Println("Status:", manifest.Status)
+		if manifest.Status == "partial" {
+			fmt.Println("Analysis is incomplete; see report.md for retained findings and limitations.")
+		}
+	}
 	return nil
 }
 

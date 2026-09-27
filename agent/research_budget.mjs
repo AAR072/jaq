@@ -1,7 +1,7 @@
 import { HarnessLimitError } from "./protocol.mjs";
 
 export const FINAL_RESEARCH_SUMMARY_INSTRUCTION = "The investigation budget is exhausted. Do not use tools. Return only a concise final research summary of the strongest recovered behavior, assets, deobfuscation work, artifacts, exact evidence IDs, and unresolved gaps.";
-export const FINAL_FINDING_FLUSH_INSTRUCTION = "The reporting budget is exhausted. Evidence-reading tools are closed. Call record_finding now for any remaining reportable application behavior, credential, infrastructure, payload, persistence, impact, recovery request, or single concrete analysis blocker. Do not record packaging, parser, interpreter, library, tooling, or investigation-process details. Use multiple record_finding calls in this response when needed. Do not claim a finding was persisted unless you actually call the tool.";
+export const FINAL_FINDING_FLUSH_INSTRUCTION = "The reporting budget is exhausted. Evidence-reading tools are closed. Call record_finding now for any remaining reportable application behavior, credential, infrastructure, payload, persistence, impact, recovery request, or single concrete analysis blocker. For behavior use an application behavior scope such as application_logic or execution; payload is an asset scope. For assets use an asset scope such as infrastructure, credential, payload, configuration, or persistence; put concrete subtypes such as crypto_wallet or url in asset_type and always supply role. Correct and retry rejected calls. Do not record packaging, parser, interpreter, library, tooling, or investigation-process details. Use multiple record_finding calls in this response when needed. Do not claim a finding was persisted unless you actually call the tool.";
 
 export function budgetReason(error) {
   if (error?.code === "MODEL_CALL_BUDGET") return "the model-call investigation budget is exhausted";
@@ -81,7 +81,7 @@ export function budgetedModelRuntime(runtime, guard, mode, finalizationStage, en
         let stage = finalizationStage();
         if (stage && compaction) {
           guard.beforeReportingAuxiliaryProviderCall();
-        } else if (stage === "findings" && guard.findingFlushProviderCalls < 2) {
+        } else if (stage === "findings" && guard.canContinueFindingFlush()) {
           guard.beforeFindingFlushProviderCall();
           requestArgs = forceFindingFlushArguments(args, summaryMaxOutputTokens);
         } else if (stage === "findings") {

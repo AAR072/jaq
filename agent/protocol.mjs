@@ -147,6 +147,7 @@ export class BudgetGuard {
     this.providerCalls = 0;
     this.summaryProviderCalls = 0;
     this.findingFlushProviderCalls = 0;
+    this.findingFlushCorrectionPending = false;
     this.reportingAuxiliaryProviderCalls = 0;
     this.toolCalls = 0;
     this.investigationToolCalls = 0;
@@ -178,11 +179,26 @@ export class BudgetGuard {
   }
 
   beforeFindingFlushProviderCall() {
-    if (this.findingFlushProviderCalls >= 2) {
+    if (
+      this.findingFlushProviderCalls >= 3
+      || this.findingFlushProviderCalls >= 2 && !this.findingFlushCorrectionPending
+    ) {
       throw new HarnessLimitError("SUMMARY_CALL_BUDGET", "investigator finding-flush call budget exhausted");
     }
+    if (this.findingFlushProviderCalls >= 2) this.findingFlushCorrectionPending = false;
     this.findingFlushProviderCalls += 1;
     this.providerCalls += 1;
+  }
+
+  noteFindingFlushFailure() {
+    if (this.findingFlushProviderCalls > 0 && this.findingFlushProviderCalls < 3) {
+      this.findingFlushCorrectionPending = true;
+    }
+  }
+
+  canContinueFindingFlush() {
+    return this.findingFlushProviderCalls < 2
+      || this.findingFlushProviderCalls < 3 && this.findingFlushCorrectionPending;
   }
 
   beforeReportingAuxiliaryProviderCall() {

@@ -29,12 +29,12 @@ import stat
 import struct
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 SCHEMA_VERSION = "1.0"
 TOOL_NAME = "jaq-go-profile"
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.2.0"
 
 MAX_INPUT_BYTES = 512 << 20
 MAX_FUNCTIONS = 256
@@ -80,15 +80,14 @@ _SENSITIVE_TERMS: tuple[tuple[str, str], ...] = (
     ("loader", "loadlibrary"),
     ("loader", "getprocaddress"),
 )
-_DYNAMIC_TERMS: tuple[str, ...] = (
-    "lazyproc",
-    "syscalln",
-    "newcallback",
-    "getprocaddress",
-    "loadlibrary",
-    "loadlibraryw",
-    "loadlibrarya",
-    "procaddress",
+_DYNAMIC_QUALIFIED_RE = re.compile(
+    r"(?:^|[.(/!*])(?:"
+    r"lazydll|newlazydll|newlazysystemdll|newproc|"
+    r"lazyproc|"
+    r"rawsyscall(?:6|n)?|syscall(?:6|9|12|15|18|n)?|newcallback|"
+    r"getprocaddress|loadlibrary(?:ex)?(?:w|a)?|procaddress"
+    r")(?:$|[)]|[.]abi[0-9]*$)",
+    re.IGNORECASE,
 )
 _STRING_INDICATOR_RE = re.compile(
     r"(?:https?://|\b(?:bearer|token|password|secret|api[_ -]?key)\b|\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)",
@@ -132,6 +131,11 @@ class Instruction:
     target: str | None = None
     target_address: int | None = None
     string_value: str | None = None
+    # Capstone-derived facts are intentionally compact and bounded.  The
+    # original operand_classes field remains the stable normalized interface;
+    # these facts are used only for conservative static value propagation.
+    operand_facts: tuple["OperandFact", ...] = ()
+    size: int = 0
 
     @property
     def normalized(self) -> str:
@@ -149,6 +153,22 @@ class FunctionIR:
     address: int
     size: int
     instructions: list[Instruction] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class OperandFact:
+    """Bounded x86 operand information needed by the Go resolver."""
+
+    kind: str
+    register: str | None = None
+    base: str | None = None
+    index: str | None = None
+    scale: int = 1
+    displacement: int = 0
+    immediate: int | None = None
+    effective_address: int | None = None
+    width: int = 0
 
 
 def _bounded_text(value: Any, maximum: int = MAX_NAME_CHARS) -> str:
@@ -160,14 +180,14 @@ def _bounded_text(value: Any, maximum: int = MAX_NAME_CHARS) -> str:
 
 
 def _target_class(target: str | None) -> str:
-    if not target:
+    if not target or target.casefold() == "<indirect>":
         return "indirect"
     lowered = target.casefold()
     if lowered.startswith("runtime.") or lowered.startswith("internal/"):
         return "runtime"
     if lowered.startswith("main."):
         return "application"
-    if any(term in lowered for term in _DYNAMIC_TERMS):
+    if _is_dynamic_target(target):
         return "dynamic"
     if "!" in lowered or lowered.startswith(("syscall.", "kernel32", "ntdll", "ws2_32")):
         return "external"
@@ -175,13 +195,13 @@ def _target_class(target: str | None) -> str:
 
 
 def _call_family(target: str | None) -> str | None:
-    if not target:
+    if not target or target.casefold() == "<indirect>":
         return "indirect"
     lowered = target.casefold()
     for family, term in _SENSITIVE_TERMS:
         if term in lowered:
             return family
-    if any(term in lowered for term in _DYNAMIC_TERMS):
+    if _is_dynamic_target(target):
         return "dynamic_resolution"
     if lowered.startswith("runtime.") or lowered.startswith("internal/"):
         return "runtime"
@@ -192,12 +212,33 @@ def _call_family(target: str | None) -> str | None:
 
 def _is_sensitive(call: Instruction) -> bool:
     family = _call_family(call.target)
-    return family in {"network", "process", "persistence", "file", "crypto", "credential", "loader", "dynamic_resolution"}
+    return family in {
+        "network",
+        "process",
+        "persistence",
+        "file",
+        "crypto",
+        "credential",
+        "loader",
+        "dynamic_resolution",
+        "indirect",
+    }
+
+
+def _is_dynamic_target(target: str | None) -> bool:
+    """Return whether a target names a dynamic/API-resolution operation.
+
+    Matching uses token boundaries rather than substring checks so names such
+    as ``notlazyprocfoo`` do not become safety-relevant by accident.
+    """
+
+    if not target or target.casefold() == "<indirect>":
+        return True
+    return bool(_DYNAMIC_QUALIFIED_RE.search(target))
 
 
 def _is_dynamic(call: Instruction) -> bool:
-    target = (call.target or "").casefold()
-    return bool(target) and target != "<indirect>" and any(term in target for term in _DYNAMIC_TERMS)
+    return call.mnemonic.casefold() == "call" and _is_dynamic_target(call.target)
 
 
 def _read_u16(data: bytes, offset: int) -> int:
@@ -334,8 +375,19 @@ def _load_capstone(machine: int):
     raise ProfileError(f"unsupported PE machine 0x{machine:x}")
 
 
+def _capstone_register_name(insn: Any, register: int) -> str | None:
+    if not register:
+        return None
+    try:
+        name = insn.reg_name(register)
+    except Exception:
+        return None
+    return name.casefold() if name else None
+
+
 def _instruction_from_capstone(insn: Any, symbol_by_address: Mapping[int, Symbol], capstone: Any) -> Instruction:
     operand_classes: list[str] = []
+    operand_facts: list[OperandFact] = []
     target_address: int | None = None
     target: str | None = None
     try:
@@ -345,16 +397,48 @@ def _instruction_from_capstone(insn: Any, symbol_by_address: Mapping[int, Symbol
     for operand in operands:
         if operand.type == capstone.x86.X86_OP_REG:
             operand_classes.append("reg")
+            operand_facts.append(OperandFact(
+                kind="reg",
+                register=_capstone_register_name(insn, operand.reg),
+                width=int(getattr(operand, "size", 0) or 0),
+            ))
         elif operand.type == capstone.x86.X86_OP_IMM:
             operand_classes.append("imm")
+            immediate = int(operand.imm)
+            operand_facts.append(OperandFact(
+                kind="imm",
+                immediate=immediate,
+                width=int(getattr(operand, "size", 0) or 0),
+            ))
             if insn.mnemonic.casefold() in {"call", "jmp", "jz", "jnz", "je", "jne", "ja", "jb", "jg", "jl"}:
-                target_address = int(operand.imm)
+                target_address = immediate
                 symbol = symbol_by_address.get(target_address)
                 target = symbol.name if symbol else None
         elif operand.type == capstone.x86.X86_OP_MEM:
             operand_classes.append("mem")
+            base = _capstone_register_name(insn, operand.mem.base)
+            index = _capstone_register_name(insn, operand.mem.index)
+            displacement = int(operand.mem.disp)
+            effective_address: int | None = None
+            if base == "rip":
+                effective_address = int(insn.address + insn.size + displacement)
+            elif base is None and index is None:
+                # Absolute disp32/disp64 addressing on x86.  For a 32-bit
+                # image this is the complete VA; for x64 Capstone emits this
+                # only for explicitly absolute operands.
+                effective_address = displacement
+            operand_facts.append(OperandFact(
+                kind="mem",
+                base=base,
+                index=index,
+                scale=int(getattr(operand.mem, "scale", 1) or 1),
+                displacement=displacement,
+                effective_address=effective_address,
+                width=int(getattr(operand, "size", 0) or 0),
+            ))
         else:
             operand_classes.append("other")
+            operand_facts.append(OperandFact(kind="other"))
     if insn.mnemonic.casefold() == "call" and target is None and "[" in insn.op_str:
         target = "<indirect>"
     string_value = None
@@ -365,6 +449,8 @@ def _instruction_from_capstone(insn: Any, symbol_by_address: Mapping[int, Symbol
         target=target,
         target_address=target_address,
         string_value=string_value,
+        operand_facts=tuple(operand_facts),
+        size=int(getattr(insn, "size", 0) or 0),
     )
 
 
@@ -383,10 +469,12 @@ def _disassemble_functions(
         {symbol.address: symbol for symbol in symbols if symbol.section == text_index}.values(),
         key=lambda item: (item.address, item.name),
     )
-    app_symbols = [
+    all_app_symbols = [
         symbol for symbol in text_symbols
         if symbol.name.startswith("main.") and symbol.address >= image_base + text_section.virtual_address
-    ][:MAX_FUNCTIONS]
+    ]
+    app_symbols = all_app_symbols[:MAX_FUNCTIONS]
+    symbols_truncated = len(all_app_symbols) > len(app_symbols)
     if not app_symbols:
         return []
     symbol_by_address = {symbol.address: symbol for symbol in text_symbols}
@@ -401,29 +489,35 @@ def _disassemble_functions(
             if candidate.address > symbol.address:
                 next_address = candidate.address
                 break
-        size = min(max(0, next_address - symbol.address), MAX_FUNCTION_BYTES)
+        unbounded_size = max(0, next_address - symbol.address)
+        size = min(unbounded_size, MAX_FUNCTION_BYTES)
         offset = _rva_to_file_offset(symbol.address - image_base, sections)
         if offset is None or offset >= len(data) or size <= 0:
-            result.append(FunctionIR(symbol.name, symbol.address, 0, []))
+            result.append(FunctionIR(symbol.name, symbol.address, 0, [], True))
             continue
         size = min(size, len(data) - offset)
         blob = data[offset : offset + size]
         instructions: list[Instruction] = []
+        function_truncated = unbounded_size > size or (symbols_truncated and index == len(app_symbols) - 1)
         try:
             for raw in engine.disasm(blob, symbol.address):
                 instructions.append(_instruction_from_capstone(raw, symbol_by_address, capstone))
                 total_instructions += 1
                 if total_instructions >= MAX_TOTAL_INSTRUCTIONS:
+                    function_truncated = True
                     break
         except Exception:
             instructions = []
-        result.append(FunctionIR(symbol.name, symbol.address, size, instructions))
+            function_truncated = True
+        if not instructions or instructions[-1].address + instructions[-1].size < symbol.address + size:
+            function_truncated = True
+        result.append(FunctionIR(symbol.name, symbol.address, size, instructions, function_truncated))
         # Keep the symbol coverage record for later functions even when the
         # global instruction cap is reached.  A missing record would make a
         # large Go binary's late loader/crypto functions invisible to triage.
         if total_instructions >= MAX_TOTAL_INSTRUCTIONS:
             for remaining in app_symbols[index + 1 :]:
-                result.append(FunctionIR(remaining.name, remaining.address, 0, []))
+                result.append(FunctionIR(remaining.name, remaining.address, 0, [], True))
             break
     return result
 
@@ -468,7 +562,634 @@ def _reachable_functions(functions: Sequence[FunctionIR]) -> tuple[set[str], str
     return reachable, "partial" if has_indirect else "direct"
 
 
-def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, entry_rva: int = 0) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _StaticImage:
+    data: bytes
+    image_base: int
+    sections: tuple[Section, ...]
+    machine: int
+
+    @property
+    def pointer_width(self) -> int:
+        return 8 if self.machine == 0x8664 else 4
+
+
+@dataclass(frozen=True)
+class _StaticValue:
+    kind: str
+    value: int
+    basis: str
+
+
+@dataclass(frozen=True)
+class _FieldLink:
+    proc_object: int
+    dll_object: int
+    basis: str
+
+
+def _canonical_register(register: str | None) -> str | None:
+    """Normalize x86 register aliases for bounded copy tracking."""
+
+    if not register:
+        return None
+    lowered = register.casefold()
+    aliases = {
+        "al": "rax", "ah": "rax", "ax": "rax", "eax": "rax",
+        "bl": "rbx", "bh": "rbx", "bx": "rbx", "ebx": "rbx",
+        "cl": "rcx", "ch": "rcx", "cx": "rcx", "ecx": "rcx",
+        "dl": "rdx", "dh": "rdx", "dx": "rdx", "edx": "rdx",
+        "si": "rsi", "esi": "rsi",
+        "di": "rdi", "edi": "rdi",
+        "sp": "rsp", "esp": "rsp",
+        "bp": "rbp", "ebp": "rbp",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
+    if re.fullmatch(r"r(?:[8-9]|1[0-5])d", lowered):
+        return lowered[:-1]
+    if re.fullmatch(r"r(?:[8-9]|1[0-5])w", lowered):
+        return lowered[:-1]
+    if re.fullmatch(r"r(?:[8-9]|1[0-5])b", lowered):
+        return lowered[:-1]
+    return lowered
+
+
+def _static_memory(image: _StaticImage | None, address: int, size: int) -> tuple[bytes, int, Section] | None:
+    if image is None or size <= 0 or size > MAX_NAME_CHARS + 16:
+        return None
+    offset = _rva_to_file_offset(address - image.image_base, image.sections)
+    if offset is None or offset < 0 or offset + size > len(image.data):
+        return None
+    section = _section_for_address(address, image.image_base, image.sections)
+    if section is None:
+        return None
+    relative = address - image.image_base - section.virtual_address
+    if relative < 0 or relative + size > section.raw_size:
+        return None
+    return image.data[offset : offset + size], offset, section
+
+
+def _static_pointer(image: _StaticImage | None, address: int) -> int | None:
+    if image is None:
+        return None
+    raw = _static_memory(image, address, image.pointer_width)
+    if raw is None:
+        return None
+    value = int.from_bytes(raw[0], "little", signed=False)
+    if value == 0 or _section_for_address(value, image.image_base, image.sections) is None:
+        return None
+    return value
+
+
+def _literal_provenance(image: _StaticImage, address: int, length: int, value: str) -> dict[str, Any] | None:
+    raw = _static_memory(image, address, length)
+    if raw is None:
+        return None
+    _bytes, offset, section = raw
+    return {
+        "value": _bounded_text(value, MAX_NAME_CHARS),
+        "va": f"0x{address:x}",
+        "file_offset": f"0x{offset:x}",
+        "section": section.name,
+        "length": length,
+    }
+
+
+def _decode_go_string(image: _StaticImage | None, header: int, offset: int) -> tuple[str, dict[str, Any]] | None:
+    if image is None or offset < 0:
+        return None
+    pointer = _static_pointer(image, header + offset)
+    if pointer is None:
+        return None
+    length_raw = _static_memory(image, header + offset + image.pointer_width, image.pointer_width)
+    if length_raw is None:
+        return None
+    length = int.from_bytes(length_raw[0], "little", signed=False)
+    if length <= 0 or length > MAX_NAME_CHARS:
+        return None
+    raw = _static_memory(image, pointer, length)
+    if raw is None:
+        return None
+    try:
+        value = raw[0].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if not value or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return None
+    provenance = _literal_provenance(image, pointer, length, value)
+    if provenance is None:
+        return None
+    return value, provenance
+
+
+_DLL_LITERAL_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*[.]dll", re.IGNORECASE)
+_PROC_LITERAL_RE = re.compile(r"(?:[a-z_?@][a-z0-9_?$@.]{0,254}|#[0-9]{1,5})", re.IGNORECASE)
+
+
+def _plausible_dll(value: str) -> bool:
+    return len(value) <= MAX_NAME_CHARS and bool(_DLL_LITERAL_RE.fullmatch(value))
+
+
+def _plausible_proc(value: str) -> bool:
+    return len(value) <= MAX_NAME_CHARS and bool(_PROC_LITERAL_RE.fullmatch(value))
+
+
+def _instruction_destination(instruction: Instruction) -> str | None:
+    facts = instruction.operand_facts
+    if not facts or facts[0].kind != "reg":
+        return None
+    return _canonical_register(facts[0].register)
+
+
+def _operand_static_value(
+    instruction: Instruction,
+    operand: OperandFact,
+    registers: Mapping[str, _StaticValue],
+    image: _StaticImage | None,
+) -> _StaticValue | None:
+    if operand.kind == "imm" and operand.immediate is not None:
+        return _StaticValue("integer", operand.immediate, "immediate")
+    if operand.kind == "reg":
+        register = _canonical_register(operand.register)
+        return registers.get(register) if register else None
+    if operand.kind != "mem":
+        return None
+    address = operand.effective_address
+    if address is None and operand.base:
+        base_value = registers.get(_canonical_register(operand.base) or "")
+        if base_value is not None:
+            address = base_value.value + operand.displacement
+            if operand.index:
+                index_value = registers.get(_canonical_register(operand.index) or "")
+                if index_value is None or index_value.kind not in {"integer", "pointer", "address"}:
+                    address = None
+                else:
+                    address += index_value.value * operand.scale
+    if address is None:
+        return None
+    if image is not None and operand.width and operand.width != image.pointer_width:
+        return None
+    value = _static_pointer(image, address)
+    if value is not None:
+        return _StaticValue("pointer", value, "static_memory_pointer")
+    return None
+
+
+def _direct_memory_operand(instruction: Instruction) -> OperandFact | None:
+    for operand in instruction.operand_facts:
+        if operand.kind == "mem" and operand.effective_address is not None:
+            return operand
+    return None
+
+
+def _is_branch_instruction(instruction: Instruction) -> bool:
+    mnemonic = instruction.mnemonic.casefold()
+    return mnemonic.startswith("j") or mnemonic.startswith("loop")
+
+
+def _track_static_function(
+    function: FunctionIR,
+    image: _StaticImage | None,
+) -> dict[int, _StaticValue | None]:
+    """Track bounded register/stack copies into dynamic call receivers."""
+
+    registers: dict[str, _StaticValue] = {}
+    stack_slots: dict[int, _StaticValue] = {}
+    receivers: dict[int, _StaticValue | None] = {}
+    for instruction in function.instructions:
+        mnemonic = instruction.mnemonic.casefold()
+        facts = instruction.operand_facts
+        if mnemonic == "call":
+            if _is_dynamic(instruction):
+                if image is not None and image.pointer_width == 4:
+                    receivers[instruction.address] = stack_slots.get(0)
+                else:
+                    receivers[instruction.address] = registers.get("rax")
+            # A call may clobber every register.  The resolver never carries a
+            # value through a call, even when the target happens to be known.
+            registers.clear()
+            stack_slots.clear()
+            continue
+        if _is_branch_instruction(instruction):
+            registers.clear()
+            stack_slots.clear()
+            continue
+        if mnemonic in {"ret", "iret", "sysret"}:
+            registers.clear()
+            stack_slots.clear()
+            continue
+        destination = _instruction_destination(instruction)
+        direct_memory = _direct_memory_operand(instruction)
+        if destination == "rsp" and mnemonic in {"add", "sub", "and", "lea", "mov"}:
+            stack_slots.clear()
+        if facts and facts[0].kind == "mem":
+            memory = facts[0]
+            if memory.base and _canonical_register(memory.base) == "rsp" and memory.index is None:
+                source = None
+                if len(facts) >= 2:
+                    source = _operand_static_value(instruction, facts[1], registers, image)
+                if source is not None and source.kind in {"pointer", "address"}:
+                    stack_slots[memory.displacement] = source
+                else:
+                    stack_slots.pop(memory.displacement, None)
+            elif direct_memory is None:
+                # An unknown memory write can alias tracked stack state.
+                registers.clear()
+                stack_slots.clear()
+            else:
+                # Exact image writes are consumed separately by the
+                # initializer-link pass and cannot alias the caller's stack.
+                pass
+            continue
+        if destination is None:
+            # Unknown writes/instructions do not inherit stale register facts.
+            if mnemonic not in {"nop", "cmp", "test", "push"}:
+                registers.clear()
+                stack_slots.clear()
+            elif mnemonic in {"add", "sub", "and", "or", "xor", "inc", "dec"} and facts:
+                registers.clear()
+                stack_slots.clear()
+            continue
+        if mnemonic == "lea" and len(facts) >= 2 and facts[1].kind == "mem" and facts[1].effective_address is not None:
+            if image is None or not facts[0].width or facts[0].width == image.pointer_width:
+                registers[destination] = _StaticValue("address", facts[1].effective_address, "rip_relative_lea")
+            else:
+                registers.pop(destination, None)
+            continue
+        if mnemonic == "mov" and len(facts) >= 2:
+            source_operand = facts[1]
+            if source_operand.kind == "mem" and source_operand.base and _canonical_register(source_operand.base) == "rsp" and source_operand.index is None:
+                source = stack_slots.get(source_operand.displacement)
+            else:
+                source = _operand_static_value(instruction, source_operand, registers, image)
+            full_width = image is None or not facts[0].width or facts[0].width == image.pointer_width
+            if source is not None and (source.kind == "integer" or full_width):
+                registers[destination] = source
+            else:
+                registers.pop(destination, None)
+            continue
+        # A register destination with no exact transfer is unknown.
+        registers.pop(destination, None)
+    return receivers
+
+
+def _pointer_source_before_store(
+    function: FunctionIR,
+    store_index: int,
+    source_register: str,
+    image: _StaticImage | None,
+) -> _StaticValue | None:
+    """Recover a pointer source for an exact initializer store.
+
+    This intentionally tolerates the compiler's write-barrier branch/call in
+    an initializer, but never uses string proximity or an arbitrary nearby
+    literal.  The bounded backward walk stops at unknown register writes and
+    non-runtime calls.
+    """
+
+    wanted = _canonical_register(source_register)
+    if wanted is None:
+        return None
+    steps = 0
+    for index in range(store_index - 1, -1, -1):
+        if steps >= min(MAX_CALLS_PER_FUNCTION, MAX_SHINGLE_INSTRUCTIONS * 2):
+            break
+        steps += 1
+        instruction = function.instructions[index]
+        mnemonic = instruction.mnemonic.casefold()
+        if mnemonic == "call":
+            target = (instruction.target or "").casefold()
+            if target not in {"runtime.gcwritebarrier2", "runtime.gcwritebarrier1"}:
+                return None
+            continue
+        if _is_branch_instruction(instruction):
+            continue
+        destination = _instruction_destination(instruction)
+        if destination != wanted:
+            continue
+        facts = instruction.operand_facts
+        if mnemonic == "mov" and len(facts) >= 2:
+            source = facts[1]
+            if source.kind == "reg" and source.register:
+                wanted = _canonical_register(source.register)
+                if wanted is None:
+                    return None
+                continue
+            source_value = _operand_static_value(instruction, source, {}, image)
+            if source_value is not None and source_value.kind in {"pointer", "address"}:
+                return source_value
+            return None
+        if mnemonic == "lea" and len(facts) >= 2 and facts[1].effective_address is not None:
+            return _StaticValue("address", facts[1].effective_address, "rip_relative_lea")
+        return None
+    return None
+
+
+def _collect_lazyproc_links(
+    functions: Sequence[FunctionIR],
+    image: _StaticImage | None,
+    proc_objects: set[int],
+) -> dict[int, list[_FieldLink]]:
+    """Collect exact LazyProc->LazyDLL links from data and init stores."""
+
+    if image is None or not proc_objects:
+        return {}
+    links: dict[int, list[_FieldLink]] = defaultdict(list)
+    link_offset = 8 + (2 * image.pointer_width)
+    # Serialized fields are already exact pointers when present.
+    for proc_object in sorted(proc_objects):
+        dll_object = _static_pointer(image, proc_object + link_offset)
+        if dll_object is not None:
+            links[proc_object].append(_FieldLink(proc_object, dll_object, "exact_lazyproc_field_pointer"))
+
+    # Recover stores to the architecture-specific LazyProc ``l`` field.  The target must be derived
+    # from an exact pointer-valued global, not from a nearby string/object.
+    proc_by_link_address = {item + link_offset: item for item in proc_objects}
+    for function in functions:
+        for index, instruction in enumerate(function.instructions):
+            facts = instruction.operand_facts
+            if instruction.mnemonic.casefold() != "mov" or len(facts) < 2:
+                continue
+            destination = facts[0]
+            source = facts[1]
+            if destination.kind != "mem" or destination.effective_address is None or source.kind != "reg" or not source.register:
+                continue
+            proc_object = proc_by_link_address.get(destination.effective_address)
+            if proc_object is None:
+                continue
+            pointer_value = _pointer_source_before_store(function, index, source.register, image)
+            if pointer_value is None or pointer_value.value == 0:
+                continue
+            link = _FieldLink(proc_object, pointer_value.value, "exact_rip_relative_initialization_store")
+            if link not in links[proc_object]:
+                links[proc_object].append(link)
+    return {key: sorted(value, key=lambda item: (item.dll_object, item.basis)) for key, value in links.items()}
+
+
+def _windows_call_kind(target: str | None) -> str:
+    if not target or target.casefold() == "<indirect>":
+        return "indirect_call"
+    lowered = target.casefold()
+    if "newlazysystemdll" in lowered:
+        return "new_lazy_system_dll"
+    if "newlazydll" in lowered:
+        return "new_lazy_dll"
+    if "newproc" in lowered:
+        return "new_proc"
+    if "newcallback" in lowered:
+        return "new_callback"
+    if "lazyproc" in lowered and "addr" in lowered:
+        return "lazyproc_addr"
+    if "lazyproc" in lowered and "call" in lowered:
+        return "lazyproc_call"
+    if "proc" in lowered and "call" in lowered:
+        return "proc_call"
+    if "rawsyscall" in lowered:
+        return "raw_syscall"
+    if "syscalln" in lowered:
+        return "syscall_n"
+    if "syscall" in lowered:
+        return "syscall"
+    if "lazydll" in lowered:
+        return "lazy_dll"
+    if "loadlibrary" in lowered:
+        return "load_library"
+    if "getprocaddress" in lowered or "procaddress" in lowered:
+        return "get_proc_address"
+    return "dynamic_call"
+
+
+def _layout_offsets(target: str | None, *, dll: bool, pointer_width: int) -> tuple[int, ...]:
+    lowered = (target or "").casefold()
+    if not dll and ("x/sys" in lowered or "/windows" in lowered) and not lowered.startswith("syscall"):
+        return (0,)
+    if dll and ("x/sys" in lowered or "/windows" in lowered) and not lowered.startswith("syscall"):
+        return (0,)
+    if lowered.startswith("syscall"):
+        return (8 + pointer_width,) if dll else (8,)
+    return (8 + pointer_width, 0) if dll else (8, 0)
+
+
+def _string_candidates(
+    image: _StaticImage | None,
+    object_address: int | None,
+    target: str | None,
+    *,
+    dll: bool,
+) -> list[tuple[str, dict[str, Any], int]]:
+    if image is None or object_address is None:
+        return []
+    candidates: list[tuple[str, dict[str, Any], int]] = []
+    for offset in _layout_offsets(target, dll=dll, pointer_width=image.pointer_width):
+        decoded = _decode_go_string(image, object_address, offset)
+        if decoded is None:
+            continue
+        value, provenance = decoded
+        if dll and not _plausible_dll(value):
+            continue
+        if not dll and not _plausible_proc(value):
+            continue
+        if not any(existing[0] == value and existing[2] == offset for existing in candidates):
+            candidates.append((value, provenance, offset))
+    return candidates
+
+
+def _resolver_site(
+    function: FunctionIR,
+    instruction: Instruction,
+    index: int,
+    covered: set[int],
+    reachable: set[str],
+    receiver: _StaticValue | None,
+    links: Mapping[int, Sequence[_FieldLink]],
+    image: _StaticImage | None,
+) -> dict[str, Any]:
+    target = instruction.target or "<indirect>"
+    kind = _windows_call_kind(target)
+    repeated = index in covered
+    site: dict[str, Any] = {
+        "function": function.name,
+        "address": f"0x{instruction.address:x}",
+        "kind": kind,
+        "call_target": _bounded_text(target),
+        "dll": None,
+        "proc": None,
+        "resolution": "unresolved",
+        "confidence": 0.0,
+        "confidence_label": "low",
+        "basis": [],
+        "reachable": function.name in reachable,
+        "repeated": repeated,
+        "clone_only": repeated,
+    }
+    basis: list[str] = []
+    if target == "<indirect>":
+        basis.append("indirect_call_without_static_target")
+    elif instruction.target_address is not None:
+        basis.append("exact_call_target")
+    if receiver is not None and receiver.kind in {"pointer", "address"}:
+        basis.append(receiver.basis)
+        site["proc_object_address"] = f"0x{receiver.value:x}"
+    else:
+        basis.append("no_exact_call_receiver")
+
+    proc_candidates = _string_candidates(image, receiver.value if receiver is not None else None, target, dll=False)
+    proc_values = sorted({candidate[0] for candidate in proc_candidates})
+    if len(proc_values) == 1:
+        proc_name = proc_values[0]
+        proc_candidate = next(candidate for candidate in proc_candidates if candidate[0] == proc_name)
+        site["proc"] = proc_name
+        site["proc_literal"] = proc_candidate[1]
+        site["proc_string_header_address"] = f"0x{receiver.value + proc_candidate[2]:x}"
+        basis.append("exact_proc_string_header")
+    elif len(proc_values) > 1:
+        site["proc"] = proc_values[0]
+        basis.append("ambiguous_proc_string_headers")
+    elif receiver is not None:
+        basis.append("missing_exact_proc_string_header")
+
+    dll_objects: list[tuple[int, str]] = []
+    if receiver is not None and receiver.kind in {"pointer", "address"}:
+        link_offset = 8 + (2 * image.pointer_width) if image is not None else 24
+        direct_dll = _static_pointer(image, receiver.value + link_offset)
+        if direct_dll is not None:
+            dll_objects.append((direct_dll, "exact_lazyproc_field_pointer"))
+        for link in links.get(receiver.value, ()):
+            dll_objects.append((link.dll_object, link.basis))
+    unique_dll_objects = sorted({item[0] for item in dll_objects})
+    dll_values: list[str] = []
+    if len(unique_dll_objects) == 1:
+        basis.extend(sorted({item[1] for item in dll_objects}))
+        dll_candidates = _string_candidates(image, unique_dll_objects[0], target, dll=True)
+        dll_values = sorted({candidate[0] for candidate in dll_candidates})
+        if len(dll_values) == 1:
+            dll_name = dll_values[0]
+            dll_candidate = next(candidate for candidate in dll_candidates if candidate[0] == dll_name)
+            site["dll"] = dll_name
+            site["dll_literal"] = dll_candidate[1]
+            site["dll_object_address"] = f"0x{unique_dll_objects[0]:x}"
+            site["dll_string_header_address"] = f"0x{unique_dll_objects[0] + dll_candidate[2]:x}"
+            basis.append("exact_dll_string_header")
+        elif len(dll_values) > 1:
+            site["dll"] = dll_values[0]
+            basis.append("ambiguous_dll_string_headers")
+        else:
+            basis.append("missing_exact_dll_string_header")
+    elif len(unique_dll_objects) > 1:
+        basis.append("ambiguous_lazy_dll_object_links")
+    elif receiver is not None:
+        basis.append("missing_exact_lazy_dll_link")
+
+    site["basis"] = sorted(set(basis))
+    exact = (
+        kind in {"lazyproc_call", "lazyproc_addr"}
+        and len(proc_values) == 1
+        and len(unique_dll_objects) == 1
+        and len(dll_values) == 1
+        and receiver is not None
+        and receiver.kind in {"pointer", "address"}
+        and "exact_call_target" in basis
+    )
+    if exact:
+        site["resolution"] = "resolved"
+        site["confidence"] = 0.95
+        site["confidence_label"] = "high"
+    elif len(proc_values) == 1 or len(unique_dll_objects) == 1:
+        site["resolution"] = "ambiguous"
+        site["confidence"] = 0.75
+        site["confidence_label"] = "medium"
+    return site
+
+
+def _resolve_windows_api(
+    functions: Sequence[FunctionIR],
+    *,
+    image_base: int,
+    sections: Sequence[Section],
+    machine: int,
+    data: bytes | None,
+    reachable: set[str],
+    covered_by_function: Mapping[str, set[int]],
+    graph_status: str,
+    analysis_truncated: bool,
+) -> tuple[dict[str, Any], dict[tuple[str, int], dict[str, Any]]]:
+    image = _StaticImage(data, image_base, tuple(sections), machine) if data is not None and sections else None
+    site_limit = MAX_CALLS_PER_FUNCTION * 4
+    candidates: list[tuple[FunctionIR, int, Instruction, _StaticValue | None]] = []
+    proc_objects: set[int] = set()
+    resolver_truncated = False
+    for function in functions:
+        receivers = _track_static_function(function, image)
+        for index, instruction in enumerate(function.instructions):
+            if instruction.mnemonic.casefold() != "call" or not _is_dynamic(instruction):
+                continue
+            kind = _windows_call_kind(instruction.target)
+            if kind in {"indirect_call", "dynamic_call"}:
+                continue
+            if len(candidates) >= site_limit:
+                resolver_truncated = True
+                break
+            receiver = receivers.get(instruction.address)
+            candidates.append((function, index, instruction, receiver))
+            if kind in {"lazyproc_call", "lazyproc_addr"} and receiver is not None and receiver.kind in {"pointer", "address"}:
+                proc_objects.add(receiver.value)
+        if resolver_truncated:
+            break
+    links = _collect_lazyproc_links(functions, image, proc_objects)
+    sites: list[dict[str, Any]] = []
+    for function, index, instruction, receiver in candidates:
+        covered = covered_by_function.get(function.name, set())
+        sites.append(_resolver_site(
+            function,
+            instruction,
+            index,
+            covered,
+            reachable,
+            receiver,
+            links,
+            image,
+        ))
+    sites.sort(key=lambda item: (item["function"], int(item["address"], 16), item["kind"], item["call_target"]))
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for site in sites:
+        key = (site["function"], site["address"], site["kind"], site["call_target"])
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(site)
+    sites = deduplicated[:site_limit]
+    resolved_count = sum(1 for item in deduplicated if item["resolution"] == "resolved")
+    ambiguous_count = sum(1 for item in deduplicated if item["resolution"] == "ambiguous")
+    unresolved_count = sum(1 for item in deduplicated if item["resolution"] == "unresolved")
+    blocked = bool(ambiguous_count or unresolved_count or resolver_truncated or graph_status == "partial" or analysis_truncated)
+    if not deduplicated:
+        status = "none"
+    elif blocked:
+        status = "partial"
+    else:
+        status = "resolved"
+    by_site = {(item["function"], int(item["address"], 16)): item for item in deduplicated}
+    return {
+        "status": status,
+        "sites": sites,
+        "resolved_count": resolved_count,
+        "ambiguous_count": ambiguous_count,
+        "unresolved_count": unresolved_count,
+        "truncated": resolver_truncated,
+        "negative_capability_claims_blocked": blocked,
+    }, by_site
+
+
+def _profile_functions(
+    functions: Sequence[FunctionIR],
+    *,
+    image_base: int = 0,
+    entry_rva: int = 0,
+    data: bytes | None = None,
+    sections: Sequence[Section] = (),
+    machine: int = 0,
+) -> dict[str, Any]:
     ordered = sorted(functions, key=lambda item: (item.address, item.name))[:MAX_FUNCTIONS]
     reachable, graph_status = _reachable_functions(ordered)
     occurrences: dict[str, list[tuple[str, int]]] = defaultdict(list)
@@ -518,8 +1239,27 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
             "disposition": "review" if sensitive else "deprioritize_for_behavior",
         })
 
+    analysis_truncated = any(function.truncated for function in ordered)
+    if len(functions) > MAX_FUNCTIONS:
+        analysis_truncated = True
+    if analysis_truncated and graph_status != "partial":
+        graph_status = "partial"
+    windows_api_resolution, resolver_by_site = _resolve_windows_api(
+        ordered,
+        image_base=image_base,
+        sections=sections,
+        machine=machine,
+        data=data,
+        reachable=reachable,
+        covered_by_function=covered_by_function,
+        graph_status=graph_status,
+        analysis_truncated=analysis_truncated,
+    )
+
     function_records: list[dict[str, Any]] = []
     all_dynamic_sites: list[dict[str, Any]] = []
+    dynamic_sites_truncated = False
+    dynamic_site_limit = MAX_CALLS_PER_FUNCTION * 4
     total_instructions = 0
     total_clone_instructions = 0
     for function in ordered:
@@ -551,16 +1291,29 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
                 elif len(meaningful_calls) < MAX_CALLS_PER_FUNCTION:
                     meaningful_calls.append(record)
                 if _is_dynamic(instruction):
-                    all_dynamic_sites.append({
-                        "function": function.name,
-                        "offset": record["offset"],
-                        "target": record["target"],
-                        "family": record["family"],
-                        "resolved": (
-                            record["target"] != "<indirect>"
-                            and not any(term in record["target"].casefold() for term in _DYNAMIC_TERMS)
-                        ),
-                    })
+                    resolver_site = resolver_by_site.get((function.name, instruction.address))
+                    if (
+                        resolver_site
+                        and resolver_site.get("resolution") == "resolved"
+                        and resolver_site.get("dll")
+                        and resolver_site.get("proc")
+                    ):
+                        record["resolved_target"] = (
+                            f"{resolver_site['dll']}!{resolver_site['proc']}"
+                        )
+                    if len(all_dynamic_sites) < dynamic_site_limit:
+                        dynamic_site = {
+                            "function": function.name,
+                            "offset": record["offset"],
+                            "target": record["target"],
+                            "family": record["family"],
+                            "resolved": bool(resolver_site and resolver_site["resolution"] == "resolved"),
+                        }
+                        if record.get("resolved_target"):
+                            dynamic_site["resolved_target"] = record["resolved_target"]
+                        all_dynamic_sites.append(dynamic_site)
+                    else:
+                        dynamic_sites_truncated = True
         calls = [*meaningful_calls, *indirect_samples]
         unique_strings = unique_strings[:MAX_STRINGS_PER_FUNCTION]
         residue_count = max(0, len(instructions) - len(covered))
@@ -598,8 +1351,33 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
         total_clone_instructions / max(1, total_instructions) >= 0.20
         or any(item["clone_ratio"] >= 0.35 for item in function_records)
     )
-    unresolved_dynamic = [item for item in all_dynamic_sites if not item["resolved"] or item["family"] == "dynamic_resolution"]
-    negative_blocked = bool(unresolved_dynamic)
+    resolver_safety_sites = [
+        {
+            "function": site["function"],
+            "offset": site["address"],
+            "target": site["call_target"],
+            "family": "dynamic_resolution",
+            "resolved": site["resolution"] == "resolved",
+            "resolution": site["resolution"],
+        }
+        for site in windows_api_resolution["sites"]
+        if site["resolution"] != "resolved"
+    ]
+    dynamic_sites: list[dict[str, Any]] = []
+    dynamic_site_keys: set[tuple[str, str, str]] = set()
+    for item in [*all_dynamic_sites, *resolver_safety_sites]:
+        key = (item["function"], item["offset"], item["target"])
+        if key in dynamic_site_keys:
+            continue
+        dynamic_site_keys.add(key)
+        dynamic_sites.append(item)
+    dynamic_sites.sort(key=lambda item: (item["function"], int(item["offset"], 16), item["target"]))
+    unresolved_dynamic = [item for item in dynamic_sites if not item["resolved"]]
+    negative_blocked = bool(unresolved_dynamic or dynamic_sites_truncated or graph_status == "partial" or analysis_truncated)
+    if negative_blocked or graph_status == "partial" or analysis_truncated:
+        windows_api_resolution["negative_capability_claims_blocked"] = True
+        if windows_api_resolution["status"] == "resolved":
+            windows_api_resolution["status"] = "partial"
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": TOOL_NAME,
@@ -612,15 +1390,18 @@ def _profile_functions(functions: Sequence[FunctionIR], *, image_base: int = 0, 
         "function_count": len(function_records),
         "reachable_main_functions": sorted(reachable),
         "graph_status": graph_status,
+        "analysis_truncated": analysis_truncated,
         "clone_dominated": clone_dominated,
         "clone_clusters": clone_clusters,
         "functions": function_records,
         "dynamic_resolution": {
-            "sites": unresolved_dynamic[:MAX_CALLS_PER_FUNCTION * 4],
+            "sites": dynamic_sites[:dynamic_site_limit],
             "unresolved_count": len(unresolved_dynamic),
+            "truncated": dynamic_sites_truncated,
             "negative_capability_claims_blocked": negative_blocked,
         },
-        "coverage_status": "partial" if clone_dominated or negative_blocked else "direct",
+        "windows_api_resolution": windows_api_resolution,
+        "coverage_status": "partial" if clone_dominated or negative_blocked or graph_status == "partial" or analysis_truncated else "direct",
         "analysis_limits": {
             "max_functions": MAX_FUNCTIONS,
             "max_total_instructions": MAX_TOTAL_INSTRUCTIONS,
@@ -676,8 +1457,24 @@ def profile_bytes(data: bytes) -> dict[str, Any]:
                 "unresolved_count": 0,
                 "negative_capability_claims_blocked": True,
             },
+            "windows_api_resolution": {
+                "status": "partial",
+                "sites": [],
+                "resolved_count": 0,
+                "ambiguous_count": 0,
+                "unresolved_count": 0,
+                "negative_capability_claims_blocked": True,
+            },
+            "coverage_status": "partial",
         }
-    return _profile_functions(functions, image_base=image_base, entry_rva=entry_rva)
+    return _profile_functions(
+        functions,
+        image_base=image_base,
+        entry_rva=entry_rva,
+        data=data,
+        sections=sections,
+        machine=machine,
+    )
 
 
 def _bounded_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
@@ -692,6 +1489,8 @@ def _bounded_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
                 function["unique_strings"] = function.get("unique_strings", [])[:MAX_STRINGS_PER_FUNCTION]
     if isinstance(value.get("clone_clusters"), list):
         value["clone_clusters"] = value["clone_clusters"][:MAX_CLONE_CLUSTERS]
+    if isinstance(value.get("windows_api_resolution"), dict):
+        value["windows_api_resolution"]["sites"] = value["windows_api_resolution"].get("sites", [])[:MAX_CALLS_PER_FUNCTION * 4]
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) <= MAX_OUTPUT_BYTES:
         return value
@@ -700,9 +1499,20 @@ def _bounded_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
     value["output_truncated"] = True
     value["functions"] = value.get("functions", [])[:64]
     value["clone_clusters"] = value.get("clone_clusters", [])[:32]
+    if isinstance(value.get("windows_api_resolution"), dict):
+        value["windows_api_resolution"]["sites"] = value["windows_api_resolution"].get("sites", [])[:64]
     for function in value.get("functions", []):
         function["unique_calls"] = function.get("unique_calls", [])[:16]
         function["unique_strings"] = function.get("unique_strings", [])[:8]
+    value["coverage_status"] = "partial"
+    dynamic = value.get("dynamic_resolution")
+    if isinstance(dynamic, dict):
+        dynamic["negative_capability_claims_blocked"] = True
+    windows = value.get("windows_api_resolution")
+    if isinstance(windows, dict):
+        windows["negative_capability_claims_blocked"] = True
+        if windows.get("status") == "resolved":
+            windows["status"] = "partial"
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) <= MAX_OUTPUT_BYTES:
         return value
@@ -718,6 +1528,14 @@ def _bounded_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
         "clone_dominated": bool(value.get("clone_dominated")),
         "dynamic_resolution": value.get("dynamic_resolution", {
             "sites": [], "unresolved_count": 0, "negative_capability_claims_blocked": True,
+        }),
+        "windows_api_resolution": value.get("windows_api_resolution", {
+            "status": "partial",
+            "sites": [],
+            "resolved_count": 0,
+            "ambiguous_count": 0,
+            "unresolved_count": 0,
+            "negative_capability_claims_blocked": True,
         }),
         "coverage_status": "partial",
     }

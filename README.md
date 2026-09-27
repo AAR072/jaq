@@ -18,7 +18,7 @@ make build
 Choose a LiteLLM provider/model string and keep its provider key in the environment:
 
 ```sh
-export JAQ_INVESTIGATOR_MODEL='deepseek/deepseek-v4-flash'
+export JAQ_INVESTIGATOR_MODEL='deepseek/deepseek-flash'
 export DEEPSEEK_API_KEY='...'
 ./bin/jaq analyze --sample /absolute/path/to/sample.exe --output /absolute/path/to/runs/example
 ```
@@ -31,7 +31,9 @@ For the normal local workflow, put those two assignments in the gitignored `.env
 
 The wrapper loads `.env`, activates `.venv` when present, builds the CLI if needed, and writes to a fresh timestamped directory under `runs/`. Supply an absolute second argument to choose a different output directory.
 
-The offline image includes native PE tooling, capa with pinned offline rules/signatures, PyInstaller extraction, Python 3.14 marshal/bytecode disassembly, .NET metadata/CIL libraries, archive/installer extractors, YARA, and common decoding/crypto utilities. It automatically records a bounded Go clone/residue profile so repeated junk-like blocks cannot outrank unique application calls merely by volume. Inside the sandbox, `jaq-tools` prints the installed inventory from `/opt/jaq/TOOLS.md`; tools are ordinary commands and libraries on `PATH`, not additional model APIs.
+DeepSeek V4.1 Flash uses the API ID `deepseek-flash`. JAQ includes a compatibility entry for its pinned SDK and estimates costs at published peak rates, so off-peak billing can be lower. The old `deepseek-v4-flash` API alias uses the same updated estimate.
+
+The offline image includes native PE tooling, capa with pinned offline rules/signatures, PyInstaller extraction, Python 3.14 marshal/bytecode disassembly, .NET metadata/CIL libraries, archive/installer extractors, YARA, common decoding/crypto utilities, and pinned GoReSym 3.4 metadata recovery. It automatically records a bounded Go clone/residue profile with conservative Windows `LazyProc`/`LazyDLL` target resolution, so repeated junk-like blocks cannot outrank unique application calls and unresolved indirect paths cannot support negative capability claims. For binaries otherwise identified as Go, the model conditionally runs GoReSym when `go-profile` reports `not_go`/`partial` because `main.*` symbols are missing or pclntab recovery is needed, then correlates recovered addresses with static disassembly. GoReSym recovers Go build/pclntab/function/type/string metadata from stripped or malformed/unpacked binaries; it does not resolve `LazyProc`/`Syscall` targets or prove behavior. A parser failure is not negative evidence, and Redress is not included. Inside the sandbox, `jaq-tools` prints the installed inventory from `/opt/jaq/TOOLS.md`; tools are ordinary commands and libraries on `PATH`, not additional model APIs.
 
 Runs emit safe structured progress without exposing model prose, sample strings, commands, endpoints, or credentials. Specialized analysis tools are shown immediately; repeated static-command work and model/cost counters are summarized periodically:
 
@@ -53,6 +55,8 @@ Research is cost-governed by default: there is no model-call, tool-call, or cumu
 
 `JAQ_INACTIVITY_TIMEOUT_SECONDS` defaults to `300`. If research emits no progress, tool request, or completion frame for that interval, JAQ terminates the stalled Pi child and compiles the evidence already produced into a partial dossier. `JAQ_REPORT_INACTIVITY_TIMEOUT_SECONDS` optionally sets the reporter timeout independently.
 
+Finalization is local: the research checkpoint is saved before reporting begins, and accepted findings are durable immediately. The reporter can search and page through complete persisted observations with `read_evidence`; it is not limited to truncated previews. When its final finding flush ends, JAQ compiles the report without another model-summary request. The report opens with a locally composed overview of accepted claims and retains the research narrative in an explicitly unverified notes section. Empty asset or communication sections mean nothing was recorded, not that the capability is absent. The CLI prints the final run status.
+
 Completion is quality-gated: at least one application claim must be accepted, analyzer health checks and deobfuscation coverage must be complete, and no core analysis blocker may remain. Otherwise every finding is preserved but the run is marked `partial`. Static “benign/safe” certifications are never accepted, incorrect abbreviated hashes are rejected, and negative capability claims are downgraded when application-owned crypto, unresolved dynamic calls, or analyzer failures contradict them.
 
 The output directory must be new or empty. A completed run contains `run-manifest.json`, `observations.jsonl`, `findings.jsonl`, `research.json`, `claims.json`, `communications.json`, `assets.json`, `requests.json`, `score.json`, and `report.md`; JAQ refuses to overwrite an existing run. `findings.jsonl` is the append-only semantic audit trail. `communications.json` lists the recovered exfiltration and command/control paths. `assets.json` retains the complete flat asset list and adds full-value categories for credentials/tokens, all communication endpoints, the attacker-controlled subset, payloads, execution/persistence, contacts/financial, configuration, and other assets. A secret-bearing webhook appears as both a credential and communication endpoint, while legitimate provider APIs are not labeled attacker infrastructure. The Markdown report presents the same explicit sections. Unsupported positive reachability is downgraded to `unknown` without rejecting an otherwise evidence-backed finding. Action requests begin as evidence-backed `pending_authorization` records. JAQ can fetch an explicitly approved remote payload in its bounded fetch container; it still does not perform dynamic analysis.
@@ -62,6 +66,14 @@ If a run retains analysis evidence or incremental findings but fails before publ
 ```sh
 ./scripts/jaq-harvest /absolute/path/to/existing/run
 ```
+
+For recovery with **no model calls**, including when the provider is unavailable or the run has no findings yet:
+
+```sh
+./scripts/jaq-harvest --compile-only /absolute/path/to/existing/run
+```
+
+This compiles saved findings and research notes, preserves limitations, and requires neither `.env`, Node, a provider key, nor Docker. It does not overwrite published dossier files. The Go controller automatically attempts this same bounded local recovery when its investigator process fails or reaches the stage deadline; the original error remains explicit and the run remains partial. Force-killing the controller itself requires the recovery command.
 
 When `research.json` is missing, the wrapper compiles it locally from the persisted evidence ledger. When `findings.jsonl` contains records, the final dossier is compiled locally with no model call. When it is empty, the same fresh incremental reporter runs over the saved research without rerunning Radare. Recovery never uses an atomic terminal dossier submission.
 

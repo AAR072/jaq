@@ -189,6 +189,26 @@ def render_report(
 
     lines: list[str] = ["# JAQ Intelligence Dossier", ""]
     lines.extend(["## Summary", ""])
+    if normalized_score is not None and not normalized_score.judgments:
+        lines.extend([
+            "Verification checked evidence references and deterministic consistency. No independent model judge reviewed the interpretations.",
+            "",
+        ])
+    # Compose the overview from verified records locally. Producing a readable
+    # ending must never require one more successful model response.
+    if accepted:
+        for claim in sorted(accepted, key=lambda item: (-item.confidence, item.id))[:5]:
+            explanation = claim.explanation
+            if len(explanation) > 900:
+                explanation = explanation[:897] + "…"
+            lines.append(f"<p><strong>{_inline(claim.classification)}</strong> — {_inline(explanation)}</p>")
+            lines.append("")
+    else:
+        lines.extend([
+            "No application behavior has passed verification. This is an incomplete investigation, not a safety verdict.",
+            "Saved evidence and any researcher notes remain available below and in the run directory.",
+            "",
+        ])
     if normalized_score is None:
         lines.append(f"- Accepted claims: {len(accepted)}")
         lines.append(f"- Rejected claims: {sum(status == 'rejected' for _, status in rejected_or_unclear)}")

@@ -129,6 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse research.json and observations.jsonl without rerunning static research",
     )
     modes.add_argument(
+        "--compile-only", action="store_true",
+        help="compile a partial dossier from saved evidence/findings with no model, sandbox, or judge calls",
+    )
+    modes.add_argument(
         "--finalize-research-only", action="store_true",
         help="create research.json from a failed run's persisted observations without rerunning analysis",
     )
@@ -146,6 +150,7 @@ def run_pipeline(
     task: str | None = None,
     tool_runtime: Any | None = None,
     harvest_only: bool = False,
+    compile_only: bool = False,
 ) -> dict[str, Any]:
     """Run the complete claims → judge → score → report handoff.
 
@@ -160,32 +165,37 @@ def run_pipeline(
     if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
         raise ValueError("output must be a real directory, not a file or symlink")
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("claims.json", "assets.json", "requests.json", "score.json", "report.md"):
+    for name in ("claims.json", "assets.json", "communications.json", "requests.json", "score.json", "report.md"):
         if (output_dir / name).exists():
             raise ValueError(f"refusing to overwrite existing {name}")
     runtime = tool_runtime
-    if runtime is None and not harvest_only and os.environ.get("JAQ_SANDBOX_CONTAINER"):
+    if runtime is None and not harvest_only and not compile_only and os.environ.get("JAQ_SANDBOX_CONTAINER"):
         runtime = StaticToolRuntime.from_environment(store)
-    if runtime is None and client is None and not harvest_only:
+    if runtime is None and client is None and not harvest_only and not compile_only:
         raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
     investigator: Investigator | PiInvestigator | None = None
     try:
         if client is None:
-            if harvest_only:
+            if harvest_only or compile_only:
                 research_path = output_dir / "research.json"
+                investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
+                if compile_only and not research_path.exists():
+                    checkpoint = investigator.finalize_persisted_research(
+                        termination_reason="Recovered locally from an interrupted run; no model was called."
+                    ).submission
+                    investigator.write_research_checkpoint(research_path, checkpoint)
                 try:
                     research_checkpoint = json.loads(research_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as error:
                     raise RuntimeError("harvest retry requires a valid research.json") from error
-                investigator = PiInvestigator(store, EvidenceOnlyRuntime(), output_dir)
-                claims = investigator.harvest(research_checkpoint)
+                claims = investigator.harvest(research_checkpoint, compile_only=compile_only)
             else:
                 if runtime is None:
                     raise RuntimeError("controller did not provide the Radare2 static sandbox runtime")
                 investigator = PiInvestigator(store, runtime, output_dir)
                 claims = investigator.run(task)
         else:
-            if harvest_only:
+            if harvest_only or compile_only:
                 raise ValueError("harvest_only is unavailable with the legacy injected model client")
             investigator = Investigator(
                 store, model_client=client,
@@ -207,7 +217,7 @@ def run_pipeline(
     judge = Judge(
         store,
         model_client=judge_client,
-        config=judge_config or JudgeConfig.from_env(),
+        config=JudgeConfig() if compile_only else judge_config or JudgeConfig.from_env(),
     )
     judgments = judge.run(claims_only)
     usage = {"investigator": dict(investigator.last_run.usage if investigator.last_run else {})}
@@ -220,6 +230,13 @@ def run_pipeline(
         usage=usage,
     )
 
+    research = {}
+    research_path = output_dir / "research.json"
+    if research_path.exists():
+        research = json.loads(research_path.read_text(encoding="utf-8"))
+    limitations = research.get("unresolved_questions", [])
+    if compile_only:
+        limitations = [*limitations, "Recovered locally from saved findings; no new analysis or independent judge was performed."]
     contents = {
         "claims.json": json.dumps(claims_only, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "assets.json": json.dumps({
@@ -234,10 +251,11 @@ def run_pipeline(
         "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "report.md": (
-            render_report(claims["claims"], score, store)
+            render_report(claims["claims"], score, store, limitations=limitations)
             + _render_analysis_quality(score.to_dict(), store)
             + _render_communications(claims)
             + _render_operational(claims)
+            + _render_research_notes(research)
         ),
     }
     targets = [output_dir / name for name in contents]
@@ -294,7 +312,7 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
                 for item in records
             )
         else:
-            lines.append("- None identified.")
+            lines.append("- No validated assets recorded in this category; this does not establish absence.")
         lines.append("")
     lines.append("\n## Pending action requests\n")
     requests = investigation.get("action_requests", [])
@@ -307,6 +325,21 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_research_notes(research: Mapping[str, Any]) -> str:
+    summary = research.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return ""
+    # The narrative can contain unsupported hypotheses and hostile sample text.
+    # Retain it for the analyst without promoting it to verified findings or
+    # allowing its Markdown, HTML, or URLs to become active report content.
+    return (
+        "\n## Research notes (unverified)\n\n"
+        "Preserved researcher narrative. These notes may contain hypotheses and incomplete conclusions; "
+        "only the structured findings above have passed the reported verification checks.\n\n"
+        "<pre>" + html.escape(summary, quote=True) + "</pre>\n"
+    )
+
+
 def _render_analysis_quality(score: Mapping[str, Any], store: CanonicalEvidenceStore) -> str:
     lines = ["\n## Analysis quality\n"]
     health_tools = {"verify_radare2_version", "capa_health_check", "go_profile_static_scan"}
@@ -317,10 +350,17 @@ def _render_analysis_quality(score: Mapping[str, Any], store: CanonicalEvidenceS
         and item.metadata.get("status") in {"error", "timeout"}
         and item.metadata.get("tool_name") in health_tools
     })
+    observed_tools = {
+        str(item.metadata.get("tool_name")) for item in store.observations
+        if item.type.endswith("tool_result") and item.metadata.get("status") == "ok"
+    }
+    missing_tools = sorted(health_tools - observed_tools - set(failed_tools))
     if failed_tools:
         lines.append("- Failed or timed-out analyzers: " + ", ".join(f"`{name}`" for name in failed_tools) + ".")
         lines.append("- Their failures are not treated as negative evidence.")
-    else:
+    if missing_tools:
+        lines.append("- Analyzer health checks not recorded: " + ", ".join(f"`{name}`" for name in missing_tools) + ".")
+    if not failed_tools and not missing_tools:
         lines.append("- Required analyzer health checks completed successfully.")
 
     clone_dominated = False
@@ -358,7 +398,7 @@ def _render_communications(investigation: Mapping[str, Any]) -> str:
     lines = ["\n## Network communication\n"]
     communications = investigation.get("communications", [])
     if not isinstance(communications, list) or not communications:
-        lines.append("- None identified.")
+        lines.append("- No validated communication paths recorded; this does not establish absence of network activity.")
         return "\n".join(lines) + "\n"
     labels = {
         "exfiltration": "Exfiltration / phone-home",
@@ -394,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.finalize_research_only:
             finalize_research_only(args.evidence, args.output)
         else:
-            run_pipeline(args.evidence, args.output, task=args.task, harvest_only=args.harvest_only)
+            run_pipeline(args.evidence, args.output, task=args.task, harvest_only=args.harvest_only, compile_only=args.compile_only)
         return 0
     except (ModelError, PiHarnessError, ValueError, OSError, RuntimeError) as error:
         # Keep provider/sample data and credentials out of CLI logs. ModelError

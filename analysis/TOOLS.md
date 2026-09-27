@@ -40,10 +40,22 @@ debug them.
 - `go-profile /input/sample.exe`: deterministic, bounded static profiling of
   Go `main.*` functions. It fingerprints repeated instruction shingles,
   separates clone-heavy regions from unique call residue, builds a conservative
-  direct-call graph, and prioritizes unresolved loader, syscall, callback,
-  network, process, file, registry, credential, and crypto sites. Its JSON
-  output calls repeated code a clone candidate rather than assuming it is junk
-  or program purpose. JAQ records this profile automatically before model work.
+  direct-call graph, and resolves exact `LazyProc.Call` receivers through Go
+  string headers and `LazyProc`/`LazyDLL` object lineage on Windows x86/x64.
+  Resolved sites include DLL/procedure names, addresses, file offsets, sections,
+  and confidence; ambiguous, indirect, truncated, syscall, callback, and loader
+  sites remain explicit blockers for negative capability claims. Its JSON output
+  calls repeated code a clone candidate rather than assuming it is junk or
+  program purpose. JAQ records this profile automatically before model work.
+- `goresym /input/sample.exe`: pinned GoReSym 3.4 metadata recovery for Go
+  build information and pclntab, function, type, and string metadata in
+  stripped, malformed, or unpacked binaries. This is model-selected and is
+  not invoked automatically: when other evidence identifies Go, run it if
+  `go-profile` reports `not_go`/`partial` because `main.*` symbols are missing,
+  or when pclntab recovery is needed, then correlate recovered addresses with static
+  disassembly. GoReSym does not itself resolve `LazyProc`/`Syscall` targets or
+  prove behavior. A parser failure is not negative evidence; record the failed
+  attempt and continue with other static evidence. Redress is not included.
 
 ## Python and PyInstaller
 

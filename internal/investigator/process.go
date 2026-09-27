@@ -234,16 +234,53 @@ func (p *Process) Investigate(ctx context.Context, evidenceDir string) error {
 	)
 	if err := cmd.Run(); err != nil {
 		progress.Flush()
+		// Finalization must survive a killed/stalled model process. Recovery is
+		// bounded local compilation; it never invokes a model or the sandbox.
+		recoveryErr := p.CompilePersisted(evidenceDir)
+		recoveryNote := "; partial dossier saved to " + filepath.Join(evidenceDir, "report.md")
+		if recoveryErr != nil {
+			recoveryNote = "; local recovery failed: " + recoveryErr.Error()
+		}
 		if errors.Is(stageCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("investigator timed out after %s: %w", timeout, stageCtx.Err())
+			return fmt.Errorf("investigator timed out after %s: %w%s", timeout, stageCtx.Err(), recoveryNote)
 		}
 		message := RedactSensitive(stdout.String() + progress.Diagnostics())
 		if len(message) > 64*1024 {
 			message = message[:64*1024]
 		}
-		return fmt.Errorf("investigator failed: %w: %s", err, strings.TrimSpace(message))
+		return fmt.Errorf("investigator failed: %w: %s%s", err, strings.TrimSpace(message), recoveryNote)
 	}
 	progress.Flush()
+	return nil
+}
+
+// CompilePersisted uses no provider configuration and preserves existing output
+// files. A fresh context lets local recovery finish after the run is cancelled.
+func (p *Process) CompilePersisted(evidenceDir string) error {
+	if !filepath.IsAbs(evidenceDir) {
+		return errors.New("evidence directory must be absolute")
+	}
+	python := p.Python
+	if python == "" {
+		python = "python3"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, python, "-m", "jaq_investigator",
+		"--evidence", filepath.Join(evidenceDir, "observations.jsonl"),
+		"--output", evidenceDir, "--compile-only")
+	cmd.Env = os.Environ()
+	if p.ProjectRoot != "" {
+		cmd.Env = append(cmd.Env, "PYTHONPATH="+filepath.Join(p.ProjectRoot, "python"))
+	}
+	progress := newProgressFilter(os.Stderr)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = progress
+	err := cmd.Run()
+	progress.Flush()
+	if err != nil {
+		return fmt.Errorf("compile saved evidence: %w: %s", err, strings.TrimSpace(RedactSensitive(progress.Diagnostics())))
+	}
 	return nil
 }
 

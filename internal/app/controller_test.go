@@ -66,7 +66,7 @@ func TestControllerCompletesMockedEndToEndRun(t *testing.T) {
 	}
 	if manifest.Status != "completed" || manifest.Versions["radare2"] != "6.2.0" ||
 		manifest.Versions["radare2_mcp"] != "1.8.6" || manifest.Versions["capa"] != "9.4.0" ||
-		manifest.Versions["go_profile"] != "0.1.0" {
+		manifest.Versions["go_profile"] != "0.2.0" {
 		t.Fatalf("unexpected manifest: %#v", manifest)
 	}
 	if _, ok := manifest.ModelRoles["harvester"]; ok {

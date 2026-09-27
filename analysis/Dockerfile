@@ -87,6 +87,28 @@ RUN mkdir -p /build/capa-source /opt/jaq/capa-signatures \
     && test "$(find /opt/jaq/capa-signatures -type f -name '*.sig' | wc -l)" -eq 3 \
     && rm -rf /build/capa-source /tmp/capa-${CAPA_RULES_VERSION}.tar.gz
 
+ARG GORESYM_VERSION=3.4
+ARG GORESYM_COMMIT=157cabbafb9c1f9ecbe548b702c8f0e8a66148a2
+ARG GORESYM_ARCHIVE_SHA256=cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4
+ARG GORESYM_LICENSE_SHA256=d7341d45c966aa10eba9d7f31bedb95db370acaf928fcaafdaa51ad29a0217b0
+
+RUN mkdir -p /build/goresym /opt/goresym/bin \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/GoReSym-linux.zip \
+        https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip \
+    && echo "${GORESYM_ARCHIVE_SHA256}  /tmp/GoReSym-linux.zip" \
+        | sha256sum --check --strict \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/GoReSym-LICENSE \
+        https://raw.githubusercontent.com/mandiant/GoReSym/${GORESYM_COMMIT}/LICENSE \
+    && echo "${GORESYM_LICENSE_SHA256}  /tmp/GoReSym-LICENSE" \
+        | sha256sum --check --strict \
+    && python3 -c 'import zipfile; archive=zipfile.ZipFile("/tmp/GoReSym-linux.zip"); assert archive.namelist() == ["GoReSym"]; archive.extractall("/build/goresym")' \
+    && install -m 0555 /build/goresym/GoReSym /opt/goresym/bin/goresym \
+    && install -m 0444 /tmp/GoReSym-LICENSE /opt/goresym/LICENSE \
+    && file /opt/goresym/bin/goresym | grep -Eq 'ELF 64-bit.*x86-64.*statically linked' \
+    && rm -rf /build/goresym /tmp/GoReSym-linux.zip /tmp/GoReSym-LICENSE
+
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
 LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
@@ -105,7 +127,11 @@ LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
       org.opencontainers.image.capa-rules.commit="2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80" \
       org.opencontainers.image.capa-rules.archive-sha256="d18c5d57c3ab2089a54ca95da2b54d83ccb7dbc6c9db071f47d3f6c4afe703de" \
       org.opencontainers.image.capa.source-commit="7a79f799a70f052e8382cdbeaec8115daba14a5b" \
-      org.opencontainers.image.capa.source-archive-sha256="89a4ef8d6c11c822c4cfff5d2d42171dde1ebac5d563a1d7ff49adbcd4f22a0a"
+      org.opencontainers.image.capa.source-archive-sha256="89a4ef8d6c11c822c4cfff5d2d42171dde1ebac5d563a1d7ff49adbcd4f22a0a" \
+      org.opencontainers.image.goresym.version="3.4" \
+      org.opencontainers.image.goresym.commit="157cabbafb9c1f9ecbe548b702c8f0e8a66148a2" \
+      org.opencontainers.image.goresym.archive-sha256="cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4" \
+      org.opencontainers.image.goresym.license-sha256="d7341d45c966aa10eba9d7f31bedb95db370acaf928fcaafdaa51ad29a0217b0"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -127,6 +153,7 @@ COPY --from=build /opt/r2mcp /opt/r2mcp
 COPY --from=build /opt/python314 /opt/python314
 COPY --from=build /opt/jaq/capa-rules /opt/jaq/capa-rules
 COPY --from=build /opt/jaq/capa-signatures /opt/jaq/capa-signatures
+COPY --from=build /opt/goresym /opt/goresym
 COPY requirements-static.txt /opt/jaq/requirements-static.txt
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check pip==26.2.1 \
     && python3 -m pip install --no-cache-dir --disable-pip-version-check \
@@ -140,6 +167,8 @@ COPY --chmod=0555 capa /usr/local/bin/capa
 COPY --chmod=0555 go-profile /usr/local/bin/go-profile
 COPY --chmod=0555 jaq-tools /usr/local/bin/jaq-tools
 COPY --chmod=0555 pyc-disasm /usr/local/bin/pyc-disasm
+
+ENV PATH=/opt/goresym/bin:/opt/r2/bin:/opt/r2mcp/bin:${PATH}
 
 RUN rm -f \
         /opt/r2/bin/clang-format-radare2 \
@@ -172,15 +201,15 @@ RUN rm -f \
     && test "$(find /opt/jaq/capa-rules -type f -name '*.yml' | wc -l)" -ge 1000 \
     && capa --quiet --json /bin/true > /tmp/jaq-capa-smoke.json \
     && python3 -c 'import json; json.load(open("/tmp/jaq-capa-smoke.json"))' \
-    && command -v binwalk bsdtar capa innoextract llvm-objdump msiextract \
+    && command -v binwalk bsdtar capa goresym innoextract llvm-objdump msiextract \
         go-profile pyinstxtractor-ng pydisasm readpe upx yara \
     && go-profile --help >/dev/null \
+    && goresym -about >/dev/null \
     && pyc-disasm --help >/dev/null \
     && jaq-tools >/dev/null \
     && ldd /opt/r2mcp/bin/r2mcp
 
-ENV PATH=/opt/r2/bin:/opt/r2mcp/bin:${PATH} \
-    HOME=/work \
+ENV HOME=/work \
     JAQ_TOOLS_MANIFEST=/opt/jaq/TOOLS.md \
     BASH_ENV=/etc/jaq/bash-env
 

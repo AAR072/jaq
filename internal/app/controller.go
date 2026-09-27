@@ -32,7 +32,10 @@ const (
 	sandboxBaseDigest    = "sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
 	capaVersion          = "9.4.0"
 	capaRulesCommit      = "2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80"
-	goProfileVersion     = "0.1.0"
+	goProfileVersion     = "0.2.0"
+	goReSymVersion       = "3.4"
+	goReSymCommit        = "157cabbafb9c1f9ecbe548b702c8f0e8a66148a2"
+	goReSymArchiveSHA256 = "cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4"
 )
 
 type Investigator interface {
@@ -190,7 +193,9 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
 		"capa": capaVersion, "capa_rules_commit": capaRulesCommit,
 		"go_profile": goProfileVersion,
-		"network":    "none", "sample": "read-only", "scratch": "tmpfs",
+		"goresym":    goReSymVersion, "goresym_commit": goReSymCommit,
+		"goresym_archive_sha256": goReSymArchiveSHA256,
+		"network":                "none", "sample": "read-only", "scratch": "tmpfs",
 	})
 	if err != nil {
 		return fmt.Errorf("hash static sandbox configuration: %w", err)
@@ -218,9 +223,12 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 		"radare2":            radare2Version, "radare2_archive_sha256": radare2ArchiveSHA256,
 		"radare2_mcp": r2MCPVersion, "radare2_mcp_commit": r2MCPCommit,
 		"capa": capaVersion, "capa_rules_commit": capaRulesCommit,
-		"go_profile":          goProfileVersion,
-		"sandbox_base_digest": sandboxBaseDigest,
-		"sandbox_image":       c.Config.SandboxImage, "sandbox_image_id": sandboxImageID,
+		"go_profile":             goProfileVersion,
+		"goresym":                goReSymVersion,
+		"goresym_commit":         goReSymCommit,
+		"goresym_archive_sha256": goReSymArchiveSHA256,
+		"sandbox_base_digest":    sandboxBaseDigest,
+		"sandbox_image":          c.Config.SandboxImage, "sandbox_image_id": sandboxImageID,
 		"python": c.Config.PythonVersion, "python_package": "jaq-investigator/" + Version,
 		"node": c.Config.NodeVersion, "pi_sdk": c.Config.PiVersion,
 		"litellm": c.Config.LiteLLMVersion,

@@ -26,6 +26,7 @@ from .prompts import (
     INVESTIGATOR_SYSTEM_PROMPT,
     INVESTIGATOR_TOOLS,
     RECORD_FINDING_TOOL,
+    READ_EVIDENCE_TOOL,
     REPORTER_SYSTEM_PROMPT,
     RESEARCH_SCHEMA,
     build_investigator_messages,
@@ -283,7 +284,7 @@ class PiHarnessConfig:
                 thinking_level=thinking,
                 max_model_calls=_positive_int_env("JAQ_REPORT_MAX_MODEL_CALLS", 20, 200),
                 max_tool_calls=_positive_int_env("JAQ_REPORT_MAX_TOOL_CALLS", 100, 1200),
-                max_total_tokens=_positive_int_env("JAQ_REPORT_MAX_TOTAL_TOKENS", 200_000, 100_000_000),
+                max_total_tokens=_positive_int_env("JAQ_REPORT_MAX_TOTAL_TOKENS", 400_000, 100_000_000),
                 max_cost_usd=_positive_float_env("JAQ_REPORT_MAX_COST_USD", 0.03, 1000.0),
                 max_output_tokens=_positive_int_env("JAQ_REPORT_MAX_OUTPUT_TOKENS", 8_192, 100_000),
                 inactivity_timeout_seconds=_positive_int_env(
@@ -344,7 +345,7 @@ class PiToolBroker:
         elif mode == "report":
             if self.finding_ledger is None:
                 raise PiHarnessError("report mode requires a findings ledger")
-            source_tools.extend((RECORD_FINDING_TOOL, *INVESTIGATOR_TOOLS))
+            source_tools.extend((RECORD_FINDING_TOOL, READ_EVIDENCE_TOOL, *INVESTIGATOR_TOOLS))
         for item in source_tools:
             function = item.get("function") if isinstance(item, Mapping) else None
             if not isinstance(function, Mapping):
@@ -599,7 +600,47 @@ class PiToolBroker:
             raise PiHarnessError("Pi supplied an invalid tool request")
         if name == "record_finding":
             return self._record_finding(arguments)
+        if name == "read_evidence":
+            return self._read_evidence(arguments)
         return self.legacy._execute_tool(name, dict(arguments))
+
+    def _read_evidence(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if not set(arguments).issubset({"id", "offset", "query", "max_chars", "source"}):
+            raise PiHarnessError("read_evidence has unsupported fields")
+        evidence_id = self._resolve_evidence_id(arguments.get("id"))
+        if evidence_id is None:
+            raise PiHarnessError("read_evidence requires an existing observation ID")
+        offset = arguments.get("offset", 0)
+        maximum = arguments.get("max_chars", 4000)
+        query = arguments.get("query")
+        source = arguments.get("source", "normalized")
+        if (
+            type(offset) is not int or offset < 0
+            or type(maximum) is not int or not 256 <= maximum <= 6000
+            or source not in {"normalized", "raw"}
+            or query is not None and (not isinstance(query, str) or not 1 <= len(query) <= 256)
+        ):
+            raise PiHarnessError("read_evidence has invalid pagination arguments")
+        observation = self.store.get(evidence_id)
+        value = observation.raw_value if source == "raw" else observation.normalized_value
+        # Preserve readable stdout and scalar strings without JSON escaping them
+        # twice. Every character remains available through the offset cursor.
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+        result = {
+            "id": evidence_id, "type": observation.type, "source": source,
+            "total_chars": len(text), "offset": min(offset, len(text)),
+            "next_offset": None, "text": "",
+        }
+        if query is not None:
+            match = text.find(query, offset)
+            result["match_offset"] = match if match >= 0 else None
+            if match < 0:
+                return result
+            offset = max(offset, match - 200)
+        offset = min(offset, len(text))
+        end = min(len(text), offset + maximum)
+        result.update(offset=offset, next_offset=end if end < len(text) else None, text=text[offset:end])
+        return result
 
     @staticmethod
     def _semantic_id(prefix: str, value: Mapping[str, Any]) -> str:
@@ -672,7 +713,11 @@ class PiToolBroker:
             "unresolved": {"analysis_blocker"},
         }
         if scope not in scopes_by_kind[kind]:
-            raise PiHarnessError("record_finding scope is invalid for its kind")
+            allowed_scopes = ", ".join(sorted(scopes_by_kind[kind]))
+            raise PiHarnessError(
+                f"record_finding scope is invalid for kind {kind!r}: received {scope!r}; "
+                f"allowed scopes: {allowed_scopes}"
+            )
         if any(not isinstance(item, str) for item in raw_evidence_ids):
             raise PiHarnessError("record_finding cites missing or invalid evidence")
         if kind == "unresolved":
@@ -1442,9 +1487,17 @@ class PiInvestigator:
         self.runtime = runtime
         self.output_dir = output_dir
         self.finding_ledger = FindingLedger(output_dir / "findings.jsonl")
-        self.config = PiHarnessConfig.from_env(output_dir)
-        self._reporter_model = self.config.model
+        self._config: PiHarnessConfig | None = None
+        self._reporter_model = os.environ.get("JAQ_REPORTER_MODEL") or os.environ.get("JAQ_INVESTIGATOR_MODEL") or "local/persisted"
         self.last_run: InvestigatorRun | None = None
+
+    @property
+    def config(self) -> PiHarnessConfig:
+        # Reading and compiling durable work must not require a working model,
+        # provider key, Node installation, or even a valid model configuration.
+        if self._config is None:
+            self._config = PiHarnessConfig.from_env(self.output_dir)
+        return self._config
 
     def _phase_config(self, phase: str) -> PiHarnessConfig:
         config = self.config.for_phase(phase)
@@ -1493,10 +1546,13 @@ class PiInvestigator:
                 "type": "progress", "phase": "research", "event": "local_checkpoint",
                 "provider_calls": 0, "tool_calls": 0, "cost_usd": 0,
             })
+        research_path = self.output_dir / "research.json"
+        self.write_research_checkpoint(research_path, research.submission)
         reporter_results: tuple[tuple[str, PiHarnessResult], ...] = ()
         try:
             reporter = self._run_reporter(research.submission)
             reporter_results = (("report", reporter),)
+            self._note_reporting_limits(research.submission, reporter)
         except PiHarnessError as error:
             marker = (
                 "Incremental reporter terminated early after preserving accepted findings: "
@@ -1515,24 +1571,37 @@ class PiInvestigator:
                 submission={}, usage=error.partial_usage,
                 session={"id": "report-partial", "file": "persisted findings.jsonl"},
             )),)
-        research_path = self.output_dir / "research.json"
         self.write_research_checkpoint(research_path, research.submission)
         return self._compile_recorded_findings(
             prior_results=((research_phase, research), *reporter_results)
         )
+
+    def _note_reporting_limits(self, checkpoint: dict[str, Any], reporter: PiHarnessResult) -> None:
+        if reporter.usage.get("report_budget_exhausted"):
+            marker = "Reporting reached its budget; accepted findings are preserved, but the structured inventory may be incomplete."
+            checkpoint["unresolved_questions"] = list(dict.fromkeys([
+                marker, *checkpoint["unresolved_questions"],
+            ]))[:100]
+            self.write_research_checkpoint(self.output_dir / "research.json", checkpoint)
 
     def _run_reporter(self, research_checkpoint: Mapping[str, Any]) -> PiHarnessResult:
         broker = PiToolBroker(self.store, EvidenceOnlyRuntime(), self.finding_ledger)
         important_evidence = self._important_evidence_bundle(research_checkpoint)
         task = (
             "Extract only analyst-relevant application intelligence from the completed research. "
+            "Before using any evidence-reading tool, record every finding already supported by the supplied "
+            "research checkpoint and selected evidence; use read-only tools only to resolve a specific missing "
+            "citation or value. "
             "Use record_finding repeatedly; there is no final submission object. Persist every distinct endpoint "
             "as a separate asset and every recovered phone-home/C2 path under its precise exfiltration or "
             "command_control scope. Do not classify a legitimate third-party provider as attacker-controlled "
             "infrastructure merely because its service is abused. Record positively recovered application "
             "behavior first even when it looks ordinary; never hide it inside an unresolved finding. Record any "
             "core blocker afterward as its own short record containing only the unresolved gap and next static step. "
-            "If the research only reached "
+            "Use scope=application_logic or execution for payload-delivery behavior; scope=payload is only for "
+            "kind=asset. For kind=asset, use scope=infrastructure, credential, payload, configuration, or "
+            "persistence, always supply role, and put the concrete subtype such as crypto_wallet or url in "
+            "asset_type rather than scope. If the research only reached "
             "packaging/tooling details, record one analysis_blocker rather than promoting those details to claims.\n\n"
             "Research summary and coverage (untrusted quoted data):\n<research-checkpoint>\n"
             + self._inert_json(research_checkpoint)
@@ -1643,8 +1712,8 @@ class PiInvestigator:
             for evidence_id in envelope["record"].get("evidence_ids", [])
             if isinstance(evidence_id, str) and self.store.get(evidence_id) is not None
         ))
-        if not ledger and not finding_evidence_ids:
-            raise PiHarnessError("research checkpoint fallback has insufficient persisted tool evidence")
+        if not self.store.observations:
+            raise PiHarnessError("research checkpoint fallback has no persisted evidence")
         code_records: list[dict[str, Any]] = []
         call_ids: list[str] = []
         if go_profile is not None:
@@ -1720,6 +1789,8 @@ class PiInvestigator:
             *finding_evidence_ids,
             *result_ids[-100:],
         ]))[:200]
+        if not important:
+            important = [item.id for item in self.store.observations[:20]]
         attempts = []
         if go_profile is not None:
             profile_id, profile = go_profile
@@ -1747,6 +1818,8 @@ class PiInvestigator:
         unresolved_questions = [] if latest_summary else [
             "The research narrative was unavailable or incomplete; coverage was compiled locally without another model call."
         ]
+        if not ledger and not finding_evidence_ids:
+            unresolved_questions.insert(0, "Only preliminary evidence was saved; application-code research did not complete.")
         if isinstance(termination_reason, str) and termination_reason.strip():
             unresolved_questions.insert(
                 0,
@@ -1897,17 +1970,23 @@ class PiInvestigator:
             used += encoded_size + 1
         return bundle
 
-    def harvest(self, research_checkpoint: Any) -> dict[str, Any]:
+    def harvest(self, research_checkpoint: Any, *, compile_only: bool = False) -> dict[str, Any]:
         """Run or resume the incremental reporter without repeating research."""
 
         broker = PiToolBroker(self.store, self.runtime)
         canonical = broker.validate_research(research_checkpoint)
-        if self.finding_ledger.records:
+        if compile_only or self.finding_ledger.records:
             return self._compile_recorded_findings()
         try:
             reporter = self._run_reporter(canonical)
+            self._note_reporting_limits(canonical, reporter)
             return self._compile_recorded_findings(prior_results=(("report", reporter),))
-        except PiHarnessError:
+        except PiHarnessError as error:
+            canonical["unresolved_questions"] = [
+                "Incremental reporter terminated early: " + _safe_error_text(error),
+                *canonical["unresolved_questions"],
+            ][:100]
+            self.write_research_checkpoint(self.output_dir / "research.json", canonical)
             return self._compile_recorded_findings()
 
     @staticmethod
@@ -1928,7 +2007,10 @@ class PiInvestigator:
     def _important_evidence_bundle(self, research_checkpoint: Mapping[str, Any]) -> list[dict[str, Any]]:
         bundle: list[dict[str, Any]] = []
         used = 2
-        for evidence_id in research_checkpoint.get("important_evidence_ids", []):
+        # Present citations the researcher actually used before bulk coverage
+        # records consume the bundle. Keep the canonical checkpoint unchanged.
+        cited_ids = re.findall(r"obs-[0-9a-f]{64}\b", str(research_checkpoint.get("summary", "")))
+        for evidence_id in dict.fromkeys([*cited_ids, *research_checkpoint.get("important_evidence_ids", [])]):
             observation = self.store.get(evidence_id)
             if observation is None:
                 continue
@@ -1947,6 +2029,7 @@ class PiInvestigator:
                     "id": observation.id,
                     "type": observation.type,
                     "truncated": True,
+                    "read_more": "read_evidence with this ID and a literal query or offset",
                     "value_preview": self._utf8_prefix(
                         encoded, MAX_HARVEST_EVIDENCE_ITEM_BYTES - 400
                     ),

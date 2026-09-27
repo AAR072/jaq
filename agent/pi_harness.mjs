@@ -114,6 +114,7 @@ async function main() {
   let providerError;
   let statsSnapshot;
   let finalizationStage = null;
+  let reportClosed = false;
   let sendProgress = () => {};
   const enterFinalization = (reason) => {
     if (finalizationStage) return;
@@ -129,6 +130,12 @@ async function main() {
     }
   };
   const enterSummary = () => {
+    if (reportMode) {
+      // Accepted findings are already durable. A tool-free model summary
+      // cannot add to the dossier, so completion is a local operation.
+      reportClosed = true;
+      throw new HarnessLimitError("REPORT_COMPLETE", "reporting finished; compile persisted findings locally");
+    }
     if (finalizationStage !== "summary") sendProgress("finalizing");
     finalizationStage = "summary";
     session?.setActiveToolsByName([]);
@@ -166,6 +173,18 @@ async function main() {
       }
     },
   );
+  if (provider === "deepseek" && ["deepseek-flash", "deepseek-v4-flash"].includes(modelID)) {
+    // The pinned SDK predates V4.1. The legacy V4 Flash ID is also routed to
+    // V4.1 by DeepSeek. Use published peak rates conservatively for budgeting.
+    // https://api-docs.deepseek.com/quick_start/pricing/ (2026-09-27)
+    const legacy = runtime.getModel("deepseek", "deepseek-v4-flash");
+    if (legacy) runtime.registerProvider("deepseek", { models: [{
+      ...legacy,
+      id: modelID,
+      name: "DeepSeek V4.1 Flash",
+      cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
+    }] });
+  }
   const catalogModel = runtime.getModel(provider, modelID);
   if (!catalogModel) throw new Error(`Pi model catalog does not contain ${init.model}`);
   const selectedModel = { ...catalogModel, maxTokens: Math.min(catalogModel.maxTokens, init.budgets.max_output_tokens) };
@@ -242,7 +261,9 @@ async function main() {
           enterFinalization("the tool-call investigation budget is exhausted");
         }
         return toolResult(
-          compactToolResult(definition.name, result, init.budgets.tool_preview_chars),
+          definition.name === "read_evidence"
+            ? JSON.stringify({ untrusted_evidence: true, tool: definition.name, data: result })
+            : compactToolResult(definition.name, result, init.budgets.tool_preview_chars),
           { tool: definition.name },
         );
       } catch (error) {
@@ -281,11 +302,23 @@ async function main() {
           : undefined
       );
     }
+    if (
+      event.type === "message_end"
+      && event.message?.role === "toolResult"
+      && event.message.toolName === "record_finding"
+      && event.message.isError === true
+    ) {
+      guard.noteFindingFlushFailure();
+    }
   });
 
-  await session.prompt(init.task, { expandPromptTemplates: false });
-  await session.waitForIdle();
-  if (providerError) throw new Error(`provider error: ${providerError}`);
+  try {
+    await session.prompt(init.task, { expandPromptTemplates: false });
+    await session.waitForIdle();
+  } catch (error) {
+    if (!reportClosed) throw error;
+  }
+  if (providerError && !reportClosed) throw new Error(`provider error: ${providerError}`);
   statsSnapshot = session.getSessionStats();
   sendProgress("phase_completed");
   channel.send({
@@ -298,6 +331,7 @@ async function main() {
       cache_write_tokens: statsSnapshot.tokens.cacheWrite,
       total_tokens: statsSnapshot.tokens.total,
       cost_usd: statsSnapshot.cost,
+      ...(reportMode ? { report_budget_exhausted: finalizationStage ? 1 : 0 } : {}),
       ...guard.snapshot(),
     },
     session: { id: session.sessionId, file: session.sessionFile },
