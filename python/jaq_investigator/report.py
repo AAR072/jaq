@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from .evidence import EvidenceStore
+from .intelligence import BEHAVIOR_LABELS, SUMMARY_PRIORITY
 from .schemas import Claim, Observation, Score, VerificationResult, as_claim
 
 
@@ -132,6 +133,7 @@ def render_report(
     observations: Iterable[Observation | Mapping[str, Any]] | EvidenceStore | None = None,
     limitations: Iterable[str] | None = None,
     sample_hashes: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    overview: Mapping[str, Any] | None = None,
 ) -> str:
     """Render a stable Markdown dossier.
 
@@ -181,10 +183,8 @@ def render_report(
         "Reachability is accepted only when structured call/reference evidence supplies a path.",
         "Global novelty and corpus correlation are outside this milestone.",
     )
-    if limitations is None:
-        limitation_values = list(default_limitations)
-    else:
-        limitation_values = list(default_limitations) + [str(item) for item in limitations]
+    run_limitations = [str(item) for item in limitations or () if str(item).strip()]
+    limitation_values = list(default_limitations) + run_limitations
     limitation_values = sorted(dict.fromkeys(item for item in limitation_values if item.strip()), key=str.casefold)
 
     lines: list[str] = ["# JAQ Intelligence Dossier", ""]
@@ -197,12 +197,23 @@ def render_report(
     # Compose the overview from verified records locally. Producing a readable
     # ending must never require one more successful model response.
     if accepted:
-        for claim in sorted(accepted, key=lambda item: (-item.confidence, item.id))[:5]:
-            explanation = claim.explanation
-            if len(explanation) > 900:
-                explanation = explanation[:897] + "…"
-            lines.append(f"<p><strong>{_inline(claim.classification)}</strong> — {_inline(explanation)}</p>")
-            lines.append("")
+        scopes = (overview or {}).get("tags", {}).get("claim_scopes", {})
+        ranks = {scope: index for index, scope in enumerate(SUMMARY_PRIORITY)}
+        ordered = sorted(accepted, key=lambda item: (
+            ranks.get(scopes.get(item.id), len(ranks)), -item.confidence, item.id,
+        ))
+        selected: list[Claim] = []
+        seen_scopes: set[str] = set()
+        for claim in ordered:
+            scope = scopes.get(claim.id, claim.id)
+            if scope not in seen_scopes:
+                selected.append(claim)
+                seen_scopes.add(scope)
+            if len(selected) == 5:
+                break
+        for claim in selected:
+            lines.append(f"- {_inline(claim.classification)}")
+        lines.extend(["", "Details and evidence for every claim appear below.", ""])
     else:
         lines.extend([
             "No application behavior has passed verification. This is an incomplete investigation, not a safety verdict.",
@@ -220,6 +231,45 @@ def render_report(
         lines.append(f"- Confidence: {_code(f'{normalized_score.confidence:.3f}')}")
     lines.append("")
 
+    if overview is not None:
+        if run_limitations:
+            lines.append("Run limitations:")
+            lines.append("")
+            for limitation in run_limitations[:2]:
+                text = limitation if len(limitation) <= 240 else limitation[:237] + "…"
+                lines.append(f"- {_inline(text)}")
+            lines.append("")
+        behavior_tags = [
+            item for item in overview.get("tags", {}).get("tags", [])
+            if item["kind"] == "behavior" and item["status"] == "accepted"
+        ]
+        lines.extend(["## Behavior tags", ""])
+        if behavior_tags:
+            lines.append(
+                ", ".join(_code(item["tag"]) for item in behavior_tags)
+                + ". Each tag inherits its claim's verification status; evidence links are in tags.json."
+            )
+        else:
+            lines.append("No accepted behavior tags were recorded. This does not establish absence of behavior.")
+        lines.extend(["", "## Recovered URLs", ""])
+        lines.append("Exact text recovered from analyzer output. Unclassified values are leads, not confirmed connections or attacker infrastructure.")
+        lines.append("")
+        assets = {item["id"]: item for item in overview.get("assets", [])}
+        urls = overview.get("recovered_urls", [])
+        for item in urls[:30]:
+            roles = [assets[asset_id]["role"] for asset_id in item["asset_ids"] if asset_id in assets]
+            role = "; ".join(roles) if roles else "Unclassified; network role needs review"
+            citations = ", ".join(_code(ref) for ref in item["evidence_ids"][:2])
+            lines.append(f"- {_code(item['value'])} — {_inline(role.rstrip('.'))}. Evidence: {citations}.")
+        if not urls:
+            lines.append("- No literal HTTP(S) URLs were indexed; computed or encoded destinations may still exist.")
+        if len(urls) > 30:
+            lines.append(f"- Showing 30 of {len(urls)} recovered URLs. The complete retained inventory is in assets.json.")
+        omitted = overview.get("url_inventory", {}).get("omitted_occurrences", 0)
+        if omitted:
+            lines.append(f"- Inventory limits omitted {omitted} additional URL occurrences; review observations.jsonl.")
+        lines.append("")
+
     lines.extend(["## Sample hashes", ""])
     if hash_values:
         for label, value in hash_values:
@@ -236,6 +286,9 @@ def render_report(
         lines.append("")
         lines.append(f"- Explanation: {_code(claim.explanation)}")
         lines.append(f"- Confidence: {_code(f'{claim.confidence:.3f}')}")
+        scope = (overview or {}).get("tags", {}).get("claim_scopes", {}).get(claim.id)
+        if scope in BEHAVIOR_LABELS:
+            lines.append(f"- Behavior tag: {_code(scope)} ({BEHAVIOR_LABELS[scope]})")
         lines.append(
             "- Evidence IDs: "
             + ", ".join(_code(evidence_id) for evidence_id in claim.evidence_ids)

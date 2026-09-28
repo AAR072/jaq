@@ -368,6 +368,10 @@ func writeMockDossier(_ context.Context, output string) error {
 	if err := os.WriteFile(filepath.Join(output, "requests.json"), []byte("{\"schema_version\":\"1.0\",\"action_requests\":[]}\n"), 0o600); err != nil {
 		return err
 	}
+	tags := fmt.Sprintf("{\"schema_version\":\"1.0\",\"tags\":[{\"kind\":\"behavior\",\"tag\":\"application_logic\",\"status\":\"accepted\",\"claim_ids\":[%q],\"evidence_ids\":[%q]}]}\n", claim.ID, claim.EvidenceIDs[0])
+	if err := os.WriteFile(filepath.Join(output, "tags.json"), []byte(tags), 0o600); err != nil {
+		return err
+	}
 	confidence := 0.8
 	score := evidence.Score{
 		SchemaVersion: evidence.ScoreSchemaVersion, Accepted: 1,

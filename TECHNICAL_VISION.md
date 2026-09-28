@@ -29,12 +29,15 @@ Each completed run writes:
 - `findings.jsonl`: append-only, evidence-backed semantic conclusions captured by the isolated reporter.
 - `claims.json`: structured investigator claims and evidence references.
 - `assets.json`: exact infrastructure, credential, configuration, and payload-reference assets with evidence.
+- `tags.json`: locally compiled behavior scopes, asset types, and request kinds with source/evidence references and verification status.
 - `communications.json`: recovered exfiltration and command/control paths, kept distinct from endpoint ownership.
 - `requests.json`: evidence-backed acquisition or dynamic-analysis requests in `pending_authorization` state; no request is executed in this milestone.
 - `score.json`: verification results, optional judgments, and model usage.
 - `report.md`: an evidence-backed analyst dossier.
 
 Formats are versioned and validated at every trust boundary. Native observations remain comparable across identical runs; interactive command observations form a provenance chain containing the logical tool, arguments, result digest, analyzer version, and parent request ID.
+
+The additive output contract in [OUTPUT_CONTRACT.md](OUTPUT_CONTRACT.md) preserves literal URLs in `assets.json.recovered_urls` even when reporting stops before classifying them. This local index does not promote matches to attacker infrastructure or acquisition requests. A bounded index is also presented to the reporter before bulk evidence. Tags inherit recorded scopes and verification outcomes, without guessing from prose. The opening report uses concise, diverse behavior titles and exposes unclassified URL evidence near the top.
 
 ## Security and isolation
 

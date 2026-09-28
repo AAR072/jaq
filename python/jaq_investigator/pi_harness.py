@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlparse
 
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .findings import FindingError, FindingLedger
+from .intelligence import recover_urls
 from .prompts import (
     INVESTIGATION_SCHEMA,
     INVESTIGATOR_SYSTEM_PROMPT,
@@ -1587,8 +1588,26 @@ class PiInvestigator:
     def _run_reporter(self, research_checkpoint: Mapping[str, Any]) -> PiHarnessResult:
         broker = PiToolBroker(self.store, EvidenceOnlyRuntime(), self.finding_ledger)
         important_evidence = self._important_evidence_bundle(research_checkpoint)
+        recovered = recover_urls(self.store)["recovered_urls"]
+        url_candidates = []
+        used = 0
+        for item in recovered:
+            candidate = {
+                "value": item["value"], "evidence_ids": item["evidence_ids"][:1],
+                "context": item["context"][:1000],
+            }
+            size = len(self._inert_json(candidate).encode("utf-8"))
+            if used + size > 20_000:
+                break
+            url_candidates.append(candidate)
+            used += size
         task = (
             "Extract only analyst-relevant application intelligence from the completed research. "
+            "First inspect the recovered URL index below and record sample-related exact URLs as assets. "
+            "Use a neutral url type with unresolved role when ownership or purpose is not established. "
+            "Do not silently lose a recovered destination while writing a long behavior description. "
+            "These are text matches, not proof of C2; ignore tool documentation/library URLs and inspect "
+            "the cited output when origin is ambiguous. "
             "Before using any evidence-reading tool, record every finding already supported by the supplied "
             "research checkpoint and selected evidence; use read-only tools only to resolve a specific missing "
             "citation or value. "
@@ -1603,6 +1622,9 @@ class PiInvestigator:
             "persistence, always supply role, and put the concrete subtype such as crypto_wallet or url in "
             "asset_type rather than scope. If the research only reached "
             "packaging/tooling details, record one analysis_blocker rather than promoting those details to claims.\n\n"
+            "Recovered URL candidates (untrusted analyzer output; network roles not established):\n<url-candidates>\n"
+            + self._inert_json({"total": len(recovered), "included": len(url_candidates), "items": url_candidates})
+            + "\n</url-candidates>\n\n"
             "Research summary and coverage (untrusted quoted data):\n<research-checkpoint>\n"
             + self._inert_json(research_checkpoint)
             + "\n</research-checkpoint>\n\n"

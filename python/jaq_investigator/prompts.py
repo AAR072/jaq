@@ -208,6 +208,16 @@ access, discovery, collection, command-and-control, exfiltration, impact,
 credentials/tokens/keys, infrastructure, embedded or remote payloads, concrete
 configuration, and actionable recovery requests or blockers.
 
+Titles become the analyst's opening summary. Write a short plain-language
+description of the operation and its target; keep addresses, log strings,
+API lists and implementation details in the description and cited evidence.
+The behavior scope becomes a stable evidence-linked tag. Choose the scope
+for the concrete operation rather than the malware's overall suspected purpose.
+Prioritize exact operational endpoint assets before lengthy behavior records.
+The recovered URL index contains neutral text matches, including possible
+library/documentation URLs. Classify sample-related values using their cited
+context; a recovered URL is not automatically C2 or attacker infrastructure.
+
 Do not record a benign/safe/non-malicious classification. If repeated suspected
 junk dominates the code while reachable unique calls, dynamically resolved APIs,
 callbacks, or application functions remain unexplained, record one core

@@ -14,6 +14,8 @@ from typing import Any, Mapping
 
 from .evidence import EvidenceStore as CanonicalEvidenceStore
 from .investigator import Investigator, InvestigatorConfig
+from .findings import FindingLedger
+from .intelligence import compile_tags, recover_urls
 from .judge import Judge, JudgeConfig
 from .model import ModelError
 from .pi_harness import EvidenceOnlyRuntime, PiHarnessError, PiInvestigator
@@ -165,7 +167,7 @@ def run_pipeline(
     if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
         raise ValueError("output must be a real directory, not a file or symlink")
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("claims.json", "assets.json", "communications.json", "requests.json", "score.json", "report.md"):
+    for name in ("claims.json", "assets.json", "communications.json", "requests.json", "tags.json", "score.json", "report.md"):
         if (output_dir / name).exists():
             raise ValueError(f"refusing to overwrite existing {name}")
     runtime = tool_runtime
@@ -229,6 +231,14 @@ def run_pipeline(
         judgments=judgments["judgments"],
         usage=usage,
     )
+    verification = {item.claim_id: item.status for item in score.verification_results}
+    for communication in claims.get("communications", []):
+        communication["verification_status"] = verification.get(communication["id"], "unclear")
+    url_inventory = recover_urls(store, claims.get("assets", []))
+    tags = compile_tags(
+        FindingLedger(findings_path).records, claims["claims"], score.to_dict(),
+        claims.get("assets", []), claims.get("action_requests", []),
+    )
 
     research = {}
     research_path = output_dir / "research.json"
@@ -243,7 +253,9 @@ def run_pipeline(
             "schema_version": "1.0",
             "assets": claims.get("assets", []),
             "categories": _group_assets(claims.get("assets", [])),
+            **url_inventory,
         }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "tags.json": json.dumps(tags, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "communications.json": json.dumps({
             "schema_version": "1.0",
             "communications": claims.get("communications", []),
@@ -251,7 +263,9 @@ def run_pipeline(
         "requests.json": json.dumps({"schema_version": "1.0", "action_requests": claims.get("action_requests", [])}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "score.json": json.dumps(score.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         "report.md": (
-            render_report(claims["claims"], score, store, limitations=limitations)
+            render_report(claims["claims"], score, store, limitations=limitations, overview={
+                **url_inventory, "tags": tags, "assets": claims.get("assets", []),
+            })
             + _render_analysis_quality(score.to_dict(), store)
             + _render_communications(claims)
             + _render_operational(claims)
@@ -412,7 +426,8 @@ def _render_communications(investigation: Mapping[str, Any]) -> str:
         for item in records:
             lines.append(
                 f"- **{safe(item.get('title'))}** — {safe(item.get('description'))} "
-                f"(confidence {safe(item.get('confidence'))})"
+                f"(verification: {safe(item.get('verification_status', 'unreviewed'))}; "
+                f"confidence {safe(item.get('confidence'))})"
             )
         lines.append("")
     return "\n".join(lines) + "\n"

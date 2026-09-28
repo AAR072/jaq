@@ -710,20 +710,37 @@ func validateResearchCheckpoint(path string, observations []evidence.Observation
 
 func validateOperationalReferences(outputDir string, observations []evidence.Observation) error {
 	ids := map[string]bool{}
+	tagSources := map[string]map[string]bool{}
 	for _, item := range observations {
 		ids[item.ID] = true
 	}
-	for _, spec := range []struct{ name, key string }{
-		{"assets.json", "assets"},
-		{"communications.json", "communications"},
-		{"requests.json", "action_requests"},
+	for _, spec := range []struct {
+		name, key string
+		optional  bool
+	}{
+		{"assets.json", "assets", false},
+		{"communications.json", "communications", false},
+		{"requests.json", "action_requests", false},
+		{"assets.json", "recovered_urls", true},
+		{"tags.json", "tags", true},
 	} {
+		path := filepath.Join(outputDir, spec.name)
+		info, err := os.Lstat(path)
+		if spec.optional && errors.Is(err, os.ErrNotExist) {
+			continue // Older persisted runs predate these derived indexes.
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > 64<<20 {
+			return fmt.Errorf("reject %s: must be a bounded regular file", spec.name)
+		}
 		var document map[string]any
-		if err := readJSONStrict(filepath.Join(outputDir, spec.name), &document); err != nil {
+		if err := readJSONStrict(path, &document); err != nil {
 			return fmt.Errorf("reject %s: %w", spec.name, err)
 		}
 		if document["schema_version"] != "1.0" {
 			return fmt.Errorf("reject %s: unsupported schema", spec.name)
+		}
+		if _, exists := document[spec.key]; !exists && spec.optional && spec.name == "assets.json" {
+			continue
 		}
 		records, ok := document[spec.key].([]any)
 		if !ok {
@@ -746,6 +763,52 @@ func validateOperationalReferences(outputDir string, observations []evidence.Obs
 			}
 			if spec.name == "requests.json" && record["status"] != "pending_authorization" {
 				return errors.New("reject requests.json: initial requests must be pending_authorization")
+			}
+			if spec.key == "recovered_urls" {
+				value, valid := record["value"].(string)
+				if !valid || value == "" || len(value) > 2048 ||
+					(record["status"] != "unclassified" && record["status"] != "recorded") {
+					return errors.New("reject assets.json: invalid recovered URL")
+				}
+			}
+			if spec.name == "tags.json" {
+				kind, _ := record["kind"].(string)
+				tag, _ := record["tag"].(string)
+				status, _ := record["status"].(string)
+				linkKey := map[string]string{"behavior": "claim_ids", "asset": "asset_ids", "request": "request_ids"}[kind]
+				links, valid := record[linkKey].([]any)
+				if linkKey == "" || tag == "" || status == "" || !valid || len(links) == 0 {
+					return errors.New("reject tags.json: invalid tag or source links")
+				}
+				if tagSources[kind] == nil {
+					source := map[string][2]string{
+						"behavior": {"claims.json", "claims"},
+						"asset":    {"assets.json", "assets"},
+						"request":  {"requests.json", "action_requests"},
+					}[kind]
+					var sourceDocument map[string]any
+					if err := readJSONStrict(filepath.Join(outputDir, source[0]), &sourceDocument); err != nil {
+						return fmt.Errorf("reject tags.json: read source: %w", err)
+					}
+					sourceRecords, ok := sourceDocument[source[1]].([]any)
+					if !ok {
+						return errors.New("reject tags.json: invalid source document")
+					}
+					tagSources[kind] = map[string]bool{}
+					for _, rawSource := range sourceRecords {
+						if sourceRecord, ok := rawSource.(map[string]any); ok {
+							if id, ok := sourceRecord["id"].(string); ok {
+								tagSources[kind][id] = true
+							}
+						}
+					}
+				}
+				for _, link := range links {
+					id, ok := link.(string)
+					if !ok || !tagSources[kind][id] {
+						return errors.New("reject tags.json: missing source record")
+					}
+				}
 			}
 		}
 	}
@@ -784,7 +847,7 @@ func fileSize(path string) int64 {
 
 func outputSize(directory string) int64 {
 	var total int64
-	for _, name := range []string{"findings.jsonl", "research.json", "claims.json", "assets.json", "communications.json", "requests.json", "score.json", "report.md"} {
+	for _, name := range []string{"findings.jsonl", "research.json", "claims.json", "assets.json", "communications.json", "requests.json", "tags.json", "score.json", "report.md"} {
 		total += fileSize(filepath.Join(directory, name))
 	}
 	return total

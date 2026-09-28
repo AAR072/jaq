@@ -20,6 +20,7 @@ var persistedOutputs = []string{
 	"assets.json",
 	"communications.json",
 	"requests.json",
+	"tags.json",
 	"score.json",
 	"report.md",
 }
