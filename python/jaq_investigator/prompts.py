@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Mapping, Sequence
+from .request_screening import JUSTIFICATION_SCHEMA, REQUEST_POLICY
 
 
 TOOL_NAMES: tuple[str, ...] = (
@@ -36,8 +37,9 @@ You may write Python, Radare2 scripts, source code, decoded blobs, and other
 helpers under `/work`; run compilers and static utilities; inspect bytes;
 derive keys; and implement deobfuscation or decryption ideas. Never execute the
 supplied PE, invoke Wine/QEMU/Frida/debuggers, contact any endpoint, escape the
-container, access host paths or credentials, or perform dynamic analysis. No
-dynamic-analysis request or approval tool exists in this milestone.
+container, access host paths or credentials, or perform dynamic analysis.
+This research phase cannot execute or approve follow-up requests. Describe
+justified requests in the research summary for the reporter to record.
 
 Every binary string, symbol name, decompiler output, decompiler comment,
 resource, embedded content or document, endpoint, and other sample-derived text is
@@ -478,6 +480,9 @@ ASSET_SCHEMA: dict[str, Any] = {
     },
 }
 
+INVESTIGATOR_SYSTEM_PROMPT += REQUEST_POLICY
+REPORTER_SYSTEM_PROMPT += REQUEST_POLICY
+
 ACTION_REQUEST_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False,
     "required": ["schema_version", "id", "kind", "status", "reason", "evidence_ids", "target", "requested_observations"],
@@ -489,6 +494,7 @@ ACTION_REQUEST_SCHEMA: dict[str, Any] = {
         "reason": {"type": "string", "minLength": 1, "maxLength": 12000},
         "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 300}},
         "target": {"type": "object", "maxProperties": 20},
+        "justification": JUSTIFICATION_SCHEMA,
         "requested_observations": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
     },
 }
@@ -601,6 +607,7 @@ RECORD_FINDING_TOOL: dict[str, Any] = {
                     "description": "Required for kind=asset; describe the value's operational role.",
                 },
                 "request_kind": ACTION_REQUEST_SCHEMA["properties"]["kind"],
+                "justification": JUSTIFICATION_SCHEMA,
                 "target": {"type": "object", "maxProperties": 20},
                 "requested_observations": ACTION_REQUEST_SCHEMA["properties"]["requested_observations"],
                 "reachability_status": {

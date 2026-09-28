@@ -28,6 +28,8 @@ type progressFilter struct {
 	display     io.Writer
 }
 
+var screeningProgressPattern = regexp.MustCompile(`^\[screening\] (checking request #[0-9]+|qualified|unsupported|insufficient_evidence|completed requests=[0-9]+ qualified=[0-9]+ held=[0-9]+)$`)
+
 func newProgressFilter(display io.Writer) *progressFilter {
 	return &progressFilter{display: display}
 }
@@ -55,7 +57,7 @@ func (w *progressFilter) Write(data []byte) (int, error) {
 func (w *progressFilter) handle(line []byte) {
 	text := strings.TrimSuffix(string(line), "\r")
 	payload := strings.TrimPrefix(text, progressPrefix)
-	if strings.HasPrefix(text, progressPrefix) && len(text) <= 600 && progressLinePattern.MatchString(payload) {
+	if strings.HasPrefix(text, progressPrefix) && len(text) <= 600 && (progressLinePattern.MatchString(payload) || screeningProgressPattern.MatchString(payload)) {
 		_, _ = fmt.Fprintln(w.display, "jaq:", payload)
 		return
 	}

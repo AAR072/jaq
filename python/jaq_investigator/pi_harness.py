@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 from .investigator import Investigator, InvestigatorConfig, InvestigatorRun, validate_claims
 from .findings import FindingError, FindingLedger
 from .intelligence import recover_urls
+from .request_screening import request_identity, validate_justification
 from .prompts import (
     INVESTIGATION_SCHEMA,
     INVESTIGATOR_SYSTEM_PROMPT,
@@ -592,7 +593,7 @@ class PiToolBroker:
         normalize_records("assets", set(INVESTIGATION_SCHEMA["properties"]["assets"]["items"]["required"]))
         normalize_records(
             "action_requests",
-            set(INVESTIGATION_SCHEMA["properties"]["action_requests"]["items"]["required"]),
+            set(INVESTIGATION_SCHEMA["properties"]["action_requests"]["items"]["properties"]),
         )
         return value
 
@@ -683,7 +684,7 @@ class PiToolBroker:
         allowed = {
             "kind", "scope", "title", "description", "confidence", "evidence_ids",
             "asset_type", "value", "role",
-            "request_kind", "target", "requested_observations",
+            "request_kind", "target", "requested_observations", "justification",
             "reachability_status", "entrypoints", "path_evidence_ids",
         }
         if not set(arguments).issubset(allowed):
@@ -808,7 +809,14 @@ class PiToolBroker:
                 evidence_leaves.extend(self._leaf_values(observation.raw_value))
                 evidence_leaves.extend(self._leaf_values(observation.normalized_value))
             target_leaves = self._leaf_values(target)
-            if target_leaves and any(item not in evidence_leaves for item in target_leaves):
+            recovered_urls = {
+                item["value"] for item in recover_urls(self.store)["recovered_urls"]
+                if set(item["evidence_ids"]).intersection(evidence_ids)
+            } if request_kind == "fetch_remote_payload" else set()
+            if target_leaves and any(
+                item not in evidence_leaves and not (isinstance(item, str) and item in recovered_urls)
+                for item in target_leaves
+            ):
                 raise PiHarnessError("action-request target is not present exactly in the cited evidence")
             if request_kind == "fetch_remote_payload" and (
                 not isinstance(target.get("url"), str) or not target["url"].strip()
@@ -827,6 +835,7 @@ class PiToolBroker:
                 "evidence_ids": evidence_ids,
                 "target": dict(target),
                 "requested_observations": requested,
+                **({"justification": arguments["justification"]} if "justification" in arguments else {}),
             }]
             canonical = self.validate_claims(candidate)
             if not canonical["action_requests"]:
@@ -848,11 +857,9 @@ class PiToolBroker:
             if duplicate is not None and len(set([*duplicate["evidence_ids"], *record["evidence_ids"]])) > 100:
                 raise PiHarnessError("asset finding evidence limit reached")
         else:
-            target_key = json.dumps(record["target"], ensure_ascii=False, sort_keys=True)
             duplicate = next((
                 item for item in existing["action_requests"]
-                if item["kind"] == record["kind"]
-                and json.dumps(item["target"], ensure_ascii=False, sort_keys=True) == target_key
+                if request_identity(item) == request_identity(record)
             ), None)
             if duplicate is None and len(existing["action_requests"]) >= 500:
                 raise PiHarnessError("action-request finding limit reached")
@@ -1217,7 +1224,7 @@ class PiToolBroker:
                 INVESTIGATION_SCHEMA["properties"]["action_requests"]["items"]
                 if requests else INVESTIGATION_SCHEMA["properties"]["assets"]["items"]
             )
-            if set(record) != set(item_schema["required"]):
+            if not set(item_schema["required"]).issubset(record) or not set(record).issubset(item_schema["properties"]):
                 raise PiHarnessError(f"{label} has missing or unsupported fields")
             record_id = record.get("id")
             evidence_ids = record.get("evidence_ids")
@@ -1230,6 +1237,11 @@ class PiToolBroker:
             if requests and record.get("status") != "pending_authorization":
                 raise PiHarnessError("action requests must remain pending_authorization")
             if requests:
+                if "justification" in record:
+                    try:
+                        validate_justification(record["justification"], evidence_ids)
+                    except ValueError as error:
+                        raise PiHarnessError(str(error)) from error
                 if record.get("kind") not in item_schema["properties"]["kind"]["enum"] or not isinstance(record.get("target"), Mapping):
                     raise PiHarnessError("invalid action request kind or target")
                 if (
@@ -1247,7 +1259,7 @@ class PiToolBroker:
                         "memory_mapped_image", "injected_code",
                     }
                     requested = {str(item).strip().lower().replace(" ", "_") for item in record["requested_observations"]}
-                    if not requested.intersection(recovery_outputs):
+                    if not requested.intersection(recovery_outputs) and "justification" not in record:
                         # Broad behavior-confirmation requests are optional
                         # model output, not a reason to discard an otherwise
                         # valid dossier. Leave them out of requests.json.

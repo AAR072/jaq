@@ -86,12 +86,13 @@ type RequestDecision struct {
 	Note  string    `json:"note,omitempty"`
 }
 type RequestOutcome struct {
-	At             time.Time `json:"at"`
-	Error          string    `json:"error,omitempty"`
-	ArtifactPath   string    `json:"artifact_path,omitempty"`
-	ArtifactSHA256 string    `json:"artifact_sha256,omitempty"`
-	HandoffPath    string    `json:"handoff_path,omitempty"`
-	ChildRun       string    `json:"child_run,omitempty"`
+	At             time.Time      `json:"at"`
+	Error          string         `json:"error,omitempty"`
+	ArtifactPath   string         `json:"artifact_path,omitempty"`
+	ArtifactSHA256 string         `json:"artifact_sha256,omitempty"`
+	HandoffPath    string         `json:"handoff_path,omitempty"`
+	ChildRun       string         `json:"child_run,omitempty"`
+	Execution      map[string]any `json:"execution,omitempty"`
 }
 type ActionRequest struct {
 	SchemaVersion         string           `json:"schema_version"`
@@ -102,9 +103,19 @@ type ActionRequest struct {
 	EvidenceIDs           []string         `json:"evidence_ids"`
 	Target                map[string]any   `json:"target"`
 	RequestedObservations []string         `json:"requested_observations"`
+	Justification         map[string]any   `json:"justification,omitempty"`
+	Screening             map[string]any   `json:"screening,omitempty"`
+	Execution             map[string]any   `json:"execution,omitempty"`
 	Decision              *RequestDecision `json:"decision,omitempty"`
 	Outcome               *RequestOutcome  `json:"outcome,omitempty"`
 }
+
+// Legacy dossiers predate screening and retain their explicit operator flow.
+// New dossiers always carry a verdict for supported acquisition request kinds.
+func (r ActionRequest) ScreeningQualified() bool {
+	return r.Screening == nil || r.Screening["verdict"] == "qualified"
+}
+
 type RequestFile struct {
 	SchemaVersion  string          `json:"schema_version"`
 	ActionRequests []ActionRequest `json:"action_requests"`

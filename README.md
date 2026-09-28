@@ -49,6 +49,26 @@ jaq: [report] dossier compiled locally from 8 recorded findings
 
 Set `JAQ_JUDGE_MODEL` to enable the optional independent judge. The judge may use a different LiteLLM provider; no second key is required for mocked tests.
 
+Follow-up request screening is a separate Jev role. Add `JEV_API_KEY='...'`
+to `.env` (or export it); `TYPESAFE_API_KEY` is also accepted. No extra SDK is
+required. The presence of a key enables screening automatically; use
+`JAQ_REQUEST_SCREENING=off` to disable provider calls. DeepSeek proposes the
+artifact, expected intelligence value, blocker, attempted static work and exact
+evidence excerpts. Jev checks five criteria independently. Only `qualified`
+requests can be approved/resumed; unsupported or incomplete candidates remain
+in `requests.json` with reason codes. Without a key they remain unresolved.
+
+`JAQ_JEV_MODEL` defaults to the pinned `jev-1.13.0`; use a versioned ID, not an
+alias. `JAQ_JEV_FETCH_THRESHOLD` defaults to `0.80` and
+`JAQ_JEV_DYNAMIC_THRESHOLD` to `0.60`: **provisional, uncalibrated per-criterion
+probability floors**, not measured accuracy. All five checks must pass; there
+is no average that can hide a failed criterion. The separate defaults were
+smoke-checked on small synthetic examples, not validated against representative
+malware runs. Screening is bounded to 12 calls, 10 seconds per call and a
+60-second phase budget. Failures retain findings and hold requests. Full
+review inputs, probabilities, model, policy version and usage are saved for
+later calibration. See [OUTPUT_CONTRACT.md](OUTPUT_CONTRACT.md).
+
 The investigator uses two isolated Pi sessions with different jobs. The research session has Radare2 and the offline command sandbox, persists every tool result, and focuses on recovering application-owned code, behavior, and every phone-home path; it has no finding/reporting tool. A fresh reporter receives the research summary and selected evidence, can read persisted observations, and appends small intelligence records through `record_finding`. It has no Radare, command, filesystem, network, or dynamic-analysis capability. At completion JAQ locally compiles `research.json`, `claims.json`, `communications.json`, `assets.json`, and `requests.json`; neither session submits a giant final JSON object. Exact-value assets must occur in cited evidence, and incidental regex matches are not promoted automatically.
 
 Research is cost-governed by default: there is no model-call, tool-call, or cumulative-token stopping limit unless `JAQ_MAX_MODEL_CALLS`, `JAQ_MAX_TOOL_CALLS`, or `JAQ_MAX_TOTAL_TOKENS` is explicitly set. `JAQ_MAX_COST_USD` defaults to `$0.10`; at exhaustion all research tools close and one tool-free summary call remains available. The reporter has a separate default `$0.03` budget, 20 model calls, and 100 evidence/finding tool calls; configure it with `JAQ_REPORTER_MODEL`, `JAQ_REPORTER_THINKING`, and `JAQ_REPORT_*` variables. If its cap is reached, evidence-reading closes, accepted findings remain durable, and bounded record-only flushes run before completion. The controller retains a 30-minute stage timeout. Coverage gaps become unresolved warnings instead of rejecting the run. Full research results remain in `observations.jsonl`, while the Markdown report renders bounded evidence previews rather than duplicating raw output.
@@ -79,7 +99,7 @@ For recovery with **no model calls**, including when the provider is unavailable
 
 This compiles saved findings and research notes, preserves limitations, and requires neither `.env`, Node, a provider key, nor Docker. It does not overwrite published dossier files. The Go controller automatically attempts this same bounded local recovery when its investigator process fails or reaches the stage deadline; the original error remains explicit and the run remains partial. Force-killing the controller itself requires the recovery command.
 
-When `research.json` is missing, the wrapper compiles it locally from the persisted evidence ledger. When `findings.jsonl` contains records, the final dossier is compiled locally with no model call. When it is empty, the same fresh incremental reporter runs over the saved research without rerunning Radare. Recovery never uses an atomic terminal dossier submission.
+When `research.json` is missing, the wrapper compiles it locally from the persisted evidence ledger. When `findings.jsonl` contains records, dossier assembly is local; normal harvest can still run configured judges, including request screening. `--compile-only` disables all model calls and marks request screening unresolved. When the ledger is empty, normal harvest runs the same fresh incremental reporter over saved research without rerunning Radare. Recovery never uses an atomic terminal dossier submission.
 
 Normal analysis uses the same zero-cost fallback automatically if the final prose summary is unavailable: persisted tool evidence still becomes a valid partial checkpoint without another model call. Provider authentication, balance, timeout, and cancellation failures remain explicit and recoverable; they are not disguised as terminal-call failures.
 
@@ -93,6 +113,6 @@ Review and decide requests explicitly:
 ./bin/jaq deny --run /absolute/path/to/run --request request-2
 ```
 
-An approved `fetch_remote_payload` uses a disposable, rootless Docker fetch with no host mounts, redirects disabled, a 64 MiB limit, and a 45-second deadline. A fetched PE receives a child JAQ run linked by `parent-request.json`. Dynamic-analysis approvals create an `awaiting_external_executor` handoff only; JAQ still has no dynamic executor.
+An approved `fetch_remote_payload` uses a disposable, rootless Docker fetch with no host mounts, redirects disabled, a 64 MiB limit, and a 45-second deadline. A fetched PE receives a child JAQ run linked by `parent-request.json`. Dynamic requests immediately contain an explicit `execution.status: "placeholder"` result with `executed: false`. Approving and resuming a qualified dynamic request writes `acquisitions/<request-id>/handoff.json` and leaves the request `handoff_pending`; it does not execute the sample. Older dossiers without screening retain their existing explicit operator approval flow.
 
 Run the credential-free test suite with `make test`. After building the image, verify the real offline container with `go test -tags=integration ./internal/sandbox -run TestPersistentSandboxRuntimeContract -v`. A live model run remains operator-triggered. Dynamic analysis is deliberately absent. See [TECHNICAL_VISION.md](TECHNICAL_VISION.md) for the detailed trust boundary.

@@ -31,7 +31,7 @@ Each completed run writes:
 - `assets.json`: exact infrastructure, credential, configuration, and payload-reference assets with evidence.
 - `tags.json`: locally compiled behavior scopes, asset types, and request kinds with source/evidence references and verification status.
 - `communications.json`: recovered exfiltration and command/control paths, kept distinct from endpoint ownership.
-- `requests.json`: evidence-backed acquisition or dynamic-analysis requests in `pending_authorization` state; no request is executed in this milestone.
+- `requests.json`: proposed follow-up work with structured justification and optional Jev screening. Qualification, operator authorization and execution are separate. Qualified fetch requests retain the explicit approval workflow; dynamic requests return a versioned placeholder result, with no sample execution.
 - `score.json`: verification results, optional judgments, and model usage.
 - `report.md`: an evidence-backed analyst dossier.
 

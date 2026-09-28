@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import threading
 from typing import Any, Mapping
+from .request_screening import request_identity
 
 
 FINDING_SCHEMA_VERSION = "1.0"
@@ -130,7 +131,8 @@ class FindingLedger:
                 "kind", "status", "reason", "target", "requested_observations",
             },
         }[kind]
-        if set(record) != required or record.get("schema_version") != FINDING_SCHEMA_VERSION:
+        optional = {"justification"} if kind == "action_request" else set()
+        if not required.issubset(record) or not set(record).issubset(required | optional) or record.get("schema_version") != FINDING_SCHEMA_VERSION:
             raise FindingError("finding record has missing or unsupported fields")
         if not isinstance(record.get("id"), str) or not record["id"]:
             raise FindingError("finding record id is invalid")
@@ -155,6 +157,12 @@ class FindingLedger:
             or not isinstance(record.get("requested_observations"), list)
         ):
             raise FindingError("finding action request is invalid")
+        if kind == "action_request" and "justification" in record:
+            from .request_screening import validate_justification
+            try:
+                validate_justification(record["justification"], evidence_ids)
+            except ValueError as error:
+                raise FindingError(str(error)) from error
 
     @staticmethod
     def _content_id(
@@ -247,7 +255,7 @@ class FindingLedger:
             "action_requests": [],
         }
         asset_indexes: dict[tuple[str, str], int] = {}
-        request_indexes: dict[tuple[str, str], int] = {}
+        request_indexes: dict[tuple[str, str, str], int] = {}
         for envelope in self._records:
             target = {
                 "claim": "claims",
@@ -270,10 +278,7 @@ class FindingLedger:
                     continue
                 asset_indexes[key] = len(result[target])
             elif target == "action_requests":
-                key = (
-                    str(record.get("kind")),
-                    json.dumps(record.get("target"), ensure_ascii=False, sort_keys=True),
-                )
+                key = request_identity(record)
                 existing_index = request_indexes.get(key)
                 if existing_index is not None:
                     existing = result[target][existing_index]
@@ -283,6 +288,9 @@ class FindingLedger:
                     existing["requested_observations"] = list(dict.fromkeys([
                         *existing["requested_observations"], *record["requested_observations"],
                     ]))
+                    if "justification" in record:
+                        existing["justification"] = record["justification"]
+                        existing["reason"] = record["reason"]
                     continue
                 request_indexes[key] = len(result[target])
             result[target].append(record)

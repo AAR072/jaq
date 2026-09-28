@@ -16,12 +16,13 @@ import (
 )
 
 type ApprovalResult struct {
-	RequestID    string `json:"request_id"`
-	Kind         string `json:"kind"`
-	Status       string `json:"status"`
-	ArtifactPath string `json:"artifact_path,omitempty"`
-	SHA256       string `json:"sha256,omitempty"`
-	HandoffPath  string `json:"handoff_path,omitempty"`
+	RequestID    string         `json:"request_id"`
+	Kind         string         `json:"kind"`
+	Status       string         `json:"status"`
+	ArtifactPath string         `json:"artifact_path,omitempty"`
+	SHA256       string         `json:"sha256,omitempty"`
+	HandoffPath  string         `json:"handoff_path,omitempty"`
+	Execution    map[string]any `json:"execution,omitempty"`
 }
 
 func writeRequests(path string, value RequestFile) error {
@@ -45,6 +46,9 @@ func updateManifestStatus(runDir, status string) error {
 	var value map[string]any
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
+	}
+	if value["status"] == "partial" || value["status"] == "failed" {
+		return nil // Request decisions cannot complete an incomplete investigation.
 	}
 	value["status"] = status
 	encoded, err := json.MarshalIndent(value, "", "  ")
@@ -75,6 +79,9 @@ func decide(runDir, requestID, status string) (ApprovalResult, error) {
 		if item.Status != "pending_authorization" {
 			return ApprovalResult{}, errors.New("request already decided")
 		}
+		if status == "approved" && !item.ScreeningQualified() {
+			return ApprovalResult{}, errors.New("request is not qualified by screening; inspect requests.json for missing evidence or unsupported criteria")
+		}
 		item.Status = status
 		item.Decision = &RequestDecision{Actor: "operator", At: time.Now().UTC()}
 		if err := writeRequests(path, requests); err != nil {
@@ -82,7 +89,7 @@ func decide(runDir, requestID, status string) (ApprovalResult, error) {
 		}
 		statusAfter := "completed"
 		for _, candidate := range requests.ActionRequests {
-			if candidate.Status == "pending_authorization" {
+			if candidate.Status == "pending_authorization" && candidate.ScreeningQualified() {
 				statusAfter = "awaiting_authorization"
 				break
 			}
@@ -116,6 +123,9 @@ func Resume(ctx context.Context, runDir string) ([]ApprovalResult, error) {
 		item := &requests.ActionRequests[index]
 		if item.Status != "approved" && item.Status != "running" {
 			continue
+		}
+		if !item.ScreeningQualified() {
+			return results, errors.New("refusing to resume a request that is not qualified by screening")
 		}
 		item.Status = "running"
 		if err := writeRequests(path, requests); err != nil {
@@ -156,12 +166,25 @@ func Resume(ctx context.Context, runDir string) ([]ApprovalResult, error) {
 			item.Status = "handoff_pending"
 			result.Status = item.Status
 			result.HandoffPath = filepath.Join(dir, "handoff.json")
-			payload := map[string]any{"schema_version": "1.0", "request": item, "status": item.Status}
-			encoded, _ := json.MarshalIndent(payload, "", "  ")
+			item.Execution = map[string]any{
+				"schema_version": "1.0", "executor": "dynamic_analysis",
+				"status": "placeholder", "executed": false,
+				"reason_code": "executor_not_implemented",
+				"message":     "Dynamic analysis is a placeholder; no sample was executed.",
+				"request_id":  item.ID, "target": item.Target,
+				"requested_observations": item.RequestedObservations,
+				"artifacts":              []any{}, "observations": []any{},
+			}
+			result.Execution = item.Execution
+			payload := map[string]any{"schema_version": "1.0", "request": item, "result": item.Execution, "status": item.Status}
+			encoded, err := json.MarshalIndent(payload, "", "  ")
+			if err != nil {
+				return results, err
+			}
 			if err := os.WriteFile(result.HandoffPath, append(encoded, '\n'), 0o600); err != nil {
 				return results, err
 			}
-			item.Outcome = &RequestOutcome{At: time.Now().UTC(), HandoffPath: result.HandoffPath}
+			item.Outcome = &RequestOutcome{At: time.Now().UTC(), HandoffPath: result.HandoffPath, Execution: item.Execution}
 		default:
 			item.Status = "handoff_pending"
 			result.Status = item.Status
@@ -174,7 +197,7 @@ func Resume(ctx context.Context, runDir string) ([]ApprovalResult, error) {
 	}
 	statusAfter := "completed"
 	for _, candidate := range requests.ActionRequests {
-		if candidate.Status == "pending_authorization" {
+		if candidate.Status == "pending_authorization" && candidate.ScreeningQualified() {
 			statusAfter = "awaiting_authorization"
 			break
 		}

@@ -20,6 +20,7 @@ from .judge import Judge, JudgeConfig
 from .model import ModelError
 from .pi_harness import EvidenceOnlyRuntime, PiHarnessError, PiInvestigator
 from .report import render_report
+from .request_screening import screen_requests
 from .runtime import StaticToolRuntime
 from .verifier import verify_and_score
 
@@ -232,6 +233,15 @@ def run_pipeline(
         usage=usage,
     )
     verification = {item.claim_id: item.status for item in score.verification_results}
+    screening_findings = [
+        {"id": claim["id"], "classification": claim["classification"], "explanation": claim["explanation"],
+         "verification_status": verification.get(claim["id"], "unclear")}
+        for claim in claims["claims"]
+    ] + [
+        {"id": asset["id"], "type": asset["type"], "value": asset["value"], "role": asset["role"]}
+        for asset in claims.get("assets", [])
+    ]
+    screen_requests(claims.get("action_requests", []), store, screening_findings, offline=compile_only)
     for communication in claims.get("communications", []):
         communication["verification_status"] = verification.get(communication["id"], "unclear")
     url_inventory = recover_urls(store, claims.get("assets", []))
@@ -328,10 +338,13 @@ def _render_operational(investigation: Mapping[str, Any]) -> str:
         else:
             lines.append("- No validated assets recorded in this category; this does not establish absence.")
         lines.append("")
-    lines.append("\n## Pending action requests\n")
+    lines.append("\n## Follow-up requests\n")
     requests = investigation.get("action_requests", [])
     lines.extend(
-        f"- <code>{safe(item.get('id'))}</code> <code>{safe(item.get('kind'))}</code> — {safe(item.get('reason'))} (<code>pending_authorization</code>)"
+        f"- <code>{safe(item.get('id'))}</code> <code>{safe(item.get('kind'))}</code> — {safe(item.get('reason'))} "
+        f"(screening: {safe(item.get('screening', {}).get('verdict', 'not_screened'))}; "
+        f"reasons: {safe(', '.join(item.get('screening', {}).get('reason_codes', [])))}). "
+        f"{safe(item.get('execution', {}).get('message', ''))}"
         for item in requests
     )
     if not requests:

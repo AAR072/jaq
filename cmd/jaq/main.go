@@ -113,6 +113,15 @@ func run(args []string) error {
 				fmt.Println("  Reason:", item.Reason)
 				fmt.Println("  Requested:", strings.Join(item.RequestedObservations, ", "))
 				fmt.Println("  Evidence:", strings.Join(item.EvidenceIDs, ", "))
+				if item.Screening != nil {
+					fmt.Println("  Screening:", item.Screening["verdict"])
+					if reasons, err := json.Marshal(item.Screening["reason_codes"]); err == nil {
+						fmt.Println("  Screening reasons:", string(reasons))
+					}
+				}
+				if item.Execution != nil {
+					fmt.Println("  Execution:", item.Execution["message"])
+				}
 			}
 			return nil
 		}

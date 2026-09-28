@@ -66,6 +66,79 @@ verification, malware-family attribution or MITRE ATT&CK mappings. Request
 tags describe the dossier at compilation time; requests.json is authoritative
 for subsequent approval and execution status.
 
+## Follow-up requests and screening
+
+Requests keep schema version `1.0` and the existing authorization `status`.
+New optional fields are additive. Screening verdict and execution state are
+separate from authorization: `pending_authorization` does not imply qualified.
+The controller only advertises an approval wait for qualified candidates.
+
+- `justification`: `missing_artifact`, `expected_value`, `blocker`,
+  `why_this_action`, `novelty`, `static_attempts` (method, result, evidence_ids),
+  and `evidence_excerpts` (evidence_id, exact quote). Text fields are bounded to
+  2,000 characters; at most eight attempts and eight excerpts. Nested references
+  must belong to the request's evidence IDs. Excerpts are checked against
+  persisted analyzer output and expanded with surrounding context. Submitted
+  commands are not evidence of successful work. Every cited attempt needs an
+  excerpt of its result. An empty attempts list can be justified by an observed
+  external/runtime dependency; unnecessary static work need not be invented.
+- `screening`: policy/model version, provider, verdict, fixed reason codes,
+  five independent `checks` with choices/probabilities/confidence, threshold,
+  calibration status, evidence references, review input hash, bounded review
+  input and provider token usage when available. Verdicts are `qualified`,
+  `unsupported`, or `insufficient_evidence`. Qualification requires every
+  criterion's supported probability to clear the kind-specific threshold;
+  a confidently unsupported criterion blocks the request. Uncertainty holds it.
+- `execution`: dynamic requests (`dynamic_analysis`, `memory_dump`,
+  `network_capture`) have the result envelope below, even when screening holds
+  them. This describes executor availability, not completed analysis.
+
+```json
+{
+  "schema_version": "1.0",
+  "executor": "dynamic_analysis",
+  "status": "placeholder",
+  "executed": false,
+  "reason_code": "executor_not_implemented",
+  "message": "Dynamic analysis is a placeholder; no sample was executed.",
+  "request_id": "request-example",
+  "target": {},
+  "requested_observations": ["unpacked_payload"],
+  "artifacts": [],
+  "observations": []
+}
+```
+
+The containing run identifies the input sample via its manifest and observation
+ledger. A future executor receives the complete request (including target,
+evidence, objective and requested outputs) in `handoff.json.request` and returns
+the versioned envelope in `handoff.json.result`. Artifact and observation arrays
+are empty today; populated item schemas must be versioned when the executor is
+implemented. No shell command or model-provided execution plan is dispatched.
+
+Asset-derived fetch candidates still preserve potentially useful stage links,
+but cannot qualify without an explicit evidence-backed justification. Distinct
+dynamic objectives/outputs are kept separate; repeated fetches of the same
+target are merged, including a later explicit justification. Unsupported and
+uncertain screened candidates stay in `requests.json` and do not erase findings.
+Malformed findings may still be rejected at recording time. Other request kinds
+retain their operator-only workflow and do not claim a Jev screening verdict.
+
+Missing keys, provider/response errors, oversized context, and exhausted screening
+budgets never count as qualification. Offline compilation performs no Jev calls
+and produces an unresolved screening result. `approve` and `resume` enforce
+qualification when screening is present; legacy requests without it retain the
+old explicit operator workflow. Request decisions preserve `partial`/`failed`
+analysis status. `tags.json` continues to describe authorization status, not the
+screening verdict; consult the corresponding request for the latter.
+
+All thresholds currently carry `calibration_status: "uncalibrated"`. Tune on
+labeled cases split by sample, then evaluate on held-out samples, separately for
+fetch and dynamic requests. Measure unnecessary requests admitted, justified
+requests blocked/held, and abstentions. Include persuasive unsupported requests,
+terse legitimate requests, already recovered artifacts and missing context.
+Model probabilities or another model's opinion are not ground-truth labels.
+
 ## Report and compatibility
 
 The opening summary lists up to five accepted finding titles, prioritizing

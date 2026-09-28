@@ -339,7 +339,14 @@ func (c *Controller) Analyze(ctx context.Context, samplePath, outputPath string)
 	var requestDocument map[string]any
 	if readErr := readJSONStrict(filepath.Join(outputDir, "requests.json"), &requestDocument); readErr == nil {
 		if requests, ok := requestDocument["action_requests"].([]any); ok && len(requests) > 0 && manifest.Status == "completed" {
-			manifest.Status = "awaiting_authorization"
+			for _, raw := range requests {
+				request, _ := raw.(map[string]any)
+				screening, screened := request["screening"].(map[string]any)
+				if !screened || screening["verdict"] == "qualified" {
+					manifest.Status = "awaiting_authorization"
+					break
+				}
+			}
 		}
 	}
 	manifest.FinishedAt = c.now().UTC()
