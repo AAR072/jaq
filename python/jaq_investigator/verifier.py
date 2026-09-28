@@ -26,7 +26,8 @@ _ABBREVIATED_HASH_RE = re.compile(
     re.IGNORECASE,
 )
 _BENIGN_CONCLUSION_RE = re.compile(
-    r"\b(?:benign|harmless|safe|non[- ]malicious)\b",
+    r"\b(?:is|are|was|were|appears|seems|looks|considered|classified as)\s+"
+    r"(?:[a-z-]+\s+){0,3}(?:benign|harmless|safe|non[- ]malicious)\b",
     re.IGNORECASE,
 )
 _NO_CRYPTO_RE = re.compile(
@@ -133,8 +134,14 @@ def verify_claim(claim: Claim | Mapping[str, Any], store: EvidenceStore) -> Veri
         json.dumps(store.get(evidence_id).to_dict(), ensure_ascii=False, sort_keys=True).lower()
         for evidence_id in normalized.evidence_ids
     )
-    exact_values = set(re.findall(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b|\b[a-fA-F0-9]{128}\b|https?://[^\s`<>]+", normalized.explanation))
-    unsupported_values = sorted(value for value in exact_values if value.lower().rstrip(".,);") not in cited_text)
+    exact_values = set(re.findall(
+        r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b|"
+        r"\b[a-fA-F0-9]{128}\b|https?://[^\s`<>\"']+",
+        normalized.explanation,
+    ))
+    unsupported_values = sorted(
+        value for value in exact_values if value.lower().rstrip(".,;:)]}") not in cited_text
+    )
     if unsupported_values:
         return _result(normalized, "rejected", ("exact value absent from cited evidence: " + ", ".join(unsupported_values[:10]),))
 
