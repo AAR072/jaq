@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS CLASSPATH
+exec /opt/java-static/bin/java -Xmx512m -m jdk.jdeps/com.sun.tools.javap.Main "$@"

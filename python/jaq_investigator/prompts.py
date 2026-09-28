@@ -133,7 +133,18 @@ with other static evidence. Redress is not included.
    LazyProc/Syscall/NewCallback target or record it as a core blocker. For Rust,
    combine Radare symbols/strings with GNU or LLVM object tools and correlate
    application functions with Radare addresses. For .NET, use `dnfile` and
-   `dncil` without loading the assembly into a runtime.
+   `dncil` without loading the assembly into a runtime. For Java/Kotlin JARs,
+   inspect the manifest and target application classes with `cfr` (a bounded
+   attempt, e.g. `timeout 60`); fall back to `javap -c -p -v` for bytecode and
+   bootstrap arguments. Do not write a JVM parser or spend the budget
+   decompiling bundled libraries. Constant-pool references are not invocation
+   sites: trace application instructions and their arguments. For Electron,
+   unpack the installer, use `asar-extract` and retain its integrity manifest,
+   then `js-format` on the package entrypoint. Do not hand-roll ASAR offsets.
+   Read `jaq-tools` for recipes and limits. These tools parse inert inputs;
+   never execute a recovered JAR, JavaScript module, or installer. Tool
+   failures alone do not justify dynamic analysis: first use the documented
+   fallback and identify the specific missing runtime artifact.
 6. Explain the command/control flow and observable capabilities. If recovery is
    genuinely blocked, cite multiple concrete failed attempts and the exact
    missing artifact that dynamic analysis would need to recover.

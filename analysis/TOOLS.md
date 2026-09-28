@@ -77,6 +77,44 @@ debug them.
   method bodies, and CIL without Mono or a .NET runtime.
 - `capa` also supports useful .NET static analysis paths.
 
+## Java and Kotlin JVM bytecode
+
+1. List a JAR with `unzip -l` and read `unzip -p FILE.jar META-INF/MANIFEST.MF`.
+   Identify application classes before spending time on bundled dependencies.
+2. Decompile a selected extracted class with
+   `timeout 60 cfr /work/Entry.class --outputdir /work/decompiled`.
+   CFR 0.152 is the primary decompiler; use `--antiobf true --constobf true`
+   for a targeted retry on obfuscated code. For a JAR, narrow with `--jarfilter`.
+3. If decompilation fails or stalls, use
+   `javap -c -p -v -classpath /work/services.jar package.Entry > /work/Entry.bytecode.txt`.
+   Java 17's disassembler preserves bytecode offsets, constant-pool entries,
+   and bootstrap arguments. Constant-pool references alone are not calls:
+   cite application instruction sites and trace their arguments.
+
+CFR has a 1 GiB heap ceiling; javap has 512 MiB. The reduced Java runtime is
+only for trusted analysis tools. Never run `java -jar` on a sample or load its
+classes through reflection. Large obfuscated methods can still defeat CFR;
+retain its errors and switch to bytecode rather than repeatedly retrying it.
+
+## Electron and JavaScript
+
+1. Extract the installer with `7z` first. Use
+   `asar-extract /work/app.asar /work/asar > /work/asar-manifest.json`
+   with a new destination directory. It uses Electron's pinned ASAR 4.3.1
+   parser and verifies member sizes and embedded SHA-256 hashes. A mismatch
+   fails without publishing the extraction. Missing hashes are explicitly
+   `not_available`; symlinks and external `.asar.unpacked` entries are skipped
+   and reported as `partial`, never silently treated as analyzed content.
+   Limits: 512 MiB archive/total output, 64 MiB per file, 10,000 entries.
+2. Read `package.json` with `jq` to find the entrypoint, then use
+   `js-format /work/asar/main.js > /work/main.readable.js`.
+   Prettier 3.9.9 parses and formats JavaScript up to 16 MiB without loading
+   project configuration/plugins or evaluating the code. Parse errors remain
+   errors; formatting does not decode strings or resolve obfuscation.
+3. Follow calls and decode literal data with existing Python tools. Never
+   execute JavaScript, import recovered modules, install sample dependencies,
+   or launch Electron. Node 22.23.3 is included only to run trusted tooling.
+
 ## Documents and data transformations
 
 - `oleid`, `olevba`, `oleobj`, `oledir`, `rtfobj`: inspect OLE, VBA, embedded

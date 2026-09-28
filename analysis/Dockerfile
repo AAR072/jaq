@@ -109,6 +109,29 @@ RUN mkdir -p /build/goresym /opt/goresym/bin \
     && file /opt/goresym/bin/goresym | grep -Eq 'ELF 64-bit.*x86-64.*statically linked' \
     && rm -rf /build/goresym /tmp/GoReSym-linux.zip /tmp/GoReSym-LICENSE
 
+FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS language-tools
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends binutils ca-certificates curl openjdk-17-jdk-headless xz-utils \
+    && /usr/lib/jvm/java-17-openjdk-amd64/bin/jlink \
+        --add-modules java.base,java.logging,java.xml,jdk.jdeps,jdk.zipfs \
+        --strip-debug --no-header-files --no-man-pages --compress=2 \
+        --output /opt/java-static \
+    && mkdir -p /opt/jaq /opt/node \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        https://www.benf.org/other/cfr/cfr-0.152.jar -o /opt/jaq/cfr.jar \
+    && echo 'f686e8f3ded377d7bc87d216a90e9e9512df4156e75b06c655a16648ae8765b2  /opt/jaq/cfr.jar' | sha256sum --check --strict \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/node.tar.xz' | sha256sum --check --strict \
+    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node
+ENV PATH=/opt/node/bin:${PATH}
+COPY js-tools/package.json js-tools/package-lock.json /opt/jaq/js-tools/
+RUN cd /opt/jaq/js-tools \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && rm -rf /opt/node/include /opt/node/share /opt/node/lib /opt/node/bin/npm /opt/node/bin/npx /opt/node/bin/corepack
+
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
 LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
@@ -131,7 +154,11 @@ LABEL org.opencontainers.image.title="JAQ Radare2 static sandbox" \
       org.opencontainers.image.goresym.version="3.4" \
       org.opencontainers.image.goresym.commit="157cabbafb9c1f9ecbe548b702c8f0e8a66148a2" \
       org.opencontainers.image.goresym.archive-sha256="cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4" \
-      org.opencontainers.image.goresym.license-sha256="d7341d45c966aa10eba9d7f31bedb95db370acaf928fcaafdaa51ad29a0217b0"
+      org.opencontainers.image.goresym.license-sha256="d7341d45c966aa10eba9d7f31bedb95db370acaf928fcaafdaa51ad29a0217b0" \
+      org.opencontainers.image.cfr.version="0.152" \
+      org.opencontainers.image.node.version="22.23.3" \
+      org.opencontainers.image.asar.version="4.3.1" \
+      org.opencontainers.image.prettier.version="3.9.9"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -161,6 +188,19 @@ RUN python3 -m pip install --no-cache-dir --disable-pip-version-check pip==26.2.
     && python3 -m pip check \
     && python3 -m pip freeze > /opt/jaq/requirements-resolved.txt \
     && mv /usr/local/bin/capa /usr/local/bin/capa-real
+COPY --from=language-tools /opt/java-static /opt/java-static
+COPY --from=language-tools /opt/node /opt/node
+COPY --from=language-tools /opt/jaq/cfr.jar /opt/jaq/cfr.jar
+COPY --chmod=0444 licenses/CFR-LICENSE /opt/jaq/licenses/CFR-LICENSE
+COPY --from=language-tools /opt/jaq/js-tools /opt/jaq/js-tools
+COPY --chmod=0555 js-tools/*.mjs /opt/jaq/js-tools/
+COPY --chmod=0555 cfr javap /usr/local/bin/
+RUN ln -s /opt/jaq/js-tools/asar-extract.mjs /usr/local/bin/asar-extract \
+    && ln -s /opt/jaq/js-tools/js-format.mjs /usr/local/bin/js-format \
+    && cfr --version \
+    && javap -version \
+    && asar-extract --help \
+    && js-format --help
 COPY --chmod=0555 entrypoint.sh /opt/jaq/entrypoint.sh
 COPY --chmod=0444 TOOLS.md /opt/jaq/TOOLS.md
 COPY --chmod=0555 capa /usr/local/bin/capa
